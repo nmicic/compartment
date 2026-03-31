@@ -122,6 +122,11 @@ External review + automated testing uncovered these bugs:
 | 12 | **High** | compartment-root | `cap-allow` only dropped bounding set — after `setuid()`, service user had zero effective caps despite profile | Added `PR_SET_KEEPCAPS` + raw `capset()` + `PR_CAP_AMBIENT_RAISE` |
 | 13 | **Medium** | compartment-user | Shell-replacement mode fail-open — ignored `prctl`/Landlock/seccomp failures | Made fail-closed: abort with rc=126 if any enforcement fails |
 | 14 | **Medium** | compartment-user | `workdir` directive only implied `rw` in built-in ai-agent profile, not file-loaded profiles | Auto-add `rw` for `workdir` after all profile loading |
+| 15 | **High** | compartment-root | `join_netns()` path traversal — `netns_name` containing `/` could open arbitrary files instead of `/var/run/netns/<name>` | Reject any `netns_name` that contains `/` |
+| 16 | **High** | compartment-root | `assign_to_cgroups()` path traversal — cgroup paths with `..` components could write PID to arbitrary files | Reject relative paths and paths containing `..` components |
+| 17 | **High** | compartment-user | Shell-replacement `COMPARTMENT_SHELL_DIR` path traversal — env var could point outside intended directory | Reject non-absolute paths and paths containing `..` components |
+| 18 | **Medium** | sandbox.sh | Predictable proxy socket path in world-writable `/tmp` — race window for socket hijack | Move socket into a private `mktemp -d` directory (mode 700) |
+| 19 | **Medium** | sandbox.sh | `slirp4netns` success not verified — SOFT mode proceeded with broken networking on slirp failure | Poll for `tap0` interface appearance; abort if it does not appear |
 
 ### seccomp Return Action: EPERM vs KILL
 

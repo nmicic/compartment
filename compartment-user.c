@@ -424,6 +424,27 @@ int main(int argc, char *argv[])
         const char *shell_dir = getenv("COMPARTMENT_SHELL_DIR");
         if (!shell_dir) shell_dir = REAL_SHELL_DIR;
 
+        /* Validate shell_dir: must be absolute and must not contain ".." */
+        if (shell_dir[0] != '/') {
+            fprintf(stderr, "compartment-user: COMPARTMENT_SHELL_DIR must be absolute: %s\n",
+                    shell_dir);
+            return 126;
+        }
+        /* Check for ".." traversal in shell_dir */
+        {
+            const char *p = shell_dir;
+            while (*p) {
+                if (p[0] == '.' && p[1] == '.' &&
+                    (p[2] == '/' || p[2] == '\0') &&
+                    (p == shell_dir || p[-1] == '/')) {
+                    fprintf(stderr, "compartment-user: COMPARTMENT_SHELL_DIR contains '..': %s\n",
+                            shell_dir);
+                    return 126;
+                }
+                p++;
+            }
+        }
+
         char real_shell[PATH_MAX];
         snprintf(real_shell, sizeof(real_shell), "%s/%s",
                  shell_dir, invoked_name);
