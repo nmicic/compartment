@@ -1,0 +1,33 @@
+# Binaries
+compartment-user
+compartment-root
+tests/probes/deny_probe
+
+# Build artifacts
+*.o
+*.d
+*.a
+*.so
+
+# Generated headers (config.py output)
+config.h
+compartment-root-config.h
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Test output
+tests/output/
+
+# Review / analysis artifacts (not part of the tool)
+review-isolation-tools.md
+syscall.py
+vs-*.md
+HOWTO-syscall-profiling.md
+
+# Editor
+*.swp
+*~
+.vscode/

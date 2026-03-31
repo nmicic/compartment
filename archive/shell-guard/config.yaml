@@ -1,0 +1,301 @@
+# config.yaml — Shared policy configuration for shell-guard and compartment-root
+#
+# Generate C headers:  python3 config.py
+# Produces:            config.h          (shell-guard compile-time policy)
+#                      compartment-root-config.h (compartment-root defaults)
+
+# ── Shared settings ──────────────────────────────────────────────────
+
+forbidden_env_vars:
+  - "LD_PRELOAD"
+  - "LD_LIBRARY_PATH"
+  - "LD_AUDIT"
+  - "DYLD_INSERT_LIBRARIES"
+  - "DYLD_LIBRARY_PATH"
+
+allowed_env_vars:
+  - "PATH"
+  - "HOME"
+  - "USER"
+  - "SHELL"
+  - "TERM"
+  - "LANG"
+
+allowed_network_ranges:
+  - "127.0.0.0/8"        # loopback
+  - "192.168.1.0/24"
+  - "10.0.0.0/8"
+  - "172.16.0.0/12"
+  - "::1/128"            # IPv6 loopback
+  - "2001:db8::/32"      # documentation range
+
+# ── shell-guard policy ───────────────────────────────────────────────
+
+shell_guard:
+  allowed_uids:
+    - 0      # root
+    - 1000   # user1
+    - 1001   # user2
+
+  allowed_gids:
+    - 0      # root
+    - 1000   # group1
+    - 1001   # group2
+
+  allowed_cwds:
+    - "/home"
+    - "/usr/sbin"
+    - "/bin"
+    - "/tmp"
+
+  allowed_executables:
+    - "/usr/sbin/sshd"
+    - "/usr/bin/sudo"
+    - "/usr/bin/su"
+    - "/usr/bin/login"
+
+  seccomp_allowed_syscalls:
+    - read
+    - write
+    - open
+    - openat
+    - close
+    - stat
+    - fstat
+    - lstat
+    - newfstatat
+    - statx
+    - mmap
+    - mprotect
+    - munmap
+    - brk
+    - rt_sigaction
+    - rt_sigprocmask
+    - rt_sigreturn
+    - ioctl
+    - access
+    - faccessat
+    - faccessat2
+    - execve
+    - execveat
+    - exit
+    - exit_group
+    - getpid
+    - getuid
+    - getgid
+    - geteuid
+    - getegid
+    - getppid
+    - gettid
+    - getdents64
+    - getcwd
+    - chdir
+    - fchdir
+    - dup
+    - dup2
+    - dup3
+    - pipe
+    - pipe2
+    - fcntl
+    - flock
+    - select
+    - poll
+    - ppoll
+    - epoll_create1
+    - epoll_ctl
+    - epoll_wait
+    - epoll_pwait
+    - lseek
+    - pread64
+    - pwrite64
+    - readv
+    - writev
+    - readlink
+    - readlinkat
+    - getrandom
+    - clock_gettime
+    - clock_getres
+    - clock_nanosleep
+    - nanosleep
+    - gettimeofday
+    - futex
+    - set_tid_address
+    - set_robust_list
+    - arch_prctl
+    - prctl
+    - sigaltstack
+    - madvise
+    - mremap
+    - sched_getaffinity
+    - sched_yield
+    - getrlimit
+    - prlimit64
+    - uname
+    - umask
+    - wait4
+    - waitid
+    - clone
+    - clone3
+    - fork
+    - vfork
+    - kill
+    - tgkill
+    - tkill
+    - socket
+    - connect
+    - sendto
+    - recvfrom
+    - sendmsg
+    - recvmsg
+    - bind
+    - listen
+    - accept
+    - accept4
+    - getsockname
+    - getpeername
+    - setsockopt
+    - getsockopt
+    - shutdown
+    - rseq
+    - membarrier
+    - close_range
+    - fadvise64
+    - ftruncate
+    - truncate
+    - rename
+    - renameat
+    - renameat2
+    - unlink
+    - unlinkat
+    - mkdir
+    - mkdirat
+    - rmdir
+    - symlink
+    - symlinkat
+    - link
+    - linkat
+    - chmod
+    - fchmod
+    - fchmodat
+    - chown
+    - fchown
+    - fchownat
+    - setuid
+    - setgid
+    - setgroups
+    - setsid
+    - setpgid
+    - getpgid
+    - getpgrp
+
+# ── compartment-root defaults ────────────────────────────────────────
+# These are compiled as defaults; CLI flags override them.
+
+compartment_root:
+  seccomp_allowed_syscalls:
+    - read
+    - write
+    - open
+    - openat
+    - close
+    - stat
+    - fstat
+    - lstat
+    - newfstatat
+    - statx
+    - mmap
+    - mprotect
+    - munmap
+    - brk
+    - rt_sigaction
+    - rt_sigprocmask
+    - rt_sigreturn
+    - ioctl
+    - access
+    - faccessat
+    - faccessat2
+    - execve
+    - execveat
+    - exit
+    - exit_group
+    - arch_prctl
+    - set_tid_address
+    - set_robust_list
+    - futex
+    - getpid
+    - getuid
+    - getgid
+    - geteuid
+    - getegid
+    - getppid
+    - gettid
+    - getdents64
+    - getcwd
+    - chdir
+    - dup
+    - dup2
+    - dup3
+    - pipe
+    - pipe2
+    - fcntl
+    - select
+    - poll
+    - ppoll
+    - lseek
+    - pread64
+    - pwrite64
+    - readv
+    - writev
+    - readlink
+    - readlinkat
+    - getrandom
+    - clock_gettime
+    - clock_getres
+    - clock_nanosleep
+    - nanosleep
+    - gettimeofday
+    - prctl
+    - sigaltstack
+    - madvise
+    - mremap
+    - sched_getaffinity
+    - sched_yield
+    - getrlimit
+    - prlimit64
+    - uname
+    - umask
+    - wait4
+    - waitid
+    - clone
+    - clone3
+    - fork
+    - vfork
+    - kill
+    - tgkill
+    - rseq
+    - membarrier
+    - close_range
+    - fadvise64
+    - rename
+    - renameat2
+    - unlink
+    - unlinkat
+    - mkdir
+    - mkdirat
+    - rmdir
+    - chmod
+    - fchmod
+    - chown
+    - fchown
+    - setuid
+    - setgid
+    - setgroups
+    - setsid
+
+  cap_deny:
+    - "cap_sys_admin"
+    - "cap_sys_ptrace"
+    - "cap_sys_rawio"
+    - "cap_sys_module"
+    - "cap_net_admin"
+    - "cap_net_raw"
