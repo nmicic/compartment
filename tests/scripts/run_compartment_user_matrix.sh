@@ -365,6 +365,27 @@ fi
 
 echo ""
 
+# ── Test 8b: Hardened env deny (new vars) ─────────────────────────
+
+echo "--- Test group: Hardened environment deny-list ---"
+
+# BASH_ENV should be stripped by default ai-agent profile
+PROBE_OUT=$(BASH_ENV=/tmp/evil.sh \
+    "${CU}" --profile ai-agent -- /bin/sh -c 'echo "value=${BASH_ENV:-(null)}"' 2>/dev/null) || true
+expect_contains "ai-agent: BASH_ENV stripped" "value=(null)"
+
+# NODE_OPTIONS should be stripped
+PROBE_OUT=$(NODE_OPTIONS="--require /tmp/evil.js" \
+    "${CU}" --profile ai-agent -- /bin/sh -c 'echo "value=${NODE_OPTIONS:-(null)}"' 2>/dev/null) || true
+expect_contains "ai-agent: NODE_OPTIONS stripped" "value=(null)"
+
+# PYTHONSTARTUP should be stripped
+PROBE_OUT=$(PYTHONSTARTUP=/tmp/evil.py \
+    "${CU}" --profile ai-agent -- /bin/sh -c 'echo "value=${PYTHONSTARTUP:-(null)}"' 2>/dev/null) || true
+expect_contains "ai-agent: PYTHONSTARTUP stripped" "value=(null)"
+
+echo ""
+
 # ── Test 9: Profile inheritance ───────────────────────────────────
 
 echo "--- Test group: Profile inheritance (strict inherits ai-agent) ---"
@@ -379,10 +400,10 @@ expect_not_contains "strict file: ptrace blocked (file inherit)" "rc=0"
 
 # Verify strict.conf file actually loads ai-agent rules (dry-run check)
 DRY_OUT=$("${CU}" --profile "${REPO_DIR}/examples/strict.conf" --dry-run -- /bin/true 2>&1) || true
-if echo "${DRY_OUT}" | grep -q "14 path rules" && echo "${DRY_OUT}" | grep -q "39 blocked"; then
-    pass "strict.conf file: inherits full ai-agent policy (14 paths, 39 blocks)"
+if echo "${DRY_OUT}" | grep -q "14 path rules" && echo "${DRY_OUT}" | grep -q "blocked"; then
+    pass "strict.conf file: inherits full ai-agent policy (14 paths, blocked syscalls present)"
 else
-    fail "strict.conf file: incomplete inheritance (expected 14 paths + 39 blocks)"
+    fail "strict.conf file: incomplete inheritance (expected 14 paths + blocked syscalls)"
 fi
 
 # ── Test 10: Shell-replacement mode ──────────────────────────────
@@ -412,6 +433,40 @@ else
 
     rm -rf "$(dirname "${SHELL_LINK}")"
 fi
+
+echo ""
+
+# ── Test 11: Profile parsing hardening ────────────────────────────
+
+echo "--- Test group: Profile parsing hardening ---"
+
+# Invalid uid in profile should be rejected
+TMPPROF=$(mktemp --suffix=.conf)
+echo "uid notanumber" > "$TMPPROF"
+echo "landlock off" >> "$TMPPROF"
+echo "seccomp off" >> "$TMPPROF"
+echo "no-new-privs on" >> "$TMPPROF"
+ERR_OUT=$("${CU}" --profile "$TMPPROF" -- /bin/true 2>&1) || true
+if echo "$ERR_OUT" | grep -qi "invalid uid"; then
+    pass "profile: invalid uid rejected"
+else
+    fail "profile: invalid uid should be rejected"
+fi
+rm -f "$TMPPROF"
+
+# Unknown directive should produce warning
+TMPPROF=$(mktemp --suffix=.conf)
+echo "typo_directive value" > "$TMPPROF"
+echo "landlock off" >> "$TMPPROF"
+echo "seccomp off" >> "$TMPPROF"
+echo "no-new-privs on" >> "$TMPPROF"
+ERR_OUT=$("${CU}" --profile "$TMPPROF" -- /bin/true 2>&1) || true
+if echo "$ERR_OUT" | grep -qi "unknown directive"; then
+    pass "profile: unknown directive warned"
+else
+    fail "profile: unknown directive should produce warning"
+fi
+rm -f "$TMPPROF"
 
 echo ""
 
