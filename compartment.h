@@ -552,24 +552,36 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 cfg->paths[cfg->path_count].path = strdup(val);
                 cfg->paths[cfg->path_count].mode = PATH_RO;
                 cfg->path_count++;
+            } else {
+                fprintf(stderr, "compartment: %s:%d: warning: path limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_PATHS, val);
             }
         } else if (strcmp(directive, "rw") == 0) {
             if (cfg->path_count < MAX_PATHS) {
                 cfg->paths[cfg->path_count].path = strdup(val);
                 cfg->paths[cfg->path_count].mode = PATH_RW;
                 cfg->path_count++;
+            } else {
+                fprintf(stderr, "compartment: %s:%d: warning: path limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_PATHS, val);
             }
         } else if (strcmp(directive, "exec") == 0) {
             if (cfg->path_count < MAX_PATHS) {
                 cfg->paths[cfg->path_count].path = strdup(val);
                 cfg->paths[cfg->path_count].mode = PATH_EXEC;
                 cfg->path_count++;
+            } else {
+                fprintf(stderr, "compartment: %s:%d: warning: path limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_PATHS, val);
             }
         } else if (strcmp(directive, "block") == 0) {
             int nr = resolve_syscall(val);
             if (nr >= 0 && cfg->blocked_count < MAX_BLOCKED_SC)
                 cfg->blocked_syscalls[cfg->blocked_count++] = nr;
-            else if (nr < 0)
+            else if (nr >= 0)
+                fprintf(stderr, "compartment: %s:%d: warning: blocked syscall limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_BLOCKED_SC, val);
+            else
                 fprintf(stderr, "compartment: %s:%d: unknown syscall: %s\n",
                         path, lineno, val);
         } else if (strcmp(directive, "allow") == 0) {
@@ -577,6 +589,9 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             if (nr >= 0 && cfg->allowed_sc_count < MAX_ALLOWED_SC) {
                 cfg->allowed_syscalls[cfg->allowed_sc_count++] = nr;
                 cfg->seccomp_allow_mode = 1;
+            } else if (nr >= 0) {
+                fprintf(stderr, "compartment: %s:%d: warning: allowed syscall limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_ALLOWED_SC, val);
             } else if (nr < 0) {
                 fprintf(stderr, "compartment: %s:%d: unknown syscall: %s\n",
                         path, lineno, val);
@@ -589,10 +604,16 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         } else if (strcmp(directive, "env-deny") == 0) {
             if (cfg->env_deny_count < MAX_ENV_VARS)
                 cfg->env_deny[cfg->env_deny_count++] = strdup(val);
+            else
+                fprintf(stderr, "compartment: %s:%d: warning: env-deny limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_ENV_VARS, val);
         } else if (strcmp(directive, "env-allow") == 0) {
             if (cfg->env_allow_count < MAX_ENV_VARS) {
                 cfg->env_allow[cfg->env_allow_count++] = strdup(val);
                 cfg->env_allow_mode = 1;
+            } else {
+                fprintf(stderr, "compartment: %s:%d: warning: env-allow limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_ENV_VARS, val);
             }
         } else if (strcmp(directive, "env-mode") == 0) {
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
@@ -666,14 +687,23 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         } else if (strcmp(directive, "cgroup") == 0) {
             if (cfg->cgroups_count < MAX_PATHS)
                 cfg->cgroups[cfg->cgroups_count++] = strdup(val);
+            else
+                fprintf(stderr, "compartment: %s:%d: warning: cgroup limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_PATHS, val);
         } else if (strcmp(directive, "cap-allow") == 0) {
             if (cfg->cap_allowed_count < MAX_ENV_VARS)
                 cfg->cap_allowed_names[cfg->cap_allowed_count++] = strdup(val);
+            else
+                fprintf(stderr, "compartment: %s:%d: warning: cap-allow limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_ENV_VARS, val);
         } else if (strcmp(directive, "loopback") == 0) {
             cfg->loopback = (strcmp(val, "on") == 0);
         } else if (strcmp(directive, "mount-mask") == 0) {
             if (cfg->mount_mask_count < MAX_PATHS)
                 cfg->mount_masks[cfg->mount_mask_count++] = strdup(val);
+            else
+                fprintf(stderr, "compartment: %s:%d: warning: mount-mask limit (%d) reached, '%s' not added\n",
+                        path, lineno, MAX_PATHS, val);
         } else {
             /* Unknown directives silently skipped — each tool uses
              * what it recognizes and ignores the rest. */
@@ -770,7 +800,7 @@ static inline void audit_log(Config *cfg, const char *event, const char *detail)
 
     /* Get CWD */
     char cwd[PATH_MAX];
-    if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "?");
+    if (!getcwd(cwd, sizeof(cwd))) { cwd[0] = '?'; cwd[1] = '\0'; }
 
     /* Get TTY */
     const char *tty = ttyname(STDIN_FILENO);

@@ -123,14 +123,35 @@ External review + automated testing uncovered these bugs:
 | 13 | **Medium** | compartment-user | Shell-replacement mode fail-open — ignored `prctl`/Landlock/seccomp failures | Made fail-closed: abort with rc=126 if any enforcement fails |
 | 14 | **Medium** | compartment-user | `workdir` directive only implied `rw` in built-in ai-agent profile, not file-loaded profiles | Auto-add `rw` for `workdir` after all profile loading |
 
+### seccomp Return Action: EPERM vs KILL
+
+The BPF deny-list returns `SECCOMP_RET_ERRNO | EPERM` rather than
+`SECCOMP_RET_KILL_PROCESS`. This is deliberate:
+
+- **EPERM** lets well-behaved applications handle blocked syscalls
+  gracefully (retry, fallback, log). Most runtimes (Node.js, Python,
+  Go) check return values and degrade gracefully on EPERM.
+- **KILL_PROCESS** terminates the entire process group on the first
+  blocked syscall, which makes debugging difficult and can cause data
+  loss in applications that were writing output.
+
+The tradeoff: a sandboxed process can observe which syscalls return
+EPERM and fingerprint its sandbox. If your threat model includes
+sandbox-aware adversaries that probe their environment, consider using
+the allow-list mode (`--allow` / `allow` directives) instead, which
+blocks everything not explicitly permitted. For the default deny-list
+use case (AI agents, development tools), EPERM provides the right
+balance of safety and usability.
+
 ### Testing
 
-51 automated tests across 4 suites:
+52 automated tests across 4 suites:
 
-- **Compartment-user matrix** (41 tests): Landlock ro/rw paths, seccomp
-  deny-list (ptrace, unshare, process_vm_*, userfaultfd, perf_event_open),
-  environment sanitization (deny-list + preserve), combined profiles,
-  built-in profiles (ai-agent, strict + inheritance), --dry-run, --verify
+- **Compartment-user matrix** (46 tests): Landlock ro/rw paths, seccomp
+  deny-list (ptrace, unshare, process_vm_*, userfaultfd, perf_event_open,
+  io_uring), environment sanitization (deny-list + preserve), combined
+  profiles, built-in profiles (ai-agent, strict + inheritance), --dry-run,
+  --verify, shell-replacement mode
 - **Child inheritance** (6 tests): seccomp survives fork/exec via /bin/sh
   and /bin/bash, Landlock inherited by children, env sanitization inherited,
   grandchild (depth-2) inherits seccomp
