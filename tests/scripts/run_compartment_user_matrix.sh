@@ -404,10 +404,10 @@ expect_not_contains "strict file: ptrace blocked (file inherit)" "rc=0"
 
 # Verify strict.conf file actually loads ai-agent rules (dry-run check)
 DRY_OUT=$("${CU}" --profile "${REPO_DIR}/examples/strict.conf" --dry-run -- /bin/true 2>&1) || true
-if echo "${DRY_OUT}" | grep -q "14 path rules" && echo "${DRY_OUT}" | grep -q "47 blocked"; then
-    pass "strict.conf file: inherits full ai-agent policy (14 paths, 47 blocks)"
+if echo "${DRY_OUT}" | grep -q "14 path rules" && echo "${DRY_OUT}" | grep -q "49 blocked"; then
+    pass "strict.conf file: inherits full ai-agent policy (14 paths, 49 blocks)"
 else
-    fail "strict.conf file: incomplete inheritance (expected 14 paths + 47 blocks)"
+    fail "strict.conf file: incomplete inheritance (expected 14 paths + 49 blocks)"
 fi
 
 # ── Test 10: Shell-replacement mode ──────────────────────────────

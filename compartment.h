@@ -98,7 +98,7 @@ typedef struct {
     int         dry_run;
     int         verbose;
     int         audit;
-    int         audit_log_fd;
+    int         audit_log_fd;   /* -1 = not open; callers must init to -1 */
     const char *audit_log_dir;
     const char *workdir;
     const char *profile;
@@ -376,6 +376,9 @@ static const SyscallEntry syscall_table[] = {
 #ifdef __NR_name_to_handle_at
     {"name_to_handle_at",   __NR_name_to_handle_at},
 #endif
+#ifdef __NR_open_tree
+    {"open_tree",           __NR_open_tree},
+#endif
 #ifdef __NR_move_mount
     {"move_mount",          __NR_move_mount},
 #endif
@@ -390,6 +393,9 @@ static const SyscallEntry syscall_table[] = {
 #endif
 #ifdef __NR_fspick
     {"fspick",              __NR_fspick},
+#endif
+#ifdef __NR_mount_setattr
+    {"mount_setattr",       __NR_mount_setattr},
 #endif
 #ifdef __NR_pidfd_getfd
     {"pidfd_getfd",         __NR_pidfd_getfd},
@@ -556,7 +562,7 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name, int de
 
 static inline int load_profile_file(Config *cfg, const char *path, int depth)
 {
-    FILE *fp = fopen(path, "r");
+    FILE *fp = fopen(path, "re");  /* "e" = O_CLOEXEC */
     if (!fp) return -1;
 
     char line[MAX_LINE];
@@ -871,7 +877,7 @@ static inline int get_ppid_chain(pid_t pid, pid_t chain[], int max_len)
     while (cur > 1 && len < max_len) {
         char path[64];
         snprintf(path, sizeof(path), "/proc/%d/status", cur);
-        FILE *fp = fopen(path, "r");
+        FILE *fp = fopen(path, "re");
         if (!fp) break;
 
         char line[256];
@@ -931,7 +937,7 @@ static inline void audit_log(Config *cfg, const char *event, const char *detail)
             detail ? detail : "");
 
     /* Also write to audit log file if open */
-    if (cfg->audit_log_fd > 0) {
+    if (cfg->audit_log_fd >= 0) {
         dprintf(cfg->audit_log_fd,
                 "[%s] user=%s uid=%u event=%s ppid_chain=%s "
                 "cwd=%s tty=%s %s\n",

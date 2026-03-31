@@ -107,7 +107,8 @@ static void apply_profile_ai_agent(Config *cfg)
         "io_uring_setup", "io_uring_enter", "io_uring_register",
         /* Container escape vectors: handle-based file access, new mount API */
         "open_by_handle_at", "name_to_handle_at",
-        "move_mount", "fsopen", "fsmount", "fsconfig", "fspick",
+        "open_tree", "move_mount", "fsopen", "fsmount", "fsconfig", "fspick",
+        "mount_setattr",
         /* Cross-process FD theft */
         "pidfd_getfd",
 #ifdef __x86_64__
@@ -136,6 +137,13 @@ static void apply_profile_ai_agent(Config *cfg)
         "AZURE_CLIENT_SECRET",
         /* VCS / CI tokens */
         "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "NPM_TOKEN",
+        /* Interpreter startup injection */
+        "BASH_ENV", "ENV",                  /* sourced by non-interactive bash/sh */
+        "NODE_OPTIONS",                     /* Node.js flag injection */
+        "PYTHONSTARTUP",                    /* Python startup code injection */
+        "PERL5OPT", "PERL5LIB",            /* Perl arbitrary code load */
+        "RUBYOPT", "RUBYLIB",              /* Ruby arbitrary code load */
+        "CDPATH", "GLOBIGNORE",             /* shell behavior hijack */
         /* SSH agent — prevents key use via forwarded socket */
         "SSH_AUTH_SOCK",
         /* Database credentials */
@@ -480,6 +488,7 @@ int main(int argc, char *argv[])
             .use_seccomp      = 1,
             .use_no_new_privs = 1,
             .use_env_sanitize = 1,
+            .audit_log_fd     = -1,
             .profile          = "ai-agent",
         };
         /* Try profile file first, fall back to built-in */
@@ -523,6 +532,7 @@ int main(int argc, char *argv[])
         .use_seccomp      = 1,
         .use_no_new_privs = 1,
         .use_env_sanitize = 1,
+        .audit_log_fd     = -1,
         .profile          = "ai-agent",
     };
 
