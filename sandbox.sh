@@ -32,6 +32,13 @@ set -euo pipefail
 # ── Configuration ───────────────────────────────────────────────────────
 UPSTREAM_PROXY="${UPSTREAM_PROXY:-${HTTPS_PROXY:-${HTTP_PROXY:-}}}"
 INNER_PORT="${SANDBOX_PROXY_PORT:-18080}"
+# Validate INNER_PORT is a valid port number
+case "$INNER_PORT" in
+    ''|*[!0-9]*) die "SANDBOX_PROXY_PORT must be a number: $INNER_PORT" ;;
+esac
+if [ "$INNER_PORT" -lt 1 ] || [ "$INNER_PORT" -gt 65535 ]; then
+    die "SANDBOX_PROXY_PORT out of range (1-65535): $INNER_PORT"
+fi
 # Use a private temp directory (mode 700) to avoid predictable /tmp socket paths
 SOCK_DIR="$(mktemp -d -t compartment-sandbox-XXXXXXXX)"
 chmod 700 "$SOCK_DIR"
@@ -59,6 +66,7 @@ trap cleanup EXIT
 
 # ── Audit log setup ────────────────────────────────────────────────────
 mkdir -p "$LOGDIR" 2>/dev/null || true
+chmod 700 "$LOGDIR" 2>/dev/null || true
 log "=== sandbox session started ==="
 log "user=$(id -un) uid=$(id -u) pid=$$ ppid=$PPID"
 log "host=$(hostname) kernel=$(uname -r)"

@@ -105,6 +105,9 @@ static void apply_profile_ai_agent(Config *cfg)
         "acct", "swapon", "swapoff",
         "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
         "io_uring_setup", "io_uring_enter", "io_uring_register",
+        /* New-style mount API (Linux 5.2+) */
+        "open_tree", "move_mount", "fsopen", "fsconfig",
+        "fsmount", "fspick", "mount_setattr",
 #ifdef __x86_64__
         "ioperm", "iopl",
 #endif
@@ -124,6 +127,14 @@ static void apply_profile_ai_agent(Config *cfg)
         "LOCPATH", "NLSPATH",               /* locale/message catalog injection */
         "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
         "_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS",
+        "BASH_ENV",                         /* sourced by non-interactive bash */
+        "ENV",                              /* sourced by POSIX sh */
+        "CDPATH",                           /* cd hijack */
+        "GLOBIGNORE",                       /* glob behavior modification */
+        "PYTHONSTARTUP",                    /* Python startup code injection */
+        "PERL5OPT", "PERL5LIB",            /* Perl arbitrary code load */
+        "RUBYOPT", "RUBYLIB",              /* Ruby arbitrary code load */
+        "NODE_OPTIONS",                     /* Node.js flag injection */
         NULL
     };
     for (int i = 0; deny_env[i]; i++) {
@@ -252,7 +263,10 @@ static int apply_landlock(Config *cfg)
         case PATH_EXEC: access = read_access | exec_access; break;
         case PATH_RWX:  access = read_access | write_access | exec_access; break;
         }
-        landlock_add_path(ruleset_fd, cfg->paths[i].path, access);
+        if (landlock_add_path(ruleset_fd, cfg->paths[i].path, access) != 0) {
+            close(ruleset_fd);
+            return -1;
+        }
     }
 
     /* Enforce */
@@ -455,6 +469,7 @@ int main(int argc, char *argv[])
             .use_seccomp      = 1,
             .use_no_new_privs = 1,
             .use_env_sanitize = 1,
+            .audit_log_fd     = -1,
             .profile          = "ai-agent",
         };
         /* Try profile file first, fall back to built-in */
@@ -498,6 +513,7 @@ int main(int argc, char *argv[])
         .use_seccomp      = 1,
         .use_no_new_privs = 1,
         .use_env_sanitize = 1,
+        .audit_log_fd     = -1,
         .profile          = "ai-agent",
     };
 

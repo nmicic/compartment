@@ -77,6 +77,7 @@ static void drop_privileges(uid_t uid, gid_t gid);
 static void drop_capabilities(Config *config);
 static void apply_kept_caps(Config *config);
 static int  assign_to_cgroups(Config *config, pid_t pid);
+static int  path_has_dotdot(const char *path);
 static void join_netns(const char *netns_name);
 static void set_rlimits(void);
 static void print_help(const char *prog_name);
@@ -87,6 +88,7 @@ int main(int argc, char *argv[])
 {
     Config config;
     memset(&config, 0, sizeof(config));
+    config.audit_log_fd = -1;
 
     /* Defaults — seccomp and env-sanitize on unless disabled */
     config.use_seccomp      = 1;
@@ -264,6 +266,17 @@ int main(int argc, char *argv[])
     if (!config.rootdir) {
         fprintf(stderr, "compartment-root: --rootdir is required "
                 "(or set 'rootdir' in profile)\n");
+        return 1;
+    }
+    /* Validate rootdir: must be absolute and no ".." traversal */
+    if (config.rootdir[0] != '/') {
+        fprintf(stderr, "compartment-root: rootdir must be absolute: %s\n",
+                config.rootdir);
+        return 1;
+    }
+    if (path_has_dotdot(config.rootdir)) {
+        fprintf(stderr, "compartment-root: rootdir contains '..': %s\n",
+                config.rootdir);
         return 1;
     }
     if (!config.username) {
@@ -565,6 +578,17 @@ static int child_func(void *arg)
                 MS_RDONLY | MS_NOSUID | MS_NOEXEC, "size=0");
     /* Extra masks from profile/CLI */
     for (int i = 0; i < config->mount_mask_count; i++) {
+        /* Validate: must be absolute and no ".." traversal */
+        if (config->mount_masks[i][0] != '/') {
+            fprintf(stderr, "compartment-root: mount-mask path must be absolute: %s\n",
+                    config->mount_masks[i]);
+            exit(EXIT_FAILURE);
+        }
+        if (path_has_dotdot(config->mount_masks[i])) {
+            fprintf(stderr, "compartment-root: mount-mask path contains '..': %s\n",
+                    config->mount_masks[i]);
+            exit(EXIT_FAILURE);
+        }
         if (config->verbose)
             fprintf(stderr, "compartment-root: mount-mask %s\n",
                     config->mount_masks[i]);
@@ -667,9 +691,13 @@ static void write_uid_gid_map(pid_t pid, const char *map_str,
                                const char *map_file)
 {
     char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/%s", pid, map_file);
+    int n = snprintf(path, sizeof(path), "/proc/%d/%s", pid, map_file);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "compartment-root: uid/gid map path too long\n");
+        exit(EXIT_FAILURE);
+    }
 
-    int fd = open(path, O_WRONLY);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd == -1) {
         fprintf(stderr, "compartment-root: open %s: %s\n",
                 path, strerror(errno));
@@ -728,7 +756,7 @@ static void drop_capabilities(Config *config)
 {
     /* Read the highest valid capability number from the kernel */
     int cap_last = 37;  /* safe fallback (covers up to CAP_AUDIT_READ) */
-    FILE *f = fopen("/proc/sys/kernel/cap_last_cap", "r");
+    FILE *f = fopen("/proc/sys/kernel/cap_last_cap", "re");
     if (f) {
         if (fscanf(f, "%d", &cap_last) != 1)
             cap_last = 37;
@@ -856,7 +884,7 @@ static int assign_to_cgroups(Config *config, pid_t pid)
             return -1;
         }
 
-        FILE *f = fopen(tasks_file, "w");
+        FILE *f = fopen(tasks_file, "we");
         if (!f) {
             fprintf(stderr, "compartment-root: cgroup %s: %s\n",
                     tasks_file, strerror(errno));
@@ -888,7 +916,7 @@ static void join_netns(const char *netns_name)
     char netns_path[PATH_MAX];
     snprintf(netns_path, sizeof(netns_path), "/var/run/netns/%s", netns_name);
 
-    int fd = open(netns_path, O_RDONLY);
+    int fd = open(netns_path, O_RDONLY | O_CLOEXEC);
     if (fd == -1) {
         perror("compartment-root: open netns");
         exit(EXIT_FAILURE);

@@ -58,7 +58,7 @@
 #define MAX_PATHS         64
 #define MAX_BLOCKED_SC    64
 #define MAX_ALLOWED_SC    512
-#define MAX_ENV_VARS      32
+#define MAX_ENV_VARS      64
 #define MAX_LINE          1024
 #define MAX_INHERIT_DEPTH 2
 
@@ -98,7 +98,7 @@ typedef struct {
     int         dry_run;
     int         verbose;
     int         audit;
-    int         audit_log_fd;
+    int         audit_log_fd;   /* -1 = not open; callers must init to -1 */
     const char *audit_log_dir;
     const char *workdir;
     const char *profile;
@@ -371,6 +371,29 @@ static const SyscallEntry syscall_table[] = {
     {"io_uring_register",   __NR_io_uring_register},
 #endif
 
+    /* ── New-style mount API (Linux 5.2+) — escape risk if unblocked ── */
+#ifdef __NR_open_tree
+    {"open_tree",           __NR_open_tree},
+#endif
+#ifdef __NR_move_mount
+    {"move_mount",          __NR_move_mount},
+#endif
+#ifdef __NR_fsopen
+    {"fsopen",              __NR_fsopen},
+#endif
+#ifdef __NR_fsconfig
+    {"fsconfig",            __NR_fsconfig},
+#endif
+#ifdef __NR_fsmount
+    {"fsmount",             __NR_fsmount},
+#endif
+#ifdef __NR_fspick
+    {"fspick",              __NR_fspick},
+#endif
+#ifdef __NR_mount_setattr
+    {"mount_setattr",       __NR_mount_setattr},
+#endif
+
     {NULL, 0}
 };
 
@@ -515,7 +538,7 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name, int de
 
 static inline int load_profile_file(Config *cfg, const char *path, int depth)
 {
-    FILE *fp = fopen(path, "r");
+    FILE *fp = fopen(path, "re");  /* "e" = O_CLOEXEC */
     if (!fp) return -1;
 
     char line[MAX_LINE];
@@ -675,9 +698,39 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             free(cfg->rootdir);
             cfg->rootdir = strdup(val);
         } else if (strcmp(directive, "uid") == 0) {
-            cfg->uid = (uid_t)strtoul(val, NULL, 10);
+            char *endptr;
+            errno = 0;
+            unsigned long v = strtoul(val, &endptr, 10);
+            if (errno != 0 || endptr == val || (*endptr != '\0' && *endptr != ' ' && *endptr != '\t')) {
+                fprintf(stderr, "compartment: %s:%d: invalid uid: %s\n",
+                        path, lineno, val);
+                fclose(fp);
+                return -1;
+            }
+            if (v > (unsigned long)(uid_t)-1) {
+                fprintf(stderr, "compartment: %s:%d: uid out of range: %s\n",
+                        path, lineno, val);
+                fclose(fp);
+                return -1;
+            }
+            cfg->uid = (uid_t)v;
         } else if (strcmp(directive, "gid") == 0) {
-            cfg->gid = (gid_t)strtoul(val, NULL, 10);
+            char *endptr;
+            errno = 0;
+            unsigned long v = strtoul(val, &endptr, 10);
+            if (errno != 0 || endptr == val || (*endptr != '\0' && *endptr != ' ' && *endptr != '\t')) {
+                fprintf(stderr, "compartment: %s:%d: invalid gid: %s\n",
+                        path, lineno, val);
+                fclose(fp);
+                return -1;
+            }
+            if (v > (unsigned long)(gid_t)-1) {
+                fprintf(stderr, "compartment: %s:%d: gid out of range: %s\n",
+                        path, lineno, val);
+                fclose(fp);
+                return -1;
+            }
+            cfg->gid = (gid_t)v;
         } else if (strcmp(directive, "username") == 0) {
             free(cfg->username);
             cfg->username = strdup(val);
@@ -705,9 +758,10 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 fprintf(stderr, "compartment: %s:%d: warning: mount-mask limit (%d) reached, '%s' not added\n",
                         path, lineno, MAX_PATHS, val);
         } else {
-            /* Unknown directives silently skipped — each tool uses
-             * what it recognizes and ignores the rest. */
-            (void)0;
+            /* Warn on unknown directives — silent skip could hide
+             * typos that silently weaken the sandbox policy. */
+            fprintf(stderr, "compartment: %s:%d: warning: unknown directive '%s'\n",
+                    path, lineno, directive);
         }
     }
     fclose(fp);
@@ -754,9 +808,8 @@ static inline int get_ppid_chain(pid_t pid, pid_t chain[], int max_len)
     while (cur > 1 && len < max_len) {
         char path[64];
         snprintf(path, sizeof(path), "/proc/%d/status", cur);
-        FILE *fp = fopen(path, "r");
+        FILE *fp = fopen(path, "re");
         if (!fp) break;
-
         char line[256];
         pid_t ppid = 0;
         while (fgets(line, sizeof(line), fp)) {
@@ -814,7 +867,7 @@ static inline void audit_log(Config *cfg, const char *event, const char *detail)
             detail ? detail : "");
 
     /* Also write to audit log file if open */
-    if (cfg->audit_log_fd > 0) {
+    if (cfg->audit_log_fd >= 0) {
         dprintf(cfg->audit_log_fd,
                 "[%s] user=%s uid=%u event=%s ppid_chain=%s "
                 "cwd=%s tty=%s %s\n",
@@ -918,6 +971,14 @@ static inline int build_seccomp_bpf(int *syscalls, int count,
                                      uint32_t match_action,
                                      uint32_t default_action)
 {
+    /* BPF program: 4 header + 2 per rule + 1 default = 4 + count*2 + 1.
+     * sock_fprog.len is unsigned short (max 65535 ≈ BPF_MAXINSNS 4096).
+     * Linux enforces BPF_MAXINSNS = 4096 for seccomp filters. */
+    if (count < 0 || count > 2045) {  /* (2045*2 + 5) = 4095 < 4096 */
+        fprintf(stderr, "compartment: seccomp: too many syscall rules (%d)\n",
+                count);
+        return -1;
+    }
     int prog_len = 4 + count * 2 + 1;
     struct sock_filter *f = calloc((size_t)prog_len, sizeof(struct sock_filter));
     if (!f) return -1;
