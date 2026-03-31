@@ -32,7 +32,10 @@ set -euo pipefail
 # ── Configuration ───────────────────────────────────────────────────────
 UPSTREAM_PROXY="${UPSTREAM_PROXY:-${HTTPS_PROXY:-${HTTP_PROXY:-}}}"
 INNER_PORT="${SANDBOX_PROXY_PORT:-18080}"
-SOCK="/tmp/compartment-sandbox-$$.sock"
+# Use a private temp directory (mode 700) to avoid predictable /tmp socket paths
+SOCK_DIR="$(mktemp -d -t compartment-sandbox-XXXXXXXX)"
+chmod 700 "$SOCK_DIR"
+SOCK="$SOCK_DIR/proxy.sock"
 LOGDIR="${SANDBOX_LOGDIR:-${HOME}/.sandbox-audit}"
 LOGFILE="${LOGDIR}/sandbox-$(date +%Y%m%dT%H%M%S)-$$.log"
 
@@ -49,7 +52,7 @@ cleanup() {
     [ -n "${SOCAT_PID:-}" ]  && kill "$SOCAT_PID" 2>/dev/null || true
     [ -n "${SLIRP_PID:-}" ] && kill "$SLIRP_PID" 2>/dev/null || true
     [ -n "${NS_PID:-}" ]    && kill "$NS_PID" 2>/dev/null || true
-    rm -f "$SOCK"
+    rm -rf "$SOCK_DIR"
     log "session ended (exit=${STATUS:-unknown})"
 }
 trap cleanup EXIT
@@ -266,11 +269,23 @@ fi
 # Create persistent namespace
 unshare --user --mount --net -- sleep 86400 &
 NS_PID=$!
-sleep 0.3
+# Wait for the namespace process to be ready
+for _ in $(seq 1 30); do
+    [ -d "/proc/$NS_PID/ns" ] && break
+    sleep 0.1
+done
+[ -d "/proc/$NS_PID/ns" ] || die "namespace process $NS_PID did not appear"
 
 slirp4netns --configure --disable-host-loopback "$NS_PID" tap0 &
 SLIRP_PID=$!
-sleep 1
+# Wait for slirp4netns to configure tap0 (poll instead of fixed sleep)
+for _ in $(seq 1 50); do
+    nsenter -U -n --preserve-credentials -t "$NS_PID" -- \
+        ip link show tap0 >/dev/null 2>&1 && break
+    sleep 0.1
+done
+nsenter -U -n --preserve-credentials -t "$NS_PID" -- \
+    ip link show tap0 >/dev/null 2>&1 || die "slirp4netns tap0 did not appear"
 
 nsenter -U -m -n --preserve-credentials -t "$NS_PID" -- bash -c "$INNER_SETUP" -- "$@"
 STATUS=$?

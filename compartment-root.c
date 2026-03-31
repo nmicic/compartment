@@ -819,12 +819,42 @@ static void apply_kept_caps(Config *config)
 
 /* ── Cgroup assignment (called by parent, host filesystem context) ──── */
 
+/* Return non-zero if path contains a ".." component (path traversal guard). */
+static int path_has_dotdot(const char *path)
+{
+    const char *p = path;
+    while (*p) {
+        /* Match a ".." segment: at start, after '/', or before '/' or '\0' */
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0') &&
+            (p == path || p[-1] == '/'))
+            return 1;
+        p++;
+    }
+    return 0;
+}
+
 static int assign_to_cgroups(Config *config, pid_t pid)
 {
     for (int i = 0; i < config->cgroups_count; i++) {
-        char tasks_file[512];
-        snprintf(tasks_file, sizeof(tasks_file), "%s/cgroup.procs",
+        /* Reject relative paths and paths with ".." traversal components */
+        if (config->cgroups[i][0] != '/') {
+            fprintf(stderr, "compartment-root: cgroup path must be absolute: %s\n",
+                    config->cgroups[i]);
+            return -1;
+        }
+        if (path_has_dotdot(config->cgroups[i])) {
+            fprintf(stderr, "compartment-root: cgroup path contains '..': %s\n",
+                    config->cgroups[i]);
+            return -1;
+        }
+        char tasks_file[PATH_MAX];
+        int n = snprintf(tasks_file, sizeof(tasks_file), "%s/cgroup.procs",
                  config->cgroups[i]);
+        if (n < 0 || (size_t)n >= sizeof(tasks_file)) {
+            fprintf(stderr, "compartment-root: cgroup path too long: %s\n",
+                    config->cgroups[i]);
+            return -1;
+        }
 
         FILE *f = fopen(tasks_file, "w");
         if (!f) {
@@ -842,7 +872,20 @@ static int assign_to_cgroups(Config *config, pid_t pid)
 
 static void join_netns(const char *netns_name)
 {
-    char netns_path[256];
+    /* Reject names with '/' — only simple names are valid under /var/run/netns/ */
+    if (strchr(netns_name, '/') != NULL) {
+        fprintf(stderr, "compartment-root: invalid netns name (contains '/'): %s\n",
+                netns_name);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Ensure the constructed path fits (prefix is 16 chars: "/var/run/netns/") */
+    if (strlen(netns_name) >= PATH_MAX - 16) {
+        fprintf(stderr, "compartment-root: netns name too long: %s\n", netns_name);
+        exit(EXIT_FAILURE);
+    }
+
+    char netns_path[PATH_MAX];
     snprintf(netns_path, sizeof(netns_path), "/var/run/netns/%s", netns_name);
 
     int fd = open(netns_path, O_RDONLY);
