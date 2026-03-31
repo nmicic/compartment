@@ -105,6 +105,11 @@ static void apply_profile_ai_agent(Config *cfg)
         "acct", "swapon", "swapoff",
         "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
         "io_uring_setup", "io_uring_enter", "io_uring_register",
+        /* Container escape vectors: handle-based file access, new mount API */
+        "open_by_handle_at", "name_to_handle_at",
+        "move_mount", "fsopen", "fsmount", "fsconfig", "fspick",
+        /* Cross-process FD theft */
+        "pidfd_getfd",
 #ifdef __x86_64__
         "ioperm", "iopl",
 #endif
@@ -118,12 +123,23 @@ static void apply_profile_ai_agent(Config *cfg)
 
     /* Dangerous env vars to strip */
     const char *deny_env[] = {
+        /* Dynamic linker injection */
         "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
         "GCONV_PATH",                       /* glibc iconv arbitrary .so load */
         "HOSTALIASES",                      /* hostname resolution hijack */
         "LOCPATH", "NLSPATH",               /* locale/message catalog injection */
         "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
         "_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS",
+        /* Cloud credentials — prevent ambient credential leakage */
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AZURE_CLIENT_SECRET",
+        /* VCS / CI tokens */
+        "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "NPM_TOKEN",
+        /* SSH agent — prevents key use via forwarded socket */
+        "SSH_AUTH_SOCK",
+        /* Database credentials */
+        "DATABASE_URL", "PGPASSWORD", "MYSQL_PWD",
         NULL
     };
     for (int i = 0; deny_env[i]; i++) {
@@ -252,7 +268,12 @@ static int apply_landlock(Config *cfg)
         case PATH_EXEC: access = read_access | exec_access; break;
         case PATH_RWX:  access = read_access | write_access | exec_access; break;
         }
-        landlock_add_path(ruleset_fd, cfg->paths[i].path, access);
+        if (landlock_add_path(ruleset_fd, cfg->paths[i].path, access) != 0) {
+            fprintf(stderr, "compartment-user: landlock: failed to add rule for %s\n",
+                    cfg->paths[i].path);
+            close(ruleset_fd);
+            return -1;
+        }
     }
 
     /* Enforce */
@@ -446,8 +467,12 @@ int main(int argc, char *argv[])
         }
 
         char real_shell[PATH_MAX];
-        snprintf(real_shell, sizeof(real_shell), "%s/%s",
-                 shell_dir, invoked_name);
+        int rsn = snprintf(real_shell, sizeof(real_shell), "%s/%s",
+                           shell_dir, invoked_name);
+        if (rsn < 0 || (size_t)rsn >= sizeof(real_shell)) {
+            fprintf(stderr, "compartment-user: shell path too long\n");
+            return 126;
+        }
 
         /* Apply ai-agent profile sandbox, then exec real shell */
         Config shell_cfg = {

@@ -32,6 +32,8 @@ set -euo pipefail
 # ── Configuration ───────────────────────────────────────────────────────
 UPSTREAM_PROXY="${UPSTREAM_PROXY:-${HTTPS_PROXY:-${HTTP_PROXY:-}}}"
 INNER_PORT="${SANDBOX_PROXY_PORT:-18080}"
+# Validate port is numeric to prevent injection into socat arguments
+[[ "$INNER_PORT" =~ ^[0-9]+$ ]] || { echo "sandbox: ERROR: SANDBOX_PROXY_PORT must be numeric" >&2; exit 1; }
 # Use a private temp directory (mode 700) to avoid predictable /tmp socket paths
 SOCK_DIR="$(mktemp -d -t compartment-sandbox-XXXXXXXX)"
 chmod 700 "$SOCK_DIR"
@@ -139,7 +141,14 @@ run_verify() {
     if [ -n "$UPSTREAM_PROXY" ]; then
         echo "   upstream: $UPSTREAM_PROXY"
         printf "   connectivity: "
-        timeout 3 bash -c "echo | socat - TCP:${UPSTREAM_PROXY#http*://}" 2>/dev/null && echo "OK" || echo "UNREACHABLE"
+        verify_hp="${UPSTREAM_PROXY#http://}"
+        verify_hp="${verify_hp#https://}"
+        verify_hp="${verify_hp%%/*}"
+        if [[ "$verify_hp" =~ ^[a-zA-Z0-9._-]+:[0-9]+$ ]]; then
+            timeout 3 socat -u /dev/null "TCP:$verify_hp" 2>/dev/null && echo "OK" || echo "UNREACHABLE"
+        else
+            echo "INVALID (not host:port)"
+        fi
     else
         echo "   UPSTREAM_PROXY not set — set it to your corporate proxy"
     fi
@@ -161,6 +170,8 @@ if [ -n "$UPSTREAM_PROXY" ]; then
     PROXY_HOSTPORT="${UPSTREAM_PROXY#http://}"
     PROXY_HOSTPORT="${PROXY_HOSTPORT#https://}"
     PROXY_HOSTPORT="${PROXY_HOSTPORT%%/*}"
+    # Validate host:port format to prevent socat argument injection
+    [[ "$PROXY_HOSTPORT" =~ ^[a-zA-Z0-9._-]+:[0-9]+$ ]] || die "UPSTREAM_PROXY is not valid host:port: $PROXY_HOSTPORT"
 
     socat "UNIX-LISTEN:$SOCK,fork,mode=600" "TCP:$PROXY_HOSTPORT" &
     SOCAT_PID=$!

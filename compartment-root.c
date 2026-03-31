@@ -152,7 +152,8 @@ int main(int argc, char *argv[])
             char *endptr;
             errno = 0;
             unsigned long val = strtoul(optarg, &endptr, 10);
-            if (errno != 0 || endptr == optarg || *endptr != '\0') {
+            if (errno != 0 || endptr == optarg || *endptr != '\0' ||
+                val > (unsigned long)UINT32_MAX) {
                 fprintf(stderr, "compartment-root: invalid UID: %s\n", optarg);
                 return 1;
             }
@@ -163,7 +164,8 @@ int main(int argc, char *argv[])
             char *endptr;
             errno = 0;
             unsigned long val = strtoul(optarg, &endptr, 10);
-            if (errno != 0 || endptr == optarg || *endptr != '\0') {
+            if (errno != 0 || endptr == optarg || *endptr != '\0' ||
+                val > (unsigned long)UINT32_MAX) {
                 fprintf(stderr, "compartment-root: invalid GID: %s\n", optarg);
                 return 1;
             }
@@ -577,7 +579,7 @@ static int child_func(void *arg)
 
     /* 7. Optional: bring up loopback in new network namespace */
     if (config->loopback && !config->netns) {
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        int sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         if (sock >= 0) {
             struct ifreq ifr;
             memset(&ifr, 0, sizeof(ifr));
@@ -669,7 +671,7 @@ static void write_uid_gid_map(pid_t pid, const char *map_str,
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/%s", pid, map_file);
 
-    int fd = open(path, O_WRONLY);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd == -1) {
         fprintf(stderr, "compartment-root: open %s: %s\n",
                 path, strerror(errno));
@@ -888,7 +890,7 @@ static void join_netns(const char *netns_name)
     char netns_path[PATH_MAX];
     snprintf(netns_path, sizeof(netns_path), "/var/run/netns/%s", netns_name);
 
-    int fd = open(netns_path, O_RDONLY);
+    int fd = open(netns_path, O_RDONLY | O_CLOEXEC);
     if (fd == -1) {
         perror("compartment-root: open netns");
         exit(EXIT_FAILURE);
