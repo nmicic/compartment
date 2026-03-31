@@ -61,6 +61,9 @@
 #define MAX_ENV_VARS      64
 #define MAX_LINE          1024
 #define MAX_INHERIT_DEPTH 2
+/* Linux enforces BPF_MAXINSNS=4096 for seccomp filters.
+ * Our BPF program uses 5 header/footer insns + 2 per rule. */
+#define MAX_SECCOMP_RULES ((4096 - 5) / 2)  /* 2045 */
 
 /* ── Path rule ──────────────────────────────────────────────────────── */
 
@@ -974,9 +977,9 @@ static inline int build_seccomp_bpf(int *syscalls, int count,
     /* BPF program: 4 header + 2 per rule + 1 default = 4 + count*2 + 1.
      * sock_fprog.len is unsigned short (max 65535 ≈ BPF_MAXINSNS 4096).
      * Linux enforces BPF_MAXINSNS = 4096 for seccomp filters. */
-    if (count < 0 || count > 2045) {  /* (2045*2 + 5) = 4095 < 4096 */
-        fprintf(stderr, "compartment: seccomp: too many syscall rules (%d)\n",
-                count);
+    if (count < 0 || count > MAX_SECCOMP_RULES) {
+        fprintf(stderr, "compartment: seccomp: too many syscall rules (%d, max %d)\n",
+                count, MAX_SECCOMP_RULES);
         return -1;
     }
     int prog_len = 4 + count * 2 + 1;
