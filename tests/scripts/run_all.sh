@@ -54,7 +54,7 @@ run_suite() {
 
 echo "Building compartment tools..."
 cd "${REPO_DIR}"
-make > /dev/null 2>&1
+make 2>&1 | tail -5
 
 echo "Building deny_probe..."
 cc -Wall -Wextra -Wpedantic -std=c11 -O2 \

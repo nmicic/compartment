@@ -58,7 +58,7 @@
 #define MAX_PATHS         64
 #define MAX_BLOCKED_SC    64
 #define MAX_ALLOWED_SC    512
-#define MAX_ENV_VARS      32
+#define MAX_ENV_VARS      64
 #define MAX_LINE          1024
 #define MAX_INHERIT_DEPTH 2
 
@@ -370,6 +370,30 @@ static const SyscallEntry syscall_table[] = {
 #ifdef __NR_io_uring_register
     {"io_uring_register",   __NR_io_uring_register},
 #endif
+#ifdef __NR_open_by_handle_at
+    {"open_by_handle_at",   __NR_open_by_handle_at},
+#endif
+#ifdef __NR_name_to_handle_at
+    {"name_to_handle_at",   __NR_name_to_handle_at},
+#endif
+#ifdef __NR_move_mount
+    {"move_mount",          __NR_move_mount},
+#endif
+#ifdef __NR_fsopen
+    {"fsopen",              __NR_fsopen},
+#endif
+#ifdef __NR_fsmount
+    {"fsmount",             __NR_fsmount},
+#endif
+#ifdef __NR_fsconfig
+    {"fsconfig",            __NR_fsconfig},
+#endif
+#ifdef __NR_fspick
+    {"fspick",              __NR_fspick},
+#endif
+#ifdef __NR_pidfd_getfd
+    {"pidfd_getfd",         __NR_pidfd_getfd},
+#endif
 
     {NULL, 0}
 };
@@ -467,6 +491,23 @@ static inline int resolve_cap(const char *name)
     return -1;
 }
 
+/* ── Boolean value parsing (case-insensitive, fail-closed) ──────── */
+
+static inline int parse_bool(const char *val, int *out)
+{
+    if (strcasecmp(val, "on") == 0 || strcasecmp(val, "yes") == 0 ||
+        strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0) {
+        *out = 1;
+        return 0;
+    }
+    if (strcasecmp(val, "off") == 0 || strcasecmp(val, "no") == 0 ||
+        strcasecmp(val, "false") == 0 || strcmp(val, "0") == 0) {
+        *out = 0;
+        return 0;
+    }
+    return -1; /* unrecognized value */
+}
+
 /* ── Variable expansion ($HOME, $USER only) ─────────────────────── */
 
 static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
@@ -529,6 +570,16 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
             line[--len] = '\0';
 
+        /* Detect truncated lines (no newline and not EOF) — a truncated
+         * line could cause the remainder to parse as a new directive,
+         * silently changing the security policy. Fail-closed. */
+        if (len > 0 && len >= sizeof(line) - 1 && !feof(fp)) {
+            fprintf(stderr, "compartment: %s:%d: error: line too long "
+                    "(max %d chars)\n", path, lineno, MAX_LINE - 2);
+            fclose(fp);
+            return -1;
+        }
+
         /* Skip blank lines and comments */
         const char *s = line;
         while (*s == ' ' || *s == '\t') s++;
@@ -553,8 +604,10 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 cfg->paths[cfg->path_count].mode = PATH_RO;
                 cfg->path_count++;
             } else {
-                fprintf(stderr, "compartment: %s:%d: warning: path limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_PATHS, val);
+                fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",
+                        path, lineno, MAX_PATHS);
+                fclose(fp);
+                return -1;
             }
         } else if (strcmp(directive, "rw") == 0) {
             if (cfg->path_count < MAX_PATHS) {
@@ -562,8 +615,10 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 cfg->paths[cfg->path_count].mode = PATH_RW;
                 cfg->path_count++;
             } else {
-                fprintf(stderr, "compartment: %s:%d: warning: path limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_PATHS, val);
+                fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",
+                        path, lineno, MAX_PATHS);
+                fclose(fp);
+                return -1;
             }
         } else if (strcmp(directive, "exec") == 0) {
             if (cfg->path_count < MAX_PATHS) {
@@ -571,16 +626,21 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 cfg->paths[cfg->path_count].mode = PATH_EXEC;
                 cfg->path_count++;
             } else {
-                fprintf(stderr, "compartment: %s:%d: warning: path limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_PATHS, val);
+                fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",
+                        path, lineno, MAX_PATHS);
+                fclose(fp);
+                return -1;
             }
         } else if (strcmp(directive, "block") == 0) {
             int nr = resolve_syscall(val);
             if (nr >= 0 && cfg->blocked_count < MAX_BLOCKED_SC)
                 cfg->blocked_syscalls[cfg->blocked_count++] = nr;
-            else if (nr >= 0)
-                fprintf(stderr, "compartment: %s:%d: warning: blocked syscall limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_BLOCKED_SC, val);
+            else if (nr >= 0) {
+                fprintf(stderr, "compartment: %s:%d: error: blocked syscall limit (%d) reached, refusing to weaken policy\n",
+                        path, lineno, MAX_BLOCKED_SC);
+                fclose(fp);
+                return -1;
+            }
             else
                 fprintf(stderr, "compartment: %s:%d: unknown syscall: %s\n",
                         path, lineno, val);
@@ -590,8 +650,10 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 cfg->allowed_syscalls[cfg->allowed_sc_count++] = nr;
                 cfg->seccomp_allow_mode = 1;
             } else if (nr >= 0) {
-                fprintf(stderr, "compartment: %s:%d: warning: allowed syscall limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_ALLOWED_SC, val);
+                fprintf(stderr, "compartment: %s:%d: error: allowed syscall limit (%d) reached, refusing to weaken policy\n",
+                        path, lineno, MAX_ALLOWED_SC);
+                fclose(fp);
+                return -1;
             } else if (nr < 0) {
                 fprintf(stderr, "compartment: %s:%d: unknown syscall: %s\n",
                         path, lineno, val);
@@ -604,16 +666,21 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         } else if (strcmp(directive, "env-deny") == 0) {
             if (cfg->env_deny_count < MAX_ENV_VARS)
                 cfg->env_deny[cfg->env_deny_count++] = strdup(val);
-            else
-                fprintf(stderr, "compartment: %s:%d: warning: env-deny limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_ENV_VARS, val);
+            else {
+                fprintf(stderr, "compartment: %s:%d: error: env-deny limit (%d) reached, refusing to weaken policy\n",
+                        path, lineno, MAX_ENV_VARS);
+                fclose(fp);
+                return -1;
+            }
         } else if (strcmp(directive, "env-allow") == 0) {
             if (cfg->env_allow_count < MAX_ENV_VARS) {
                 cfg->env_allow[cfg->env_allow_count++] = strdup(val);
                 cfg->env_allow_mode = 1;
             } else {
-                fprintf(stderr, "compartment: %s:%d: warning: env-allow limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_ENV_VARS, val);
+                fprintf(stderr, "compartment: %s:%d: error: env-allow limit (%d) reached, refusing to weaken policy\n",
+                        path, lineno, MAX_ENV_VARS);
+                fclose(fp);
+                return -1;
             }
         } else if (strcmp(directive, "env-mode") == 0) {
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
@@ -623,15 +690,30 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         } else if (strcmp(directive, "workdir") == 0) {
             cfg->workdir = strdup(val);
         } else if (strcmp(directive, "landlock") == 0) {
-            cfg->use_landlock = (strcmp(val, "on") == 0);
+            if (parse_bool(val, &cfg->use_landlock) != 0) {
+                fprintf(stderr, "compartment: %s:%d: invalid value for landlock: '%s' (use on/off)\n", path, lineno, val);
+                fclose(fp); return -1;
+            }
         } else if (strcmp(directive, "seccomp") == 0) {
-            cfg->use_seccomp = (strcmp(val, "on") == 0);
+            if (parse_bool(val, &cfg->use_seccomp) != 0) {
+                fprintf(stderr, "compartment: %s:%d: invalid value for seccomp: '%s' (use on/off)\n", path, lineno, val);
+                fclose(fp); return -1;
+            }
         } else if (strcmp(directive, "no-new-privs") == 0) {
-            cfg->use_no_new_privs = (strcmp(val, "on") == 0);
+            if (parse_bool(val, &cfg->use_no_new_privs) != 0) {
+                fprintf(stderr, "compartment: %s:%d: invalid value for no-new-privs: '%s' (use on/off)\n", path, lineno, val);
+                fclose(fp); return -1;
+            }
         } else if (strcmp(directive, "env-sanitize") == 0) {
-            cfg->use_env_sanitize = (strcmp(val, "on") == 0);
+            if (parse_bool(val, &cfg->use_env_sanitize) != 0) {
+                fprintf(stderr, "compartment: %s:%d: invalid value for env-sanitize: '%s' (use on/off)\n", path, lineno, val);
+                fclose(fp); return -1;
+            }
         } else if (strcmp(directive, "audit") == 0) {
-            cfg->audit = (strcmp(val, "on") == 0);
+            if (parse_bool(val, &cfg->audit) != 0) {
+                fprintf(stderr, "compartment: %s:%d: invalid value for audit: '%s' (use on/off)\n", path, lineno, val);
+                fclose(fp); return -1;
+            }
         } else if (strcmp(directive, "audit-log") == 0) {
             cfg->audit_log_dir = strdup(val);
             cfg->audit = 1;
@@ -675,9 +757,29 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             free(cfg->rootdir);
             cfg->rootdir = strdup(val);
         } else if (strcmp(directive, "uid") == 0) {
-            cfg->uid = (uid_t)strtoul(val, NULL, 10);
+            char *endptr;
+            errno = 0;
+            unsigned long v = strtoul(val, &endptr, 10);
+            if (errno != 0 || endptr == val || *endptr != '\0' ||
+                v > (unsigned long)UINT32_MAX) {
+                fprintf(stderr, "compartment: %s:%d: invalid uid: %s\n",
+                        path, lineno, val);
+                fclose(fp);
+                return -1;
+            }
+            cfg->uid = (uid_t)v;
         } else if (strcmp(directive, "gid") == 0) {
-            cfg->gid = (gid_t)strtoul(val, NULL, 10);
+            char *endptr;
+            errno = 0;
+            unsigned long v = strtoul(val, &endptr, 10);
+            if (errno != 0 || endptr == val || *endptr != '\0' ||
+                v > (unsigned long)UINT32_MAX) {
+                fprintf(stderr, "compartment: %s:%d: invalid gid: %s\n",
+                        path, lineno, val);
+                fclose(fp);
+                return -1;
+            }
+            cfg->gid = (gid_t)v;
         } else if (strcmp(directive, "username") == 0) {
             free(cfg->username);
             cfg->username = strdup(val);
@@ -687,27 +789,40 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         } else if (strcmp(directive, "cgroup") == 0) {
             if (cfg->cgroups_count < MAX_PATHS)
                 cfg->cgroups[cfg->cgroups_count++] = strdup(val);
-            else
-                fprintf(stderr, "compartment: %s:%d: warning: cgroup limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_PATHS, val);
+            else {
+                fprintf(stderr, "compartment: %s:%d: error: cgroup limit (%d) reached\n",
+                        path, lineno, MAX_PATHS);
+                fclose(fp);
+                return -1;
+            }
         } else if (strcmp(directive, "cap-allow") == 0) {
             if (cfg->cap_allowed_count < MAX_ENV_VARS)
                 cfg->cap_allowed_names[cfg->cap_allowed_count++] = strdup(val);
-            else
-                fprintf(stderr, "compartment: %s:%d: warning: cap-allow limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_ENV_VARS, val);
+            else {
+                fprintf(stderr, "compartment: %s:%d: error: cap-allow limit (%d) reached\n",
+                        path, lineno, MAX_ENV_VARS);
+                fclose(fp);
+                return -1;
+            }
         } else if (strcmp(directive, "loopback") == 0) {
-            cfg->loopback = (strcmp(val, "on") == 0);
+            if (parse_bool(val, &cfg->loopback) != 0) {
+                fprintf(stderr, "compartment: %s:%d: invalid value for loopback: '%s' (use on/off)\n", path, lineno, val);
+                fclose(fp); return -1;
+            }
         } else if (strcmp(directive, "mount-mask") == 0) {
             if (cfg->mount_mask_count < MAX_PATHS)
                 cfg->mount_masks[cfg->mount_mask_count++] = strdup(val);
-            else
-                fprintf(stderr, "compartment: %s:%d: warning: mount-mask limit (%d) reached, '%s' not added\n",
-                        path, lineno, MAX_PATHS, val);
+            else {
+                fprintf(stderr, "compartment: %s:%d: error: mount-mask limit (%d) reached\n",
+                        path, lineno, MAX_PATHS);
+                fclose(fp);
+                return -1;
+            }
         } else {
-            /* Unknown directives silently skipped — each tool uses
-             * what it recognizes and ignores the rest. */
-            (void)0;
+            /* Warn on unknown directives — typos silently weakening
+             * policy is a real risk in corporate deployments. */
+            fprintf(stderr, "compartment: %s:%d: warning: unknown directive '%s' (typo?)\n",
+                    path, lineno, directive);
         }
     }
     fclose(fp);
@@ -728,10 +843,12 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name, int de
     char path[PATH_MAX];
 
     if (home) {
-        snprintf(path, sizeof(path), "%s/.config/compartment/%s.conf", home, name);
-        if (load_profile_file(cfg, path, depth) == 0) {
-            cfg->profile_source = strdup(path);
-            return 0;
+        int n = snprintf(path, sizeof(path), "%s/.config/compartment/%s.conf", home, name);
+        if (n > 0 && (size_t)n < sizeof(path)) {
+            if (load_profile_file(cfg, path, depth) == 0) {
+                cfg->profile_source = strdup(path);
+                return 0;
+            }
         }
     }
 
@@ -848,6 +965,10 @@ static inline int audit_log_open(Config *cfg)
 
     char path[PATH_MAX];
     int n = snprintf(path, sizeof(path), "%s/", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "compartment: audit log dir path too long\n");
+        return -1;
+    }
     strftime(path + n, sizeof(path) - (size_t)n, "%Y-%m-%d.log", tm);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
@@ -998,8 +1119,8 @@ static inline int apply_seccomp(Config *cfg)
     } else {
         /* Deny-list: block these syscalls, default allow */
         if (cfg->blocked_count == 0) {
-            if (cfg->verbose)
-                fprintf(stderr, "compartment: seccomp: no syscalls to block\n");
+            fprintf(stderr, "compartment: warning: seccomp enabled but no "
+                    "syscalls to block — no filter installed\n");
             return 0;
         }
         r = build_seccomp_bpf(cfg->blocked_syscalls, cfg->blocked_count,

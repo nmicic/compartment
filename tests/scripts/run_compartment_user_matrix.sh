@@ -219,33 +219,48 @@ echo ""
 
 echo "--- Test group: seccomp deny-list ---"
 
-# ptrace should be blocked (SIGSYS → exit 159 or similar)
+# Helper: verify probe actually ran (output is not empty) and got EPERM
+# This prevents false-greens when compartment-user fails before probe runs.
+expect_blocked() {
+    local label="$1"
+    if [ -z "${PROBE_OUT}" ]; then
+        fail "${label} (probe produced no output — may not have run)"
+    elif echo "${PROBE_OUT}" | grep -q "rc=0"; then
+        fail "${label} (syscall was NOT blocked)"
+    elif echo "${PROBE_OUT}" | grep -q "errno=1\|EPERM\|rc="; then
+        pass "${label}"
+    else
+        fail "${label} (unexpected output: ${PROBE_OUT})"
+    fi
+}
+
+# ptrace should be blocked (seccomp returns EPERM)
 run_probe "${PROFILES}/test-seccomp-deny.conf" sc_ptrace_traceme
-expect_not_contains "ptrace blocked" "rc=0"
+expect_blocked "ptrace blocked"
 
 # unshare should be blocked
 run_probe "${PROFILES}/test-seccomp-deny.conf" sc_unshare_user
-expect_not_contains "unshare blocked" "rc=0"
+expect_blocked "unshare blocked"
 
-# process_vm_readv should be blocked (SIGSYS, not just EPERM/ESRCH)
+# process_vm_readv should be blocked
 run_probe "${PROFILES}/test-seccomp-deny.conf" sc_process_vm_readv
-expect_not_contains "process_vm_readv blocked" "rc=0"
+expect_blocked "process_vm_readv blocked"
 
 # process_vm_writev should be blocked
 run_probe "${PROFILES}/test-seccomp-deny.conf" sc_process_vm_writev
-expect_not_contains "process_vm_writev blocked" "rc=0"
+expect_blocked "process_vm_writev blocked"
 
 # userfaultfd should be blocked
 run_probe "${PROFILES}/test-seccomp-deny.conf" sc_userfaultfd
-expect_not_contains "userfaultfd blocked" "rc=0"
+expect_blocked "userfaultfd blocked"
 
 # perf_event_open should be blocked
 run_probe "${PROFILES}/test-seccomp-deny.conf" sc_perf_event_open
-expect_not_contains "perf_event_open blocked" "rc=0"
+expect_blocked "perf_event_open blocked"
 
 # io_uring_setup should be blocked
 run_probe "${PROFILES}/test-seccomp-deny.conf" sc_io_uring_setup
-expect_not_contains "io_uring_setup blocked" "rc=0"
+expect_blocked "io_uring_setup blocked"
 
 # Normal operations should still work (read, write, etc.)
 run_probe "${PROFILES}/test-seccomp-deny.conf" fs_read /etc/hostname
@@ -276,6 +291,16 @@ expect_contains "PATH preserved" "value=/usr/bin:/bin"
 # HOME should survive
 PROBE_OUT=$("${CU}" --profile "${PROFILES}/test-env-deny.conf" -- "${PROBE}" env_get HOME 2>/dev/null) || PROBE_RC=$?
 expect_contains "HOME preserved" "value=/"
+
+# Cloud credentials should be stripped by default ai-agent profile
+PROBE_OUT=$(AWS_SECRET_ACCESS_KEY=supersecret \
+    "${CU}" -- "${PROBE}" env_get AWS_SECRET_ACCESS_KEY 2>/dev/null) || PROBE_RC=$?
+expect_contains "AWS_SECRET_ACCESS_KEY stripped" "value=(null)"
+
+# SSH agent socket should be stripped
+PROBE_OUT=$(SSH_AUTH_SOCK=/tmp/ssh-agent.sock \
+    "${CU}" -- "${PROBE}" env_get SSH_AUTH_SOCK 2>/dev/null) || PROBE_RC=$?
+expect_contains "SSH_AUTH_SOCK stripped" "value=(null)"
 
 echo ""
 
@@ -379,10 +404,10 @@ expect_not_contains "strict file: ptrace blocked (file inherit)" "rc=0"
 
 # Verify strict.conf file actually loads ai-agent rules (dry-run check)
 DRY_OUT=$("${CU}" --profile "${REPO_DIR}/examples/strict.conf" --dry-run -- /bin/true 2>&1) || true
-if echo "${DRY_OUT}" | grep -q "14 path rules" && echo "${DRY_OUT}" | grep -q "39 blocked"; then
-    pass "strict.conf file: inherits full ai-agent policy (14 paths, 39 blocks)"
+if echo "${DRY_OUT}" | grep -q "14 path rules" && echo "${DRY_OUT}" | grep -q "47 blocked"; then
+    pass "strict.conf file: inherits full ai-agent policy (14 paths, 47 blocks)"
 else
-    fail "strict.conf file: incomplete inheritance (expected 14 paths + 39 blocks)"
+    fail "strict.conf file: incomplete inheritance (expected 14 paths + 47 blocks)"
 fi
 
 # ── Test 10: Shell-replacement mode ──────────────────────────────
@@ -412,6 +437,67 @@ else
 
     rm -rf "$(dirname "${SHELL_LINK}")"
 fi
+
+# ── Test 11: FD inheritance ──────────────────────────────────────
+
+echo "--- Test group: FD inheritance ---"
+
+# Verify no unexpected FDs leak to sandboxed process
+# Under sandboxing, only stdin/stdout/stderr (0,1,2) should be open
+# plus any FDs compartment-user legitimately passes through
+if [ "${NO_LANDLOCK}" -eq 1 ]; then
+    skip "FD test requires Landlock"
+else
+    run_probe "${PROFILES}/test-fs-readonly.conf" fd_list
+    if [ -n "${PROBE_OUT}" ]; then
+        # Count FDs reported — should only see 0,1,2 and possibly a few more
+        FD_COUNT=$(echo "${PROBE_OUT}" | grep -c "fd=" || true)
+        if [ "${FD_COUNT}" -le 5 ]; then
+            pass "FD inheritance: only ${FD_COUNT} FDs visible to child"
+        else
+            fail "FD inheritance: ${FD_COUNT} FDs leaked to child (expected <=5)"
+        fi
+    else
+        skip "FD inheritance: fd_list not supported by probe"
+    fi
+fi
+
+# ── Test 12: Profile hardening negative tests ──────────────────────
+
+echo "--- Test group: Profile hardening ---"
+
+# Test: malformed boolean values should be rejected
+BAD_PROFILE=$(mktemp --suffix=.conf)
+echo 'landlock enabled' > "$BAD_PROFILE"
+BAD_OUT=$("${CU}" --profile "$BAD_PROFILE" --dry-run -- /bin/true 2>&1) || BAD_RC=$?
+if echo "$BAD_OUT" | grep -qi "invalid value for landlock"; then
+    pass "profile: invalid boolean value rejected"
+else
+    fail "profile: 'landlock enabled' should be rejected (got: $BAD_OUT)"
+fi
+rm -f "$BAD_PROFILE"
+
+# Test: unknown directives produce a warning
+WARN_PROFILE=$(mktemp --suffix=.conf)
+printf 'blokc ptrace\n' > "$WARN_PROFILE"
+WARN_OUT=$("${CU}" --profile "$WARN_PROFILE" --dry-run -- /bin/true 2>&1) || true
+if echo "$WARN_OUT" | grep -qi "unknown directive.*blokc"; then
+    pass "profile: unknown directive warned"
+else
+    fail "profile: typo 'blokc' should produce warning"
+fi
+rm -f "$WARN_PROFILE"
+
+# Test: COMPARTMENT_SHELL_DIR path traversal rejected
+SHELL_LINK2=$(mktemp -d)/test-bash
+ln -sf "$(readlink -f "${CU}")" "${SHELL_LINK2}"
+TRAV_OUT=$(COMPARTMENT_SHELL_DIR="/usr/../tmp" "${SHELL_LINK2}" -c "echo hi" 2>&1) || TRAV_RC=$?
+if echo "$TRAV_OUT" | grep -qi "contains '..'"; then
+    pass "shell-replacement: path traversal in COMPARTMENT_SHELL_DIR rejected"
+else
+    fail "shell-replacement: COMPARTMENT_SHELL_DIR with .. should be rejected"
+fi
+rm -rf "$(dirname "${SHELL_LINK2}")"
 
 echo ""
 

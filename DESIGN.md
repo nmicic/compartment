@@ -127,6 +127,20 @@ External review + automated testing uncovered these bugs:
 | 17 | **High** | compartment-user | Shell-replacement `COMPARTMENT_SHELL_DIR` path traversal — env var could point outside intended directory | Reject non-absolute paths and paths containing `..` components |
 | 18 | **Medium** | sandbox.sh | Predictable proxy socket path in world-writable `/tmp` — race window for socket hijack | Move socket into a private `mktemp -d` directory (mode 700) |
 | 19 | **Medium** | sandbox.sh | `slirp4netns` success not verified — SOFT mode proceeded with broken networking on slirp failure | Poll for `tap0` interface appearance; abort if it does not appear |
+| 20 | **High** | compartment.h | Profile `uid`/`gid` parsed with `strtoul(val, NULL, 10)` — no error/range check; value `4294967296` silently truncates to UID 0 (root) | Added endptr/errno/range validation matching CLI parser |
+| 21 | **High** | compartment-root | CLI `--uid`/`--gid` accepted values > UINT32_MAX — truncation to UID 0 on 64-bit systems | Added `val > UINT32_MAX` range check |
+| 22 | **High** | sandbox.sh | `UPSTREAM_PROXY` passed through `bash -c` in `--verify` — shell injection via attacker-controlled proxy env var | Replaced with direct socat call + host:port format validation |
+| 23 | **High** | compartment.h | Profile limit truncation (paths/syscalls/env) returned success — silently weakened policy | Made fail-closed: abort profile loading when any limit exceeded |
+| 24 | **High** | compartment-user | `landlock_add_path()` return value ignored in `apply_landlock()` — failed rules silently weakened filesystem policy | Check return; abort on failure |
+| 25 | **Medium** | compartment.h | Profile line >1024 chars silently wrapped — remainder parsed as new directive, could alter security policy | Detect truncated lines and abort with error |
+| 26 | **Medium** | compartment.h | Boolean directives only accepted exact string `"on"` — `"yes"`, `"true"`, `"ON"` silently disabled security features | Accept on/off/yes/no/true/false/1/0 (case-insensitive); reject unrecognized values |
+| 27 | **Medium** | compartment.h | Unknown profile directives silently ignored — typos like `blokc ptrace` had no effect with no warning | Emit warning on unrecognized directives |
+| 28 | **Medium** | sandbox.sh | `PROXY_HOSTPORT` and `SANDBOX_PROXY_PORT` not validated — potential socat argument injection via env vars | Validate host:port regex and numeric port before use |
+| 29 | **Low** | compartment-root | Missing `O_CLOEXEC` on netns fd, loopback socket, uid_map fd — potential fd leak across exec boundary | Added `O_CLOEXEC`/`SOCK_CLOEXEC` to all short-lived fds |
+| 30 | **Low** | compartment.h/user | Multiple `snprintf` calls unchecked for truncation — silently truncated paths could match wrong files | Added truncation checks with error returns |
+| 31 | **High** | compartment-user | seccomp deny-list missing container escape syscalls: `open_by_handle_at`, `name_to_handle_at`, new mount API (`move_mount`, `fsopen`, `fsmount`, `fsconfig`, `fspick`), `pidfd_getfd` | Added to ai-agent deny-list (built-in + conf) |
+| 32 | **Medium** | compartment-user | Environment sanitization missed cloud/VCS/SSH credential variables (AWS, GCP, GitHub, SSH_AUTH_SOCK, DB passwords) | Added 13 credential env vars to deny-list |
+| 33 | **Low** | compartment.h | `MAX_ENV_VARS` was 32 — too tight with expanded env-deny list, risked silent truncation | Increased to 64 |
 
 ### seccomp Return Action: EPERM vs KILL
 
