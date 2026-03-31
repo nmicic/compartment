@@ -400,6 +400,19 @@ static int do_sc_perf_event_open(void)
     return r >= 0 ? 0 : 1;
 }
 
+static int do_sc_io_uring_setup(void)
+{
+#ifdef __NR_io_uring_setup
+    int r = (int)syscall(__NR_io_uring_setup, 1, NULL);
+    if (r >= 0) close(r);
+    result("sc_io_uring_setup", "", r >= 0 ? 0 : -1);
+    return r >= 0 ? 0 : 1;
+#else
+    result("sc_io_uring_setup", "not available", -1);
+    return 1;
+#endif
+}
+
 /* ── Usage ──────────────────────────────────────────────────────────── */
 
 static void usage(void)
@@ -427,6 +440,7 @@ static void usage(void)
         "  sc_ptrace_traceme           sc_unshare_user\n"
         "  sc_process_vm_readv         sc_process_vm_writev\n"
         "  sc_userfaultfd              sc_perf_event_open\n"
+        "  sc_io_uring_setup\n"
     );
 }
 
@@ -474,6 +488,7 @@ int main(int argc, char *argv[])
     if (strcmp(cmd, "sc_process_vm_writev") == 0)       return do_sc_process_vm_writev();
     if (strcmp(cmd, "sc_userfaultfd") == 0)             return do_sc_userfaultfd();
     if (strcmp(cmd, "sc_perf_event_open") == 0)         return do_sc_perf_event_open();
+    if (strcmp(cmd, "sc_io_uring_setup") == 0)         return do_sc_io_uring_setup();
 
     fprintf(stderr, "deny_probe: unknown command: %s\n", cmd);
     usage();

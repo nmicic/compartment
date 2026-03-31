@@ -361,6 +361,15 @@ static const SyscallEntry syscall_table[] = {
 #ifdef __NR_nfsservctl
     {"nfsservctl",          __NR_nfsservctl},
 #endif
+#ifdef __NR_io_uring_setup
+    {"io_uring_setup",      __NR_io_uring_setup},
+#endif
+#ifdef __NR_io_uring_enter
+    {"io_uring_enter",      __NR_io_uring_enter},
+#endif
+#ifdef __NR_io_uring_register
+    {"io_uring_register",   __NR_io_uring_register},
+#endif
 
     {NULL, 0}
 };

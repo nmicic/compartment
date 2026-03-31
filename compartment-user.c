@@ -104,6 +104,7 @@ static void apply_profile_ai_agent(Config *cfg)
         "process_vm_readv", "process_vm_writev",
         "acct", "swapon", "swapoff",
         "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
+        "io_uring_setup", "io_uring_enter", "io_uring_register",
 #ifdef __x86_64__
         "ioperm", "iopl",
 #endif

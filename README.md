@@ -27,12 +27,21 @@ profile format, zero dependencies.
 Same `.conf` profile files drive both tools. Write your policy once,
 enforce it at whatever privilege level you have.
 
+## Quick Start
+
+```bash
+make
+./compartment-user -- /bin/sh          # sandboxed shell in 2 commands
+./compartment-user --dry-run -- /bin/sh # see what would be applied
+```
+
 ## Build
 
 ```bash
 make                    # builds both tools (zero dependencies)
-make test-quick         # run core tests (Landlock + seccomp + env + inheritance)
+make test               # run core tests (Landlock + seccomp + env + inheritance)
 make test-integration   # run all tests (includes Claude CLI smoke test)
+make hardened           # build with randomized shell stash path
 ```
 
 ## Usage
@@ -61,7 +70,7 @@ make test-integration   # run all tests (includes Claude CLI smoke test)
 
 1. `PR_SET_NO_NEW_PRIVS` — prevent privilege escalation
 2. **Landlock** — filesystem path restrictions (read-only system paths, writable workdir)
-3. **seccomp BPF** — block dangerous syscalls (ptrace, mount, kexec, bpf, ...)
+3. **seccomp BPF** — block dangerous syscalls (ptrace, mount, kexec, bpf, io_uring, ...)
 4. **Environment sanitize** — strip LD_PRELOAD, LD_LIBRARY_PATH, etc.
 5. **Audit logging** — file-per-day log with PPID chain
 
@@ -158,6 +167,7 @@ sandbox.sh             — Network namespace + proxy bridge
 Makefile               — Build targets
 HOWTO.md               — Detailed setup guide
 DESIGN.md              — Architecture, security review, lineage from shell-guard
+SECURITY.md            — Vulnerability reporting policy
 examples/
   ai-agent.conf        — Profile for Claude/Codex/Gemini
   strict.conf          — Locked-down profile (inherits ai-agent)
@@ -166,7 +176,7 @@ examples/
 tests/
   probes/deny_probe.c  — Sandbox validation probe (machine-parseable output)
   profiles/            — Test-specific .conf profiles
-  scripts/run_all.sh   — Top-level test runner (51 tests across 4 suites)
+  scripts/run_all.sh   — Top-level test runner (52 tests across 4 suites)
   README.md            — Test documentation
 archive/
   shell-guard/         — Archived shell-replacement tool (~2003, self-contained)

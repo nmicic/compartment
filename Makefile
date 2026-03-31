@@ -11,7 +11,7 @@ CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE -O2 \
           -fstack-protector-strong -D_FORTIFY_SOURCE=2
 LDFLAGS = -Wl,-z,relro,-z,now
 
-.PHONY: all clean test-integration test-quick hardened
+.PHONY: all clean test test-integration test-quick hardened
 
 # Both tools: zero dependencies
 all: compartment-user compartment-root
@@ -45,7 +45,7 @@ tests/probes/deny_probe: tests/probes/deny_probe.c
 test-integration: all tests/probes/deny_probe
 	./tests/scripts/run_all.sh
 
-test-quick: all tests/probes/deny_probe
+test test-quick: all tests/probes/deny_probe
 	./tests/scripts/run_all.sh --quick
 
 clean:

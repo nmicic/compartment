@@ -1,0 +1,36 @@
+# Copyright (c) 2026 Nenad Micic <nenad@micic.be>
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Build deny_probe
+        run: make tests/probes/deny_probe
+
+      - name: Run tests
+        run: make test-quick
+
+      - name: Verify --version
+        run: |
+          ./compartment-user --version
+          ./compartment-root --version
+
+      - name: Verify --verify
+        run: ./compartment-user --verify
+
+      - name: Dry-run smoke test
+        run: ./compartment-user --dry-run -- /bin/true
