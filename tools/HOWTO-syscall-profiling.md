@@ -9,17 +9,15 @@ program actually needs at runtime.
 ## Quick Start
 
 ```bash
-cd extra/
-
 # 1. Check: is the default ai-agent profile safe for your program?
-python3 syscall.py check --profile ai-agent -- ./my-program
+python3 tools/syscall.py check --profile ai-agent -- ./my-program
 
 # 2. If safe: done, use the default
-compartment-user -- ./my-program
+./compartment-user -- ./my-program
 
 # 3. If not safe: generate a custom profile
-python3 syscall.py profile -o my-program.conf -- ./my-program
-compartment-user --profile my-program.conf -- ./my-program
+python3 tools/syscall.py profile -o my-program.conf -- ./my-program
+./compartment-user --profile my-program.conf -- ./my-program
 ```
 
 ## Two Modes: Deny vs Allow
@@ -71,10 +69,10 @@ timezone reload) may use syscalls not seen during profiling.
 
 ### With environment allow-list
 
-Strip all env vars except those the program actually needs:
+Add a conservative env-allow list to the profile:
 
 ```bash
-python3 syscall.py profile --seccomp-mode allow --with-env -- ./my-program
+python3 tools/syscall.py profile --seccomp-mode allow --with-env -- ./my-program
 ```
 
 Adds to the profile:
@@ -85,6 +83,12 @@ env-allow HOME
 env-allow TERM
 # ...
 ```
+
+> **Note:** `--with-env` generates a conservative default list (PATH,
+> HOME, TERM, LANG, XDG vars, plus any proxy/API key vars currently
+> set in your environment). It does NOT dynamically discover which
+> env vars the program reads — that would require LD_PRELOAD or eBPF.
+> Review and trim the list for your deployment.
 
 ## Workflow: Profiling a Long-Running Program
 
@@ -102,9 +106,14 @@ python3 syscall.py trace --duration 300 -- claude --model claude-opus-4-6
 python3 syscall.py check --profile ai-agent --duration 300 -- claude
 ```
 
-**Tip:** Run the profile step multiple times with different workloads
-(coding task, file search, web fetch) and merge the results. A syscall
-used in ANY run should be in the allow-list.
+> **Important:** A single profiling run will miss rare code paths.
+> Run the profile step multiple times with different workloads
+> (coding task, file search, web fetch, error conditions, network
+> timeouts) and merge the results. A syscall used in ANY run must
+> be in the allow-list. This is the same lesson from years of
+> manual strace work: rare paths only appear under specific
+> conditions, and a profile that misses them will break in
+> production at the worst possible time.
 
 ## Workflow: Static + Dynamic Combined
 
