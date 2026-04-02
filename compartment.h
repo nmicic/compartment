@@ -103,7 +103,7 @@ typedef struct {
     const char *workdir;
     const char *profile;
     const char *profile_source;   /* "built-in" or file path */
-    int         allow_unsecure;   /* --unsecure: run with degraded enforcement */
+    int         allow_insecure;   /* --insecure: run with degraded enforcement */
 
     /* Root-specific fields (compartment-root only, ignored by compartment-user) */
     char       *rootdir;
@@ -978,7 +978,7 @@ static inline int audit_log_open(Config *cfg)
     }
     strftime(path + n, sizeof(path) - (size_t)n, "%Y-%m-%d.log", tm);
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) {
         fprintf(stderr, "compartment: open %s: %s\n", path, strerror(errno));
         return -1;

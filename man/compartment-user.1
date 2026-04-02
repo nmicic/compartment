@@ -133,7 +133,7 @@ If any check fails, execution is refused with suggestions:
 .nf
 compartment-user: REFUSING to execute \(em 1 preflight check failed.
   Options:
-    --unsecure      Run anyway with degraded enforcement
+    --insecure      Run anyway with degraded enforcement
     --no-landlock   Disable Landlock (if filesystem unsupported)
     --verify        Show full system capabilities
 .fi
@@ -163,7 +163,7 @@ warning at
 level, including uid, pid, and ppid for audit trail:
 .RS
 .nf
-compartment-user[bash]: UNSECURE shell session (1 mechanisms failed) uid=1000 pid=12345 ppid=12340
+compartment-user[bash]: INSECURE shell session (1 mechanisms failed) uid=1000 pid=12345 ppid=12340
 .fi
 .RE
 .PP

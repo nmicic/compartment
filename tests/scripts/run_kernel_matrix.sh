@@ -97,15 +97,19 @@ run_kernel_test() {
     local test_name="$2"
     local cmd="$3"
     local expect_rc="${4:-0}"   # expected exit code (0=success, 1=expected failure)
-    local extra_args="${5:-}"   # extra vng args (e.g. --append for boot params)
+    # extra_args: array-safe via shift
+    shift 4 || true
+    local -a extra_args=("$@")
 
     TOTAL=$((TOTAL + 1))
     printf "  %-12s %-40s " "$kernel" "$test_name"
 
     local output rc=0
-    local vng_cmd="vng --run $kernel $KVM_FLAG --rw --pwd --memory $MEMORY --cpus $CPUS $extra_args --exec"
+    local -a vng_cmd=(vng --run "$kernel" $KVM_FLAG --rw --pwd
+                      --memory "$MEMORY" --cpus "$CPUS"
+                      "${extra_args[@]}" --exec)
 
-    output=$($vng_cmd "$cmd" 2>&1) || rc=$?
+    output=$("${vng_cmd[@]}" "$cmd" 2>&1) || rc=$?
 
     if [[ $rc -eq $expect_rc ]]; then
         echo "PASS"
@@ -143,25 +147,27 @@ for K in $KERNELS; do
     else
         # Has Landlock but on 9p — verify fails due to fs type
         # Use lsm= boot param for 5.15 which doesn't enable Landlock by default
-        boot_param=""
         if [[ "$K" == "v5.15" ]]; then
-            boot_param='--append "lsm=landlock,lockdown,capability,yama,apparmor"'
+            run_kernel_test "$K" "verify (landlock+9p)" \
+                "$REPO_DIR/compartment-user --verify" 1 \
+                --append "lsm=landlock,lockdown,capability,yama,apparmor"
+        else
+            run_kernel_test "$K" "verify (landlock+9p)" \
+                "$REPO_DIR/compartment-user --verify" 1
         fi
-        run_kernel_test "$K" "verify (landlock+9p)" \
-            "$REPO_DIR/compartment-user --verify" 1 "$boot_param"
     fi
 
     # Test 3: seccomp enforcement (works on all kernels, independent of fs)
     run_kernel_test "$K" "seccomp deny ptrace" \
-        "$REPO_DIR/compartment-user --unsecure --no-landlock --block ptrace -- /bin/true"
+        "$REPO_DIR/compartment-user --insecure --no-landlock --block ptrace -- /bin/true"
 
-    # Test 4: Preflight refuses on 9p without --unsecure
+    # Test 4: Preflight refuses on 9p without --insecure
     run_kernel_test "$K" "preflight refuses (9p)" \
         "$REPO_DIR/compartment-user -- /bin/true" 1
 
-    # Test 5: --unsecure allows execution on 9p
-    run_kernel_test "$K" "--unsecure proceeds" \
-        "$REPO_DIR/compartment-user --unsecure -- /bin/true"
+    # Test 5: --insecure allows execution on 9p
+    run_kernel_test "$K" "--insecure proceeds" \
+        "$REPO_DIR/compartment-user --insecure -- /bin/true"
 
     # Test 6: --no-landlock bypasses fs check
     run_kernel_test "$K" "--no-landlock bypasses" \
@@ -169,7 +175,7 @@ for K in $KERNELS; do
 
     # Test 7: env sanitization (works everywhere)
     run_kernel_test "$K" "env strip LD_PRELOAD" \
-        "LD_PRELOAD=evil.so $REPO_DIR/compartment-user --unsecure --no-landlock --no-seccomp -- env | grep -c LD_PRELOAD" 1
+        "LD_PRELOAD=evil.so $REPO_DIR/compartment-user --insecure --no-landlock --no-seccomp -- env | grep -c LD_PRELOAD" 1
 done
 
 # ─── Summary ────────────────────────────────────────────────────────────
