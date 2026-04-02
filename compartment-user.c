@@ -34,6 +34,14 @@
 
 #include <linux/landlock.h>
 
+/* Fallback defines for older kernel headers (pre-5.19 / pre-6.2) */
+#ifndef LANDLOCK_ACCESS_FS_REFER
+#define LANDLOCK_ACCESS_FS_REFER       (1ULL << 13)
+#endif
+#ifndef LANDLOCK_ACCESS_FS_TRUNCATE
+#define LANDLOCK_ACCESS_FS_TRUNCATE    (1ULL << 14)
+#endif
+
 /* Shared types, config, syscall table, profile loader, audit,
  * env sanitize, seccomp BPF builder — all static inline. */
 #include "compartment.h"
