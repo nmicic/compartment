@@ -123,7 +123,7 @@ Source tag: $VERSION"
   git push -u origin "$BRANCH" --force
 
   # Return to original branch
-  git checkout "$CURRENT"
+  git checkout -f "$CURRENT"
 
   echo ""
   echo "Done. Archive branch pushed: $BRANCH"
