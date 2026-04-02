@@ -142,6 +142,10 @@ External review + automated testing uncovered these bugs:
 | 32 | **Medium** | compartment-user | Environment sanitization missed cloud/VCS/SSH credential variables (AWS, GCP, GitHub, SSH_AUTH_SOCK, DB passwords) | Added 13 credential env vars to deny-list |
 | 33 | **Low** | compartment.h | `MAX_ENV_VARS` was 32 — too tight with expanded env-deny list, risked silent truncation | Increased to 64 |
 | 34 | **High** | compartment.h | x32 ABI seccomp bypass on x86_64 — attacker could invoke blocked syscalls via x32 numbering (`nr \| 0x40000000`) and the BPF deny-list would not match | Added `BPF_JSET` check: kill any syscall with x32 bit set (credit: Gemini review) |
+| 35 | **Medium** | compartment-user | FD close fallback only iterated to 1024 — leaked inherited FDs above 1023 when `close_range(2)` unavailable | Use `getrlimit(RLIMIT_NOFILE)` for upper bound (credit: Codex review) |
+| 36 | **Medium** | compartment.h | Unknown syscall in `block`/`allow` directive only warned, did not indicate the block was NOT applied | Warning now explicitly says "block NOT applied" to make silent weakening visible |
+| 37 | **Medium** | compartment-user | CLI `--no-landlock`/`--no-seccomp`/`--no-env-sanitize` could be undone by a profile loaded after CLI parsing | CLI disable flags now always take precedence over profile (credit: Codex review) |
+| 38 | **Medium** | compartment-root | Mount propagation used `MS_SLAVE` (allows host→container events) but comment said "private" | Changed to `MS_PRIVATE` — fully isolates mount propagation (credit: Codex review) |
 
 ### seccomp Return Action: EPERM vs KILL
 

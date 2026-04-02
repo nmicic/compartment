@@ -35,6 +35,7 @@
 
 #include <linux/landlock.h>
 #include <sys/statfs.h>
+#include <sys/resource.h>
 
 /* Fallback defines for older kernel headers (pre-5.19 / pre-6.2) */
 #ifndef LANDLOCK_ACCESS_FS_REFER
@@ -866,6 +867,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* Track which flags were explicitly disabled via CLI, so profile
+     * loading cannot silently re-enable them. */
+    int cli_disabled_landlock     = (cfg.use_landlock == 0);
+    int cli_disabled_seccomp      = (cfg.use_seccomp == 0);
+    int cli_disabled_env_sanitize = (cfg.use_env_sanitize == 0);
+
     /* Apply profile: try file first, then fall back to built-in */
     if (strcmp(cfg.profile, "none") != 0) {
         if (resolve_and_load_profile(&cfg, cfg.profile, 0) == 0) {
@@ -883,6 +890,13 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
+
+    /* CLI --no-* flags always win over profile — if the user explicitly
+     * disabled a mechanism on the command line, the profile cannot
+     * silently re-enable it. */
+    if (cli_disabled_landlock)     cfg.use_landlock = 0;
+    if (cli_disabled_seccomp)      cfg.use_seccomp = 0;
+    if (cli_disabled_env_sanitize) cfg.use_env_sanitize = 0;
 
     /* workdir implies rw — the user expects to write there.
      * The ai-agent built-in does this already; this ensures file-loaded
@@ -1043,8 +1057,12 @@ int main(int argc, char *argv[])
      * open() calls, not already-open fds leaked from the parent.
      * close_range() available since Linux 5.9, glibc 2.34. */
     if (close_range(3, ~0U, 0) != 0) {
-        /* Fallback for older kernels */
-        for (int cfd = 3; cfd < 1024; cfd++) close(cfd);
+        /* Fallback for older kernels — use rlimit to find upper bound */
+        struct rlimit rl;
+        int max_fd = 4096;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < (rlim_t)max_fd)
+            max_fd = (int)rl.rlim_cur;
+        for (int cfd = 3; cfd < max_fd; cfd++) close(cfd);
     }
 
     /* ── 7. exec ───────────────────────────────────────────────── */

@@ -505,9 +505,11 @@ static int child_func(void *arg)
         exit(EXIT_FAILURE);
     }
 
-    /* a) Make mount propagation private */
-    if (mount(NULL, "/", NULL, MS_SLAVE | MS_REC, NULL) != 0) {
-        perror("compartment-root: mount MS_SLAVE");
+    /* a) Make mount propagation private — MS_PRIVATE prevents host mount
+     *    events from propagating into the container (MS_SLAVE would still
+     *    allow host→container propagation). */
+    if (mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL) != 0) {
+        perror("compartment-root: mount MS_PRIVATE");
         exit(EXIT_FAILURE);
     }
 

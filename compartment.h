@@ -647,10 +647,15 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                         path, lineno, MAX_BLOCKED_SC);
                 fclose(fp);
                 return -1;
-            }
-            else
-                fprintf(stderr, "compartment: %s:%d: unknown syscall: %s\n",
+            } else {
+                /* Cannot distinguish arch-absent syscalls (e.g. ioperm on
+                 * aarch64) from genuine typos — both return -1. Warn loudly
+                 * but don't abort, since the same .conf file may be used
+                 * across architectures. The block is NOT applied. */
+                fprintf(stderr, "compartment: %s:%d: warning: unknown syscall '%s' "
+                        "— block NOT applied (typo? or arch-specific syscall)\n",
                         path, lineno, val);
+            }
         } else if (strcmp(directive, "allow") == 0) {
             int nr = resolve_syscall(val);
             if (nr >= 0 && cfg->allowed_sc_count < MAX_ALLOWED_SC) {
@@ -661,8 +666,9 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                         path, lineno, MAX_ALLOWED_SC);
                 fclose(fp);
                 return -1;
-            } else if (nr < 0) {
-                fprintf(stderr, "compartment: %s:%d: unknown syscall: %s\n",
+            } else {
+                fprintf(stderr, "compartment: %s:%d: warning: unknown syscall '%s' "
+                        "— allow NOT applied (typo? or arch-specific syscall)\n",
                         path, lineno, val);
             }
         } else if (strcmp(directive, "seccomp-mode") == 0) {
