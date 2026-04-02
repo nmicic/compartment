@@ -1034,9 +1034,10 @@ static inline void sanitize_env(Config *cfg)
  *   [1]   if arch == target → skip kill
  *   [2]   kill (wrong arch)
  *   [3]   load syscall nr
+ *   [4]   (x86_64 only) if nr & 0x40000000 (x32 ABI) → kill
  *   For each rule (2 instructions each):
- *   [4+i*2]   if nr == syscall[i] → fall through to RET
- *   [5+i*2]   RET (action for match)
+ *   [N+i*2]   if nr == syscall[i] → fall through to RET
+ *   [N+i*2+1] RET (action for match)
  *   [last]    RET (default action)
  *
  * Deny-list:  match → ERRNO, default → ALLOW
@@ -1046,7 +1047,11 @@ static inline int build_seccomp_bpf(int *syscalls, int count,
                                      uint32_t match_action,
                                      uint32_t default_action)
 {
-    int prog_len = 4 + count * 2 + 1;
+    int x32_insns = 0;
+#if defined(__x86_64__)
+    x32_insns = 2;  /* JSET + KILL for x32 ABI bypass prevention */
+#endif
+    int prog_len = 4 + x32_insns + count * 2 + 1;
     struct sock_filter *f = calloc((size_t)prog_len, sizeof(struct sock_filter));
     if (!f) return -1;
 
@@ -1084,6 +1089,16 @@ static inline int build_seccomp_bpf(int *syscalls, int count,
     f[p++] = (struct sock_filter)
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                  offsetof(struct seccomp_data, nr));
+
+#if defined(__x86_64__)
+    /* Kill any x32 ABI syscall (bit 30 set). Without this, an attacker
+     * can invoke blocked syscalls via x32 numbering (nr | 0x40000000)
+     * and bypass the deny-list since the filter only matches native nrs. */
+    f[p++] = (struct sock_filter)
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x40000000, 0, 1);
+    f[p++] = (struct sock_filter)
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+#endif
 
     for (int i = 0; i < count; i++) {
         f[p++] = (struct sock_filter)

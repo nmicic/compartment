@@ -141,6 +141,7 @@ External review + automated testing uncovered these bugs:
 | 31 | **High** | compartment-user | seccomp deny-list missing container escape syscalls: `open_by_handle_at`, `name_to_handle_at`, new mount API (`move_mount`, `fsopen`, `fsmount`, `fsconfig`, `fspick`), `pidfd_getfd` | Added to ai-agent deny-list (built-in + conf) |
 | 32 | **Medium** | compartment-user | Environment sanitization missed cloud/VCS/SSH credential variables (AWS, GCP, GitHub, SSH_AUTH_SOCK, DB passwords) | Added 13 credential env vars to deny-list |
 | 33 | **Low** | compartment.h | `MAX_ENV_VARS` was 32 — too tight with expanded env-deny list, risked silent truncation | Increased to 64 |
+| 34 | **High** | compartment.h | x32 ABI seccomp bypass on x86_64 — attacker could invoke blocked syscalls via x32 numbering (`nr \| 0x40000000`) and the BPF deny-list would not match | Added `BPF_JSET` check: kill any syscall with x32 bit set (credit: Gemini review) |
 
 ### seccomp Return Action: EPERM vs KILL
 
