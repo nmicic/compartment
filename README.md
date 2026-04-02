@@ -242,6 +242,42 @@ matches what you're protecting against.
 - **Figuring out why something is being blocked** → `dev.conf`, then tighten
   from there
 
+## Profiling Any Program
+
+Don't write profiles by hand. Use `tools/syscall.py` to generate one
+for any program automatically:
+
+```bash
+# Step 1: Check — will the default profile break your program?
+python3 tools/syscall.py check --profile ai-agent -- wget -q -O /dev/null https://example.com
+
+# Step 2: If it breaks, generate a custom profile
+python3 tools/syscall.py profile -o examples/wget.conf -- wget -q -O /dev/null https://example.com
+
+# Step 3: Use it
+./compartment-user --profile examples/wget.conf -- wget https://example.com
+```
+
+Works with anything: `curl`, `git`, `ssh`, `rsync`, `python3`, database
+clients — any program you can run, you can profile and sandbox.
+
+```bash
+# More examples
+python3 tools/syscall.py profile -o curl.conf -- curl -s https://example.com
+python3 tools/syscall.py profile -o git.conf  -- git clone https://github.com/user/repo
+python3 tools/syscall.py profile -o psql.conf -- psql -c "SELECT 1"
+
+# Strict allow-list (only permit observed syscalls, deny everything else)
+python3 tools/syscall.py profile --seccomp-mode allow -o strict-curl.conf -- curl https://example.com
+
+# See what syscalls a program actually uses
+python3 tools/syscall.py trace -- ssh user@host "echo hello"
+```
+
+Requires `strace` (`apt install strace`). See
+[tools/HOWTO-syscall-profiling.md](tools/HOWTO-syscall-profiling.md)
+for the full guide.
+
 ## Shell Replacement
 
 compartment-user can transparently intercept `/bin/bash` so every
@@ -346,6 +382,9 @@ examples/
   ssh.conf             — Read-only SSH client (no filesystem writes)
   socat-proxy.conf     — Network-only socat bridge (no user file access)
   paranoid-ssh.sh      — Privilege-separated SSH (SSH+socat split)
+tools/
+  syscall.py           — Profile generator: trace any program, emit .conf
+  HOWTO-syscall-profiling.md — Full guide to syscall profiling
 tests/
   probes/deny_probe.c  — Sandbox validation probe (machine-parseable output)
   profiles/            — Test-specific .conf profiles

@@ -21,11 +21,9 @@ vgcore.*
 # Test output
 tests/output/
 
-# Review / analysis artifacts (not part of the tool)
+# Review / analysis artifacts
 review-isolation-tools.md
-syscall.py
 vs-*.md
-HOWTO-syscall-profiling.md
 
 # Editor
 *.swp
