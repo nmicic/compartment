@@ -1,0 +1,216 @@
+.\" Copyright (c) 2026 Nenad Mićić <nenad@micic.be>
+.\" SPDX-License-Identifier: Apache-2.0
+.TH COMPARTMENT-ROOT 8 "April 2026" "compartment 1.1.0" "System Administration"
+.SH NAME
+compartment-root \- full-namespace process isolation (requires root)
+.SH SYNOPSIS
+.B compartment-root
+[\fIOPTIONS\fR] \fB\-\-\fR \fICOMMAND\fR [\fIARGS\fR...]
+.SH DESCRIPTION
+.B compartment-root
+creates a fully isolated container using Linux namespaces, then drops
+privileges and executes the given command. Requires root. Zero dependencies.
+.PP
+Isolation is applied in order:
+.IP 1. 4
+.B clone()
+with new UTS, mount, PID, IPC, net, user, and cgroup namespaces.
+.IP 2.
+.B pivot_root
+\- new root filesystem; old root fully unmounted (stronger than chroot).
+.IP 3.
+Minimal
+.IR /dev ", "
+masked
+.IR /proc ", "
+isolated hostname.
+.IP 4.
+.B Capability drop
+\- all capabilities removed from bounding set except those named via
+.BR \-\-cap\-allowed .
+Uses raw prctl + capset (no libcap dependency).
+.IP 5.
+.B Privilege drop
+\- setgid/setuid to service user.
+.IP 6.
+.B seccomp BPF
+\- raw BPF filter, no libseccomp.
+.IP 7.
+.B Environment sanitization
+and
+.B audit logging
+(same as
+.BR compartment-user (1)).
+.IP 8.
+.B FD cleanup
+\- close all file descriptors >= 3 before exec
+.RI ( close_range
+or fallback loop).
+.SH OPTIONS
+.SS Profile
+.TP
+.BI \-p ", " \-\-profile " NAME|FILE"
+Load policy from a profile file.
+Search order:
+.IR ~/.config/compartment/NAME.conf ,
+.IR /etc/compartment/NAME.conf .
+.SS Namespace
+.TP
+.BI \-c ", " \-\-rootdir " DIR"
+Root filesystem directory for pivot_root. Required.
+Must be absolute and contain no \fB..\fR components.
+.TP
+.BI \-u ", " \-\-uid " UID"
+Override UID for privilege drop inside the container.
+.TP
+.BI \-g ", " \-\-gid " GID"
+Override GID for privilege drop.
+.TP
+.BI \-U ", " \-\-username " USER"
+Service user for privilege drop. Required.
+Looked up via
+.BR getpwnam (3)
+inside the container's
+.IR /etc/passwd .
+.TP
+.BI \-n ", " \-\-netns " NAME"
+Join an existing network namespace
+.RI ( /var/run/netns/NAME ).
+Name must not contain \fB/\fR.
+.TP
+.BR \-l ", " \-\-loopback
+Bring up loopback interface in the new network namespace.
+.TP
+.BI \-C ", " \-\-cgroup " PATH"
+Assign the container process to a cgroup. Repeatable.
+Path must be absolute and contain no \fB..\fR components.
+.TP
+.BI \-M ", " \-\-mount\-mask " PATH"
+Mount an empty read-only tmpfs over \fIPATH\fR inside the container.
+Repeatable. Used to hide sensitive paths in \fI/proc\fR.
+Path must be absolute and contain no \fB..\fR components.
+.SS Capabilities
+.TP
+.BI \-A ", " \-\-cap\-allowed " CAP"
+Preserve a capability for the service user. Repeatable.
+Accepts \fBCAP_NET_BIND_SERVICE\fR, \fBnet_bind_service\fR, or a
+raw number (0\-63). Uses
+.BR PR_SET_KEEPCAPS ,
+raw
+.BR capset (2),
+and
+.BR PR_CAP_AMBIENT_RAISE .
+.SS "Syscalls (seccomp BPF)"
+.TP
+.BI \-a ", " \-\-seccomp\-allowed " SYSCALL"
+Allow-list mode: only permit this syscall. Repeatable.
+All other syscalls return EPERM.
+.TP
+.BI \-B ", " \-\-block " SYSCALL"
+Deny-list mode: block this syscall. Repeatable.
+.TP
+.B \-\-no\-seccomp
+Disable seccomp entirely.
+.SS Environment
+.TP
+.BI \-E ", " \-\-env\-deny " VAR"
+Strip environment variable. Repeatable.
+.TP
+.BI \-e ", " \-\-env\-allow " VAR"
+Allow-list mode: keep only this variable. Repeatable.
+.TP
+.B \-\-no\-env\-sanitize
+Do not strip environment variables.
+.SS General
+.TP
+.B \-\-dry\-run
+Show what would be applied without executing.
+.TP
+.BR \-v ", " \-\-verbose
+Print actions to stderr.
+.TP
+.B \-\-audit
+Log events to stderr and to a file.
+.TP
+.BI \-L ", " \-\-audit\-log " DIR"
+Set audit log directory (implies \fB\-\-audit\fR).
+.TP
+.B \-\-verify
+Check system support and exit.
+.TP
+.BR \-h ", " \-\-help
+Print usage summary.
+.SH HARDENING DETAILS
+.SS /proc masking
+The following paths are masked by default inside the container:
+.IR /proc/sys " (tmpfs),"
+.IR /proc/sysrq-trigger " (/dev/null),"
+.IR /proc/kcore " (/dev/null),"
+.IR /proc/acpi " (tmpfs)."
+Additional paths can be masked with
+.BR \-\-mount\-mask .
+.SS Privilege drop sequence
+.IP 1. 4
+.B PR_SET_DUMPABLE(0)
+\- prevent ptrace from outside.
+.IP 2.
+.B PR_SET_NO_NEW_PRIVS
+\- prevent setuid escalation.
+.IP 3.
+Drop bounding-set capabilities (while still root, needs CAP_SETPCAP).
+.IP 4.
+.B setgid/setuid
+to service user.
+.IP 5.
+If
+.B \-\-cap\-allowed
+is used: restore named capabilities via capset + ambient raise.
+.IP 6.
+.B seccomp BPF
+filter applied.
+.IP 7.
+Close all FDs >= 3.
+.IP 8.
+.B execvp
+the command.
+.SH EXAMPLES
+.TP
+Basic container:
+.B compartment-root \-c /srv/jail \-U svc \-\- /bin/sh
+.TP
+With capabilities and audit:
+.B compartment-root \-c /srv/jail \-U svc \-l \-\-audit \-A net_bind_service \-\- /usr/bin/myapp
+.TP
+With profile:
+.B compartment-root \-\-profile container \-\- /bin/sh
+.TP
+Preview:
+.B compartment-root \-\-profile container \-\-dry\-run \-\- /bin/sh
+.SH EXIT STATUS
+.TP
+.B 0
+Command executed successfully inside the container.
+.TP
+.B 1
+Configuration error, namespace creation failure, or privilege drop failure.
+.SH FILES
+.TP
+.I ~/.config/compartment/*.conf
+Per-user profile files.
+.TP
+.I /etc/compartment/*.conf
+System-wide profile files.
+.SH REQUIREMENTS
+Linux >= 4.6 (CLONE_NEWCGROUP). Requires root or equivalent capabilities.
+No external libraries (no libseccomp, no libcap).
+.SH SEE ALSO
+.BR compartment-user (1),
+.BR namespaces (7),
+.BR pivot_root (2),
+.BR capabilities (7),
+.BR seccomp (2),
+.BR cgroups (7)
+.PP
+Project: https://github.com/nmicic/compartment
+.SH AUTHORS
+Nenad Mićić <nenad@micic.be>

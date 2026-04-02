@@ -385,6 +385,9 @@ examples/
 tools/
   syscall.py           — Profile generator: trace any program, emit .conf
   HOWTO-syscall-profiling.md — Full guide to syscall profiling
+man/
+  compartment-user.1   — Man page (section 1: user commands)
+  compartment-root.8   — Man page (section 8: system administration)
 tests/
   probes/deny_probe.c  — Sandbox validation probe (machine-parseable output)
   profiles/            — Test-specific .conf profiles

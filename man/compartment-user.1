@@ -1,0 +1,225 @@
+.\" Copyright (c) 2026 Nenad Mićić <nenad@micic.be>
+.\" SPDX-License-Identifier: Apache-2.0
+.TH COMPARTMENT-USER 1 "April 2026" "compartment 1.1.0" "User Commands"
+.SH NAME
+compartment-user \- userspace process isolation with Landlock, seccomp, and environment sanitization
+.SH SYNOPSIS
+.B compartment-user
+[\fIOPTIONS\fR] \fB\-\-\fR \fICOMMAND\fR [\fIARGS\fR...]
+.SH DESCRIPTION
+.B compartment-user
+applies kernel-enforced restrictions to a process before executing it.
+No root required. Zero dependencies.
+.PP
+Restrictions are applied in order and are all inherited by child processes:
+.IP 1. 4
+.B PR_SET_NO_NEW_PRIVS
+\- prevents privilege escalation via setuid binaries.
+.IP 2.
+.B Landlock
+\- filesystem path restrictions (read-only system paths, writable working directory).
+.IP 3.
+.B seccomp BPF
+\- blocks dangerous syscalls (ptrace, mount, bpf, io_uring, etc.).
+.IP 4.
+.B Environment sanitization
+\- strips LD_PRELOAD, cloud credentials, SSH agent socket, etc.
+.IP 5.
+.B Audit logging
+\- file-per-day log with PPID chain and user identity.
+.PP
+All restrictions are irreversible \(em a sandboxed process cannot remove them.
+.SH OPTIONS
+.SS Profiles
+.TP
+.BI \-\-profile " NAME|FILE"
+Load a security profile.
+Built-in profiles:
+.BR ai-agent " (default),"
+.BR strict ", "
+.BR none .
+File search order:
+.IR ~/.config/compartment/NAME.conf ,
+.IR /etc/compartment/NAME.conf .
+An explicit file path (containing \fB/\fR) loads directly.
+.SS "Filesystem (Landlock)"
+.TP
+.BI \-\-ro " PATH"
+Grant read-only + execute access to \fIPATH\fR.
+.TP
+.BI \-\-rw " PATH"
+Grant read-write + execute access to \fIPATH\fR.
+.TP
+.BI \-\-exec " PATH"
+Grant read + execute access (alias for \fB\-\-ro\fR).
+.TP
+.BI \-\-workdir " PATH"
+Set working directory (added as \fB\-\-rw\fR).
+.TP
+.B \-\-no\-landlock
+Disable Landlock filesystem restrictions.
+.SS "Syscalls (seccomp BPF)"
+.TP
+.BI \-\-block " SYSCALL"
+Block a syscall by name or number. Repeatable.
+.TP
+.B \-\-no\-seccomp
+Disable seccomp filtering.
+.SS Environment
+.TP
+.BI \-\-env\-deny " VAR"
+Strip an environment variable. Repeatable.
+.TP
+.B \-\-no\-env\-sanitize
+Do not strip dangerous environment variables.
+.SS General
+.TP
+.B \-\-dry\-run
+Show what restrictions would be applied without executing the command.
+.TP
+.B \-\-verbose
+Print actions to stderr.
+.TP
+.B \-\-audit
+Log events to stderr and to a file.
+.TP
+.BI \-\-audit\-log " DIR"
+Set audit log directory (implies \fB\-\-audit\fR).
+Default: \fI/var/tmp/compartment-audit-$UID/\fR.
+.TP
+.B \-\-verify
+Check kernel support (Landlock, seccomp) and exit.
+.TP
+.B \-\-help
+Print usage summary.
+.SH SHELL REPLACEMENT MODE
+When invoked via a symlink whose name is not
+.IR compartment-user
+(e.g., as \fI/bin/bash\fR), the program enters shell-replacement mode:
+it applies the
+.B ai-agent
+profile and execs the real shell from the stash directory
+(compile-time \fBREAL_SHELL_DIR\fR or the \fBCOMPARTMENT_SHELL_DIR\fR
+environment variable).
+.PP
+This allows transparent sandboxing of all subprocesses spawned by an
+AI agent or any other program that invokes \fI/bin/bash\fR.
+.PP
+Build with a randomized stash path:
+.RS
+.nf
+make hardened
+.fi
+.RE
+.SH PROFILE FORMAT
+Profiles use a simple line-oriented format shared with
+.BR compartment-root (1):
+.PP
+.nf
+.RS
+# Filesystem
+ro /usr
+rw $HOME
+
+# Syscalls
+block ptrace
+block mount
+
+# Environment
+env-deny LD_PRELOAD
+
+# Features
+landlock on
+seccomp on
+no-new-privs on
+env-sanitize on
+
+# Inheritance
+inherit ai-agent
+.RE
+.fi
+.PP
+Boolean values accept:
+.BR on / off ,
+.BR yes / no ,
+.BR true / false ,
+.BR 1 / 0
+(case-insensitive). Unrecognized values are rejected.
+.PP
+Unknown directives produce a warning to help catch typos.
+.SH DEFAULT DENY LIST (ai-agent profile)
+The built-in
+.B ai-agent
+profile blocks these syscall families:
+.PP
+.nf
+ptrace, mount, umount2, reboot, kexec_load,
+init_module, finit_module, delete_module,
+pivot_root, chroot, unshare, setns,
+keyctl, add_key, request_key,
+bpf, userfaultfd, perf_event_open,
+process_vm_readv, process_vm_writev,
+io_uring_setup, io_uring_enter, io_uring_register,
+open_by_handle_at, name_to_handle_at,
+open_tree, move_mount, fsopen, fsmount,
+fsconfig, fspick, mount_setattr, pidfd_getfd
+.fi
+.PP
+Environment variables stripped include LD_PRELOAD, cloud credentials
+(AWS, GCP, Azure), VCS tokens (GitHub, GitLab), SSH_AUTH_SOCK,
+database passwords, and interpreter injection vectors (BASH_ENV,
+NODE_OPTIONS, PYTHONSTARTUP, etc.).
+.SH EXAMPLES
+.TP
+Sandbox an AI agent with defaults:
+.B compartment-user \-\- claude \-\-model claude-opus-4-6
+.TP
+Use a strict profile:
+.B compartment-user \-\-profile strict \-\- codex \-\-full-auto
+.TP
+Custom filesystem rules:
+.B compartment-user \-\-rw /data \-\-block ptrace \-\- ./my\-agent
+.TP
+Preview the policy:
+.B compartment-user \-\-dry\-run \-\- claude
+.TP
+Read-only SSH client:
+.B compartment-user \-\-profile ssh.conf \-\- ssh user@host
+.TP
+Check kernel support:
+.B compartment-user \-\-verify
+.SH EXIT STATUS
+.TP
+.B 0
+Command executed successfully under sandbox.
+.TP
+.B 1
+Configuration error, missing command, or profile load failure.
+.TP
+.B 126
+Shell-replacement mode failed (enforcement error or path traversal rejected).
+.TP
+.B 127
+Command not found or not executable under Landlock restrictions.
+.SH FILES
+.TP
+.I ~/.config/compartment/*.conf
+Per-user profile files.
+.TP
+.I /etc/compartment/*.conf
+System-wide profile files.
+.TP
+.I /var/tmp/compartment-audit-$UID/
+Default audit log directory (one file per day).
+.SH REQUIREMENTS
+Linux >= 5.13 (Landlock). seccomp BPF requires >= 3.17.
+No external libraries.
+.SH SEE ALSO
+.BR compartment-root (8),
+.BR landlock (7),
+.BR seccomp (2),
+.BR prctl (2)
+.PP
+Project: https://github.com/nmicic/compartment
+.SH AUTHORS
+Nenad Mićić <nenad@micic.be>

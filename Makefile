@@ -11,7 +11,11 @@ CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE -O2 \
           -fstack-protector-strong -D_FORTIFY_SOURCE=2
 LDFLAGS = -Wl,-z,relro,-z,now
 
-.PHONY: all clean test test-integration test-quick hardened
+PREFIX  = /usr/local
+BINDIR  = $(PREFIX)/bin
+MANDIR  = $(PREFIX)/share/man
+
+.PHONY: all clean test test-integration test-quick hardened install install-man
 
 # Both tools: zero dependencies
 all: compartment-user compartment-root
@@ -47,6 +51,16 @@ test-integration: all tests/probes/deny_probe
 
 test test-quick: all tests/probes/deny_probe
 	./tests/scripts/run_all.sh --quick
+
+install: all install-man
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 755 compartment-user $(DESTDIR)$(BINDIR)/
+	install -m 755 compartment-root $(DESTDIR)$(BINDIR)/
+
+install-man:
+	install -d $(DESTDIR)$(MANDIR)/man1 $(DESTDIR)$(MANDIR)/man8
+	install -m 644 man/compartment-user.1 $(DESTDIR)$(MANDIR)/man1/
+	install -m 644 man/compartment-root.8 $(DESTDIR)$(MANDIR)/man8/
 
 clean:
 	rm -f compartment-user compartment-root tests/probes/deny_probe
