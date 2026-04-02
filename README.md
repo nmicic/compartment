@@ -216,6 +216,32 @@ Search order: `--profile /path/file.conf` → `~/.config/compartment/<name>.conf
 
 See [HOWTO.md](HOWTO.md) for full format reference.
 
+## Examples
+
+Each profile addresses a different threat model. Pick the one that
+matches what you're protecting against.
+
+| File | Use when | Protects against |
+|------|----------|------------------|
+| `ai-agent.conf` | Running Claude, Codex, Gemini CLIs | Agent reads/writes outside working directory, spawns unexpected processes |
+| `strict.conf` | Untrusted code, tighter than ai-agent | Same as above, smaller syscall surface |
+| `ssh.conf` | Running SSH client on a box you don't fully trust | Compromised SSH binary writing credentials to disk |
+| `socat-proxy.conf` | Used internally by `paranoid-ssh.sh` | socat having access to your SSH keys |
+| `container.conf` | Full namespace isolation via compartment-root | Process escaping its root directory |
+| `dev.conf` | Development and debugging | Nothing — this is intentionally relaxed |
+
+**Which one should I use?**
+
+- **Sandboxing an AI agent** → `ai-agent.conf` (default) or `strict.conf` (tighter)
+- **Connecting to a remote server** → `paranoid-ssh.sh`, which combines
+  `ssh.conf` + `socat-proxy.conf`. The SSH process can read your keys but
+  cannot write anywhere. The socat process handles the network connection
+  but cannot read your keys. Neither alone can both steal credentials and
+  exfiltrate them.
+- **Running an untrusted service** → `container.conf` with `compartment-root`
+- **Figuring out why something is being blocked** → `dev.conf`, then tighten
+  from there
+
 ## Shell Replacement
 
 compartment-user can transparently intercept `/bin/bash` so every
