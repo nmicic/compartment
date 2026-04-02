@@ -58,6 +58,12 @@ ARCHIVE_DIR="archive"
 SUMS="$ARCHIVE_DIR/SHA256SUMS"
 ROOT="$ARCHIVE_DIR/SHA256SUMS.root"
 
+# ── Pre-flight: refuse to run with uncommitted changes ──────────────────
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "ERROR: uncommitted changes present. Stash or commit first." >&2
+  exit 1
+fi
+
 # ── Resolve ots binary ──────────────────────────────────────────────────
 OTS="$(command -v ots 2>/dev/null || echo "$HOME/.local/bin/ots")"
 
