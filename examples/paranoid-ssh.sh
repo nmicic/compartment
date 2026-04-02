@@ -19,8 +19,8 @@
 #
 # Usage:
 #   ./paranoid-ssh.sh user@host [-p port] [ssh-options...]
-#   ./paranoid-ssh.sh claude@www.nmv6.com -p 62222
-#   ./paranoid-ssh.sh claude@www.nmv6.com -p 62222 "uptime"
+#   ./paranoid-ssh.sh user@remote-host -p 2222
+#   ./paranoid-ssh.sh user@remote-host "uptime"
 #
 # Requirements: compartment-user, socat
 

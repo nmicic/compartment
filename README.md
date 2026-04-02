@@ -110,10 +110,13 @@ Split SSH into two sandboxed processes with complementary restrictions:
 
 ```bash
 # Paranoid SSH to a remote server
-./examples/paranoid-ssh.sh claude@www.nmv6.com -p 62222
+./examples/paranoid-ssh.sh user@remote-host
+
+# With a custom port
+./examples/paranoid-ssh.sh user@remote-host -p 2222
 
 # Run a command
-./examples/paranoid-ssh.sh claude@host -p 62222 "uptime"
+./examples/paranoid-ssh.sh user@remote-host "uptime"
 ```
 
 **Security properties:**
