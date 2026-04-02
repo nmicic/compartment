@@ -256,6 +256,70 @@ subprocess an AI agent spawns gets sandboxed:
 This happens automatically inside `sandbox.sh` when compartment-user
 is built and available. See [HOWTO.md](HOWTO.md) for manual setup options.
 
+## Advanced Deployment: Compartmented Login Shell
+
+Compartment can be deployed as the login shell for non-admin users,
+so that every interactive session and every `execve("/bin/sh", ...)`
+— including remote exploit payloads — enters a sandboxed shell
+automatically.
+
+This is an opinionated setup for controlled environments (hardened
+servers, jump boxes, CI runners), not a universal recommendation.
+
+### Setup
+
+```bash
+# Build with a randomized shell stash path
+make hardened
+# Output: REAL_SHELL_DIR=/bin/.shells_a1b2c3d4e5f6
+
+# Preserve real shells in the stash directory
+sudo mkdir -p /bin/.shells_a1b2c3d4e5f6
+sudo mv /bin/bash /bin/.shells_a1b2c3d4e5f6/bash
+sudo mv /bin/sh   /bin/.shells_a1b2c3d4e5f6/sh
+
+# Install compartment-user as the system shell
+sudo cp compartment-user /bin/bash
+sudo ln -sf /bin/bash /bin/sh
+
+# Preserve a normal shell for the designated admin account
+sudo chsh -s /bin/.shells_a1b2c3d4e5f6/bash root
+sudo chsh -s /bin/.shells_a1b2c3d4e5f6/bash your-admin-user
+```
+
+When invoked as `bash` or `sh` (detected via `argv[0]`),
+compartment-user applies the `ai-agent` profile and execs the real
+shell from the stash directory.
+
+### Privilege model
+
+```
+root / admin  →  /bin/.shells_.../bash  (real shell, no sandbox)
+all others    →  /bin/bash              (compartment → sandboxed shell)
+                 Landlock + seccomp + env sanitize + audit
+```
+
+### What this stops
+
+A remote exploit that calls `execve("/bin/sh", ...)` gets compartment,
+not bash. The payload hits Landlock filesystem restrictions and seccomp
+syscall filtering before executing a single attacker-controlled
+instruction. The sandboxed shell cannot `ptrace`, cannot load kernel
+modules, cannot mount filesystems, and writes only to allowed paths.
+
+### Caveats
+
+- **Compatibility**: some workflows expect an unrestricted interactive
+  shell and may break. Test thoroughly before deploying to production.
+- **Not a substitute** for correct host hardening, patching, and
+  privilege separation. This is a defense-in-depth layer.
+- **Bypass paths exist**: an attacker who can write an ELF binary to
+  an executable path and invoke it directly (not through `/bin/sh`)
+  will bypass the shell-replacement layer. Landlock on the parent
+  process limits where they can write, but this is not airtight.
+- **Recovery**: always keep at least one admin account with a real
+  shell. If compartment-user has a bug, you need a way back in.
+
 ## Requirements
 
 - Linux >= 5.13 (Landlock) — compartment-user
