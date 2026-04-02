@@ -30,9 +30,11 @@
 #endif
 #include <getopt.h>
 #include <libgen.h>
+#include <syslog.h>
 #include <sys/utsname.h>
 
 #include <linux/landlock.h>
+#include <sys/statfs.h>
 
 /* Fallback defines for older kernel headers (pre-5.19 / pre-6.2) */
 #ifndef LANDLOCK_ACCESS_FS_REFER
@@ -344,6 +346,8 @@ static void print_usage(void)
         "  --audit               Log events to stderr + file\n"
         "  --audit-log DIR       Set audit log directory (implies --audit)\n"
         "                        Default: /var/tmp/compartment-audit-$UID/\n"
+        "  --unsecure            Allow execution when enforcement is degraded\n"
+        "                        (missing Landlock, unsupported filesystem, etc.)\n"
         "  --verify              Check system support and exit\n"
         "  --help                This help\n"
         "\n"
@@ -356,6 +360,167 @@ static void print_usage(void)
         "Combine with sandbox.sh for full isolation:\n"
         "  sandbox.sh compartment-user -- claude\n"
     );
+}
+
+/* ── Pre-flight check: run before exec to detect degraded environments ── */
+
+/* Known filesystem type magic numbers */
+#define V9P_MAGIC      0x01021997
+#define NFS_MAGIC      0x6969
+#define FUSE_MAGIC     0x65735546
+#define CIFS_MAGIC     0xFF534D42
+#define TMPFS_MAGIC    0x01021994
+#define OVERLAYFS_MAGIC 0x794C7630
+
+static const char *fs_type_name(unsigned long magic)
+{
+    switch (magic) {
+    case V9P_MAGIC:       return "9p (virtme-ng/QEMU — Landlock cannot enforce)";
+    case NFS_MAGIC:       return "NFS (Landlock cannot enforce)";
+    case FUSE_MAGIC:      return "FUSE (Landlock may not enforce)";
+    case CIFS_MAGIC:      return "CIFS/SMB (Landlock cannot enforce)";
+    case OVERLAYFS_MAGIC: return "overlayfs";
+    case TMPFS_MAGIC:     return "tmpfs";
+    default:              return NULL;
+    }
+}
+
+static int fs_landlock_unsupported(unsigned long magic)
+{
+    return magic == V9P_MAGIC || magic == NFS_MAGIC ||
+           magic == CIFS_MAGIC;
+}
+
+/* statfs on 9p can report the underlying fs type (e.g. ext4), so also
+ * check /proc/mounts for the actual filesystem driver on a given path. */
+static int check_proc_mounts_for_unsupported(const char *path)
+{
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return 0;
+
+    char line[512];
+    const char *best_mount = NULL;
+    const char *best_fstype = NULL;
+    size_t best_len = 0;
+    static char saved_mount[256];
+    static char saved_fstype[64];
+
+    while (fgets(line, sizeof(line), f)) {
+        char dev[256], mount[256], fstype[64];
+        if (sscanf(line, "%255s %255s %63s", dev, mount, fstype) < 3)
+            continue;
+        size_t mlen = strlen(mount);
+        if (strncmp(path, mount, mlen) == 0 &&
+            (path[mlen] == '/' || path[mlen] == '\0' || mlen == 1)) {
+            if (mlen > best_len) {
+                best_len = mlen;
+                snprintf(saved_mount, sizeof(saved_mount), "%s", mount);
+                snprintf(saved_fstype, sizeof(saved_fstype), "%s", fstype);
+                best_mount = saved_mount;
+                best_fstype = saved_fstype;
+            }
+        }
+    }
+    fclose(f);
+
+    if (best_fstype) {
+        if (strcmp(best_fstype, "9p") == 0 ||
+            strcmp(best_fstype, "nfs") == 0 ||
+            strcmp(best_fstype, "nfs4") == 0 ||
+            strcmp(best_fstype, "cifs") == 0) {
+            (void)best_mount;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * preflight_check — validate that the enforcement mechanisms requested
+ * in cfg will actually work on this system.  Returns 0 if all checks
+ * pass, >0 count of failures.  Prints warnings to stderr.
+ *
+ * Called automatically before exec.  If any check fails and
+ * --unsecure is NOT set, we abort with a clear message.
+ */
+static int preflight_check(Config *cfg)
+{
+    int warnings = 0;
+
+    /* 1. PR_SET_NO_NEW_PRIVS — always required */
+    if (cfg->use_no_new_privs) {
+        if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) < 0 &&
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+            fprintf(stderr, "compartment-user: WARNING: PR_SET_NO_NEW_PRIVS "
+                    "not available (%s)\n", strerror(errno));
+            warnings++;
+        }
+    }
+
+    /* 2. Landlock availability */
+    if (cfg->use_landlock) {
+        int abi = syscall(__NR_landlock_create_ruleset, NULL, 0,
+                          LANDLOCK_CREATE_RULESET_VERSION);
+        if (abi < 0) {
+            fprintf(stderr, "compartment-user: WARNING: Landlock not available "
+                    "(%s)\n", strerror(errno));
+            fprintf(stderr, "  Filesystem restrictions will NOT be enforced.\n");
+            fprintf(stderr, "  Run: compartment-user --verify\n");
+            warnings++;
+        } else {
+            if (abi < 2)
+                fprintf(stderr, "compartment-user: NOTE: Landlock ABI v%d "
+                        "(cross-dir rename/link not restricted)\n", abi);
+
+            /* 3. Check filesystem types of configured paths */
+            for (int i = 0; i < cfg->path_count; i++) {
+                struct statfs sfs;
+                if (statfs(cfg->paths[i].path, &sfs) == 0) {
+                    const char *fsname = fs_type_name((unsigned long)sfs.f_type);
+                    if (fs_landlock_unsupported((unsigned long)sfs.f_type)) {
+                        fprintf(stderr, "compartment-user: WARNING: %s is on %s\n",
+                                cfg->paths[i].path, fsname);
+                        warnings++;
+                    }
+                }
+            }
+
+            /* Check root filesystem — both statfs magic and /proc/mounts */
+            struct statfs root_sfs;
+            if (statfs("/", &root_sfs) == 0 &&
+                fs_landlock_unsupported((unsigned long)root_sfs.f_type)) {
+                const char *fsname = fs_type_name((unsigned long)root_sfs.f_type);
+                fprintf(stderr, "compartment-user: WARNING: root filesystem "
+                        "is %s — Landlock filesystem isolation will NOT work.\n",
+                        fsname);
+                warnings++;
+            } else if (check_proc_mounts_for_unsupported("/")) {
+                /* 9p can proxy the underlying fs type in statfs, so also
+                 * check /proc/mounts for the actual driver */
+                fprintf(stderr, "compartment-user: WARNING: root filesystem "
+                        "is a network/virtual fs (per /proc/mounts) — "
+                        "Landlock filesystem isolation will NOT work.\n");
+                warnings++;
+            }
+        }
+    }
+
+    /* 4. seccomp BPF availability */
+    if (cfg->use_seccomp) {
+        /* Quick check: can we set seccomp mode? We already set no_new_privs
+         * if needed, so just check the prctl is accepted. Use a no-op
+         * filter that allows everything. */
+        errno = 0;
+        long sec = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+        if (sec < 0 && errno == EINVAL) {
+            fprintf(stderr, "compartment-user: WARNING: seccomp not available "
+                    "(%s)\n", strerror(errno));
+            fprintf(stderr, "  Syscall restrictions will NOT be enforced.\n");
+            warnings++;
+        }
+    }
+
+    return warnings;
 }
 
 static int print_verify(void)
@@ -408,6 +573,32 @@ static int print_verify(void)
     else {
         printf("FAILED (%s)\n", strerror(errno));
         failures++;
+    }
+
+    /* Root filesystem type */
+    printf("Root filesystem: ");
+    struct statfs root_sfs;
+    int root_fs_bad = 0;
+    if (statfs("/", &root_sfs) == 0) {
+        const char *fsname = fs_type_name((unsigned long)root_sfs.f_type);
+        if (fsname) {
+            printf("%s\n", fsname);
+            if (fs_landlock_unsupported((unsigned long)root_sfs.f_type))
+                root_fs_bad = 1;
+        } else if (check_proc_mounts_for_unsupported("/")) {
+            printf("virtual/network (statfs=0x%lx, /proc/mounts disagrees)\n",
+                   (unsigned long)root_sfs.f_type);
+            root_fs_bad = 1;
+        } else {
+            printf("local (0x%lx)\n", (unsigned long)root_sfs.f_type);
+        }
+        if (root_fs_bad) {
+            printf("  ^^^ Landlock CANNOT enforce on this filesystem.\n");
+            printf("  ^^^ Use a real disk (ext4/btrfs/xfs) for filesystem isolation.\n");
+            failures++;
+        }
+    } else {
+        printf("unknown (%s)\n", strerror(errno));
     }
 
     /* Architecture */
@@ -490,7 +681,12 @@ int main(int argc, char *argv[])
             return 126;
         }
 
-        /* Apply ai-agent profile sandbox, then exec real shell */
+        /* Apply ai-agent profile sandbox, then exec real shell.
+         *
+         * IMPORTANT: Shell-replacement mode must NEVER block login.
+         * If enforcement fails, log to syslog and continue unsecured.
+         * Blocking /bin/bash would lock out the user — worse than
+         * running unsandboxed. */
         Config shell_cfg = {
             .use_landlock     = 1,
             .use_seccomp      = 1,
@@ -503,30 +699,40 @@ int main(int argc, char *argv[])
         if (resolve_and_load_profile(&shell_cfg, "ai-agent", 0) != 0)
             apply_profile_ai_agent(&shell_cfg);
 
-        /* Fail-closed: if any enforcement mechanism fails, abort.
-         * Running the shell unsandboxed would be worse than not running. */
+        int shell_degraded = 0;
+
         if (shell_cfg.use_no_new_privs) {
             if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-                fprintf(stderr, "compartment-user[%s]: PR_SET_NO_NEW_PRIVS: %s\n",
-                        invoked_name, strerror(errno));
-                return 126;
+                syslog(LOG_WARNING, "compartment-user[%s]: "
+                       "PR_SET_NO_NEW_PRIVS failed: %s — running unsecured",
+                       invoked_name, strerror(errno));
+                shell_degraded++;
             }
         }
         if (shell_cfg.use_env_sanitize)
             sanitize_env(&shell_cfg);
         if (shell_cfg.use_landlock) {
             if (apply_landlock(&shell_cfg) != 0) {
-                fprintf(stderr, "compartment-user[%s]: landlock failed — aborting\n",
-                        invoked_name);
-                return 126;
+                syslog(LOG_WARNING, "compartment-user[%s]: "
+                       "Landlock failed — running without filesystem restriction",
+                       invoked_name);
+                shell_degraded++;
             }
         }
         if (shell_cfg.use_seccomp) {
             if (apply_seccomp(&shell_cfg) != 0) {
-                fprintf(stderr, "compartment-user[%s]: seccomp failed — aborting\n",
-                        invoked_name);
-                return 126;
+                syslog(LOG_WARNING, "compartment-user[%s]: "
+                       "seccomp failed — running without syscall restriction",
+                       invoked_name);
+                shell_degraded++;
             }
+        }
+        if (shell_degraded > 0) {
+            syslog(LOG_WARNING, "compartment-user[%s]: UNSECURE shell session "
+                   "(%d mechanism%s failed) uid=%d pid=%d ppid=%d",
+                   invoked_name, shell_degraded,
+                   shell_degraded > 1 ? "s" : "",
+                   getuid(), getpid(), getppid());
         }
 
         execv(real_shell, argv);
@@ -561,6 +767,7 @@ int main(int argc, char *argv[])
         {"verbose",         no_argument,       NULL, 'v'},
         {"audit",           no_argument,       NULL, 'a'},
         {"audit-log",       required_argument, NULL, 'A'},
+        {"unsecure",        no_argument,       NULL, 'U'},
         {"verify",          no_argument,       NULL, 'V'},
         {"version",         no_argument,       NULL, 1},
         {"help",            no_argument,       NULL, 'h'},
@@ -568,7 +775,7 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "+P:r:w:x:W:b:l:E:e:A:LSNdvaVh",
+    while ((opt = getopt_long(argc, argv, "+P:r:w:x:W:b:l:E:e:A:LSNdvaUVh",
                               long_opts, NULL)) != -1) {
         switch (opt) {
         case 'P': cfg.profile = optarg; break;
@@ -638,6 +845,7 @@ int main(int argc, char *argv[])
         case 'v': cfg.verbose = 1; break;
         case 'a': cfg.audit = 1; break;
         case 'A': cfg.audit_log_dir = optarg; cfg.audit = 1; break;
+        case 'U': cfg.allow_unsecure = 1; break;
         case 'V': return print_verify();
         case  1 : printf("compartment-user %s\n", COMPARTMENT_VERSION); return 0;
         case 'h': print_usage(); return 0;
@@ -748,6 +956,28 @@ int main(int argc, char *argv[])
                  cfg.use_landlock, cfg.use_seccomp,
                  cfg.path_count, cfg.blocked_count);
         audit_log(&cfg, "COMPARTMENT_START", detail);
+    }
+
+    /* ── 0. Pre-flight check ─────────────────────────────────────── */
+    int pf_warnings = preflight_check(&cfg);
+    if (pf_warnings > 0 && !cfg.allow_unsecure) {
+        fprintf(stderr, "\ncompartment-user: REFUSING to execute — %d preflight "
+                "check%s failed.\n", pf_warnings, pf_warnings > 1 ? "s" : "");
+        fprintf(stderr, "  Options:\n");
+        fprintf(stderr, "    --unsecure      Run anyway with degraded enforcement\n");
+        fprintf(stderr, "    --no-landlock   Disable Landlock (if filesystem unsupported)\n");
+        fprintf(stderr, "    --verify        Show full system capabilities\n");
+        return 1;
+    }
+    if (pf_warnings > 0 && cfg.allow_unsecure) {
+        fprintf(stderr, "compartment-user: UNSECURE mode — running with %d "
+                "degraded check%s\n", pf_warnings, pf_warnings > 1 ? "s" : "");
+        if (cfg.audit) {
+            char detail[256];
+            snprintf(detail, sizeof(detail),
+                     "UNSECURE_MODE warnings=%d", pf_warnings);
+            audit_log(&cfg, "COMPARTMENT_DEGRADED", detail);
+        }
     }
 
     /* ── 1. PR_SET_NO_NEW_PRIVS (must be before seccomp) ───────── */

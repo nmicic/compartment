@@ -103,6 +103,7 @@ typedef struct {
     const char *workdir;
     const char *profile;
     const char *profile_source;   /* "built-in" or file path */
+    int         allow_unsecure;   /* --unsecure: run with degraded enforcement */
 
     /* Root-specific fields (compartment-root only, ignored by compartment-user) */
     char       *rootdir;
