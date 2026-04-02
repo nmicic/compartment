@@ -87,23 +87,89 @@ Log events to stderr and to a file.
 Set audit log directory (implies \fB\-\-audit\fR).
 Default: \fI/var/tmp/compartment-audit-$UID/\fR.
 .TP
+.B \-\-unsecure
+Allow execution when enforcement is degraded.
+.B compartment-user
+runs a pre-flight check before executing the command. If any check fails
+(missing Landlock, unsupported filesystem, etc.), execution is refused
+by default. This flag overrides the refusal and proceeds with reduced
+protection, printing warnings to stderr.
+When \fB\-\-audit\fR is also set, a
+.B COMPARTMENT_DEGRADED
+event is logged.
+.TP
 .B \-\-verify
-Check kernel support (Landlock, seccomp) and exit.
+Check kernel support (Landlock, seccomp, filesystem type) and exit.
+Reports the Landlock ABI version, detects unsupported filesystems
+(9p, NFS, CIFS), and verifies seccomp BPF availability.
 .TP
 .B \-\-help
 Print usage summary.
+.SH PRE-FLIGHT CHECK
+Before executing a command,
+.B compartment-user
+automatically validates that requested enforcement mechanisms are
+available and functional:
+.IP \(bu 2
+.B PR_SET_NO_NEW_PRIVS
+\(em required for seccomp and privilege escalation prevention.
+.IP \(bu
+.B Landlock availability
+\(em checks the kernel ABI version. Notes if ABI < 2 (no cross-dir rename restriction).
+.IP \(bu
+.B Filesystem type
+\(em detects 9p (virtme-ng/QEMU), NFS, and CIFS filesystems where Landlock
+cannot enforce path restrictions. Uses both
+.BR statfs (2)
+and
+.I /proc/mounts
+because 9p can proxy the underlying filesystem type through statfs.
+.IP \(bu
+.B seccomp BPF
+\(em verifies the kernel accepts BPF filters.
+.PP
+If any check fails, execution is refused with suggestions:
+.RS
+.nf
+compartment-user: REFUSING to execute \(em 1 preflight check failed.
+  Options:
+    --unsecure      Run anyway with degraded enforcement
+    --no-landlock   Disable Landlock (if filesystem unsupported)
+    --verify        Show full system capabilities
+.fi
+.RE
+.PP
+Use \fB\-\-unsecure\fR to proceed with degraded protection, or
+\fB\-\-no-landlock\fR to skip filesystem restrictions entirely.
 .SH SHELL REPLACEMENT MODE
 When invoked via a symlink whose name is not
 .IR compartment-user
-(e.g., as \fI/bin/bash\fR), the program enters shell-replacement mode:
+(e.g., as \fI/bin/bash\fR, \fI/bin/zsh\fR, \fI/bin/tcsh\fR, or any other
+shell), the program enters shell-replacement mode:
 it applies the
 .B ai-agent
 profile and execs the real shell from the stash directory
 (compile-time \fBREAL_SHELL_DIR\fR or the \fBCOMPARTMENT_SHELL_DIR\fR
 environment variable).
 .PP
-This allows transparent sandboxing of all subprocesses spawned by an
-AI agent or any other program that invokes \fI/bin/bash\fR.
+.B "IMPORTANT:"
+Shell-replacement mode
+.B never blocks login.
+If any enforcement mechanism fails (missing Landlock, unsupported
+filesystem, etc.), the shell is still executed but with a
+.B syslog
+warning at
+.B LOG_WARNING
+level, including uid, pid, and ppid for audit trail:
+.RS
+.nf
+compartment-user[bash]: UNSECURE shell session (1 mechanisms failed) uid=1000 pid=12345 ppid=12340
+.fi
+.RE
+.PP
+This ensures that replacing \fI/bin/bash\fR (or any shell) with a symlink
+to compartment-user can never lock out users, while still providing
+audit visibility when enforcement is degraded.
 .PP
 Build with a randomized stash path:
 .RS
