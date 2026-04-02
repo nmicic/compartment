@@ -64,6 +64,83 @@ make hardened           # build with randomized shell stash path
 ./sandbox.sh claude --model claude-opus-4-6
 ```
 
+## Example: Hardened SSH (Privilege Separation for Network Clients)
+
+Compartment can lock down any network client — not just AI agents.
+Here is a worked example using SSH, showing how to split a process
+into privilege-separated components so that no single compromise can
+both access secrets AND exfiltrate them.
+
+### Problem
+
+If a remote SSH server is compromised, it can reverse-exploit the SSH
+client. A trojanized client could:
+- Write stolen credentials to `~/.ssh/exfil.txt`
+- Log keystrokes to a hidden file
+- Exfiltrate data over the network to a third-party host
+
+### Solution 1: Read-Only SSH (`ssh.conf`)
+
+Lock the SSH client to read-only filesystem access. It can read keys
+to authenticate but cannot write anything to disk:
+
+```bash
+# One-liner: SSH with no filesystem writes
+./compartment-user --profile examples/ssh.conf -- ssh user@host
+
+# What happens if the SSH binary tries to write:
+#   touch /tmp/exfil.txt     → EACCES (blocked by Landlock)
+#   echo x > ~/.ssh/log.txt  → EACCES (blocked by Landlock)
+#   cat ~/.ssh/id_ed25519    → OK (read allowed)
+```
+
+### Solution 2: Paranoid SSH (`paranoid-ssh.sh`)
+
+Split SSH into two sandboxed processes with complementary restrictions:
+
+```
+┌──────────────────────────┐     ┌──────────────────────────┐
+│  SSH (read-only fs)      │────▶│  socat (no user files)   │────▶ remote:PORT
+│  • can read keys         │     │  • no $HOME access       │
+│  • cannot write anywhere │     │  • cannot read SSH keys  │
+│  • Landlock + seccomp    │     │  • Landlock + seccomp    │
+└──────────────────────────┘     └──────────────────────────┘
+         localhost:RANDOM_PORT
+```
+
+```bash
+# Paranoid SSH to a remote server
+./examples/paranoid-ssh.sh claude@www.nmv6.com -p 62222
+
+# Run a command
+./examples/paranoid-ssh.sh claude@host -p 62222 "uptime"
+```
+
+**Security properties:**
+- **SSH process** can read `~/.ssh/` keys but cannot write to disk
+  → a reverse-exploited SSH cannot save stolen data locally
+- **socat process** has network access but cannot read any user files
+  → even if socat is exploited, attacker cannot access credentials
+- **Neither process alone** can both access secrets AND exfiltrate them
+
+This is the same principle as OpenSSH's own privilege separation, but
+applied at the OS level with Landlock + seccomp instead of trusting the
+application to separate itself.
+
+### Why This Matters (2026 Paradigm)
+
+Traditional sysadmin thinking: "SSH is trusted, the network is untrusted."
+
+Compartment thinking: "Nothing is fully trusted. Split every process so
+that compromise of any single component cannot achieve both data access
+and data exfiltration."
+
+This pattern applies to any network client:
+- **curl/wget** — read-only profile prevents saving downloaded malware
+- **git** — read-only profile for fetch, write-only for the workdir
+- **database clients** — prevent credential logging to disk
+- **AI agents** — the primary use case (see `sandbox.sh`)
+
 ## How It Works
 
 **compartment-user** applies kernel-enforced restrictions before exec:
@@ -173,6 +250,9 @@ examples/
   strict.conf          — Locked-down profile (inherits ai-agent)
   container.conf       — Full namespace isolation profile
   dev.conf             — Relaxed profile for development
+  ssh.conf             — Read-only SSH client (no filesystem writes)
+  socat-proxy.conf     — Network-only socat bridge (no user file access)
+  paranoid-ssh.sh      — Privilege-separated SSH (SSH+socat split)
 tests/
   probes/deny_probe.c  — Sandbox validation probe (machine-parseable output)
   profiles/            — Test-specific .conf profiles
