@@ -25,6 +25,9 @@ tests/output/
 review-isolation-tools.md
 vs-*.md
 
+# Archive (tracked on archive/* branches, not main)
+archive/
+
 # Editor
 *.swp
 *~
