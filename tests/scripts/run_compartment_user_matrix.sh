@@ -293,13 +293,15 @@ PROBE_OUT=$("${CU}" --profile "${PROFILES}/test-env-deny.conf" -- "${PROBE}" env
 expect_contains "HOME preserved" "value=/"
 
 # Cloud credentials should be stripped by default ai-agent profile
+# Use --no-landlock so preflight doesn't refuse in environments without Landlock
+# (these tests target env sanitization, not filesystem restriction)
 PROBE_OUT=$(AWS_SECRET_ACCESS_KEY=supersecret \
-    "${CU}" -- "${PROBE}" env_get AWS_SECRET_ACCESS_KEY 2>/dev/null) || PROBE_RC=$?
+    "${CU}" --no-landlock -- "${PROBE}" env_get AWS_SECRET_ACCESS_KEY 2>/dev/null) || PROBE_RC=$?
 expect_contains "AWS_SECRET_ACCESS_KEY stripped" "value=(null)"
 
 # SSH agent socket should be stripped
 PROBE_OUT=$(SSH_AUTH_SOCK=/tmp/ssh-agent.sock \
-    "${CU}" -- "${PROBE}" env_get SSH_AUTH_SOCK 2>/dev/null) || PROBE_RC=$?
+    "${CU}" --no-landlock -- "${PROBE}" env_get SSH_AUTH_SOCK 2>/dev/null) || PROBE_RC=$?
 expect_contains "SSH_AUTH_SOCK stripped" "value=(null)"
 
 echo ""
