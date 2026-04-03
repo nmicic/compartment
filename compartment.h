@@ -528,18 +528,25 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
         user = pw ? pw->pw_name : NULL;
     }
 
+    /* Treat empty values same as unset — prevents "$HOME/.ssh"
+     * from resolving to "/.ssh" (filesystem root) when HOME="" */
+    if (home && home[0] == '\0') home = NULL;
+    if (user && user[0] == '\0') user = NULL;
+
     size_t pos = 0;
     const char *p = input;
     while (*p && pos < bufsz - 1) {
         if (*p == '$') {
-            if (strncmp(p, "$HOME", 5) == 0 && home) {
+            if (strncmp(p, "$HOME", 5) == 0) {
+                if (!home) return NULL; /* $HOME referenced but unset */
                 size_t len = strlen(home);
                 if (pos + len >= bufsz) return NULL; /* truncation → error */
                 memcpy(buf + pos, home, len);
                 pos += len;
                 p += 5;
                 continue;
-            } else if (strncmp(p, "$USER", 5) == 0 && user) {
+            } else if (strncmp(p, "$USER", 5) == 0) {
+                if (!user) return NULL; /* $USER referenced but unset */
                 size_t len = strlen(user);
                 if (pos + len >= bufsz) return NULL; /* truncation → error */
                 memcpy(buf + pos, user, len);
@@ -631,6 +638,17 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             if (cfg->path_count < MAX_PATHS) {
                 cfg->paths[cfg->path_count].path = strdup(val);
                 cfg->paths[cfg->path_count].mode = PATH_EXEC;
+                cfg->path_count++;
+            } else {
+                fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",
+                        path, lineno, MAX_PATHS);
+                fclose(fp);
+                return -1;
+            }
+        } else if (strcmp(directive, "rwx") == 0) {
+            if (cfg->path_count < MAX_PATHS) {
+                cfg->paths[cfg->path_count].path = strdup(val);
+                cfg->paths[cfg->path_count].mode = PATH_RWX;
                 cfg->path_count++;
             } else {
                 fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",

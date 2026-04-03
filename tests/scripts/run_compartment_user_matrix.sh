@@ -380,6 +380,15 @@ echo ""
 
 echo "--- Test group: Default ai-agent profile ---"
 
+# ai-agent profile: $HOME has rwx, /tmp has rw (no exec).
+# The probe must be under $HOME for exec to work.
+AI_PROBE_DIR="${HOME}/.compartment-test-probe-$$"
+mkdir -p "$AI_PROBE_DIR"
+cp "${PROBE}" "$AI_PROBE_DIR/deny_probe"
+chmod +x "$AI_PROBE_DIR/deny_probe"
+SAVED_PROBE_FIX="${PROBE_FIX}"
+PROBE_FIX="$AI_PROBE_DIR/deny_probe"
+
 # seccomp should block ptrace with default profile
 run_probe ai-agent sc_ptrace_traceme
 expect_not_contains "ai-agent: ptrace blocked" "rc=0"
@@ -389,6 +398,9 @@ if [ "${NO_LANDLOCK}" -eq 0 ]; then
     run_probe ai-agent fs_read /etc/hostname
     expect_contains "ai-agent: fs_read /etc" "rc=0"
 fi
+
+PROBE_FIX="${SAVED_PROBE_FIX}"
+rm -rf "$AI_PROBE_DIR"
 
 echo ""
 
@@ -419,15 +431,17 @@ echo "--- Test group: Shell-replacement mode ---"
 if [ "${NO_LANDLOCK}" -eq 1 ]; then
     skip "Landlock not available"
 else
-    # Create a symlink to compartment-user that looks like a shell
-    SHELL_LINK=$(mktemp -d)/fake-bash
+    # Create a symlink to compartment-user that looks like a shell.
+    # Use $HOME (which has rwx in ai-agent profile) not /tmp (rw only).
+    SHELL_TEST_DIR="${HOME}/.compartment-test-$$"
+    mkdir -p "${SHELL_TEST_DIR}/shells"
+    SHELL_LINK="${SHELL_TEST_DIR}/fake-bash"
     ln -sf "$(readlink -f "${CU}")" "${SHELL_LINK}"
-    mkdir -p "$(dirname "${SHELL_LINK}")/shells"
-    cp /bin/true "$(dirname "${SHELL_LINK}")/shells/fake-bash"
+    cp /bin/true "${SHELL_TEST_DIR}/shells/fake-bash"
 
     # When invoked via symlink, compartment-user should apply sandbox and exec real shell
     SHELL_RC=0
-    SHELL_OUT=$(COMPARTMENT_SHELL_DIR="$(dirname "${SHELL_LINK}")/shells" \
+    SHELL_OUT=$(COMPARTMENT_SHELL_DIR="${SHELL_TEST_DIR}/shells" \
         "${SHELL_LINK}" -c "echo shell-replacement-works" 2>/dev/null) || SHELL_RC=$?
 
     # /bin/true ignores arguments so we just check it ran (rc=0)
@@ -437,7 +451,7 @@ else
         fail "shell-replacement mode: symlink invocation failed (rc=${SHELL_RC})"
     fi
 
-    rm -rf "$(dirname "${SHELL_LINK}")"
+    rm -rf "${SHELL_TEST_DIR}"
 fi
 
 # ── Test 11: FD inheritance ──────────────────────────────────────

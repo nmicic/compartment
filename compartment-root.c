@@ -74,7 +74,7 @@ static int  child_func(void *arg);
 static void write_uid_gid_map(pid_t pid, const char *map_str,
                                const char *map_file);
 static void drop_privileges(uid_t uid, gid_t gid);
-static void drop_capabilities(Config *config);
+static void drop_capabilities(Config *config, int cap_last);
 static void apply_kept_caps(Config *config);
 static int  assign_to_cgroups(Config *config, pid_t pid);
 static int  path_has_dotdot(const char *path);
@@ -572,6 +572,20 @@ static int child_func(void *arg)
         perror("compartment-root: mount proc");
         exit(EXIT_FAILURE);
     }
+    /* Read cap_last_cap BEFORE masking /proc/sys — the mask hides
+     * /proc/sys/kernel/cap_last_cap, causing drop_capabilities() to
+     * use a stale fallback value and miss modern capabilities like
+     * CAP_PERFMON(38), CAP_BPF(39), CAP_CHECKPOINT_RESTORE(40). */
+    int cap_last_cap = 63;  /* safe max — covers all possible caps */
+    {
+        FILE *fcap = fopen("/proc/sys/kernel/cap_last_cap", "re");
+        if (fcap) {
+            if (fscanf(fcap, "%d", &cap_last_cap) != 1)
+                cap_last_cap = 63;
+            fclose(fcap);
+        }
+    }
+
     /* Default masks: hide kernel tunables and memory */
     (void)mount("tmpfs", "/proc/sys", "tmpfs",
                 MS_RDONLY | MS_NOSUID | MS_NOEXEC, "size=0");
@@ -614,12 +628,13 @@ static int child_func(void *arg)
         }
     }
 
-    /* 8. Set resource limits */
-    set_rlimits();
+    /* 8. Set resource limits — AFTER close_range/FD cleanup below so the
+     *    fallback loop can see the original RLIMIT_NOFILE, not the
+     *    lowered value. Moved from here to step 13 below. */
 
     /* 9. Drop bounding-set capabilities BEFORE privilege drop
      *    (PR_CAPBSET_DROP needs CAP_SETPCAP — only available as root) */
-    drop_capabilities(config);
+    drop_capabilities(config, cap_last_cap);
 
     /* 10. Drop privileges (setgid/setuid to service user).
      *     If cap-allow is in use, preserve caps across setuid so we
@@ -669,19 +684,26 @@ static int child_func(void *arg)
         audit_log(config, "CONTAINER_EXEC", detail);
     }
 
-    /* 14. Close inherited FDs and exec */
+    /* 14. Close inherited FDs */
 #ifdef __NR_close_range
     /* close_range(2): Linux 5.9+, single syscall instead of a loop */
     if (syscall(__NR_close_range, 3U, ~0U, 0U) != 0)
 #endif
     {
-        /* Fallback for kernels < 5.9: use actual RLIMIT_NOFILE, not hardcoded 4096 */
+        /* Fallback for kernels < 5.9: use actual RLIMIT_NOFILE.
+         * This runs BEFORE set_rlimits() so the original (higher) limit
+         * is visible, ensuring FDs above 1024 are closed. */
         struct rlimit rl;
         int max_fd = 4096;
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur > 3)
             max_fd = (int)(rl.rlim_cur < 1048576 ? rl.rlim_cur : 1048576);
         for (int i = 3; i < max_fd; i++) close(i);
     }
+
+    /* 15. Set resource limits (moved from step 8 — AFTER FD cleanup
+     *     so the fallback loop sees the original RLIMIT_NOFILE) */
+    set_rlimits();
+
     execvp(cmd_args[0], cmd_args);
     perror("compartment-root: execvp");
     exit(EXIT_FAILURE);
@@ -750,16 +772,8 @@ static void drop_privileges(uid_t uid, gid_t gid)
  * MUST be called while still root (UID 0 inside the user namespace) —
  * PR_CAPBSET_DROP requires CAP_SETPCAP, which is lost after setuid.
  */
-static void drop_capabilities(Config *config)
+static void drop_capabilities(Config *config, int cap_last)
 {
-    /* Read the highest valid capability number from the kernel */
-    int cap_last = 37;  /* safe fallback (covers up to CAP_AUDIT_READ) */
-    FILE *f = fopen("/proc/sys/kernel/cap_last_cap", "re");
-    if (f) {
-        if (fscanf(f, "%d", &cap_last) != 1)
-            cap_last = 37;
-        fclose(f);
-    }
 
     /* Build the allow-set from cap_allowed_names[] */
     int allowed[64] = {0};

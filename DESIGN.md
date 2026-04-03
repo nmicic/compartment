@@ -146,6 +146,16 @@ External review + automated testing uncovered these bugs:
 | 36 | **Medium** | compartment.h | Unknown syscall in `block`/`allow` directive only warned, did not indicate the block was NOT applied | Warning now explicitly says "block NOT applied" to make silent weakening visible |
 | 37 | **Medium** | compartment-user | CLI `--no-landlock`/`--no-seccomp`/`--no-env-sanitize` could be undone by a profile loaded after CLI parsing | CLI disable flags now always take precedence over profile (credit: Codex review) |
 | 38 | **Medium** | compartment-root | Mount propagation used `MS_SLAVE` (allows host→container events) but comment said "private" | Changed to `MS_PRIVATE` — fully isolates mount propagation (credit: Codex review) |
+| 39 | **Medium** | compartment-root | `drop_capabilities()` read `cap_last_cap` from `/proc/sys/kernel/cap_last_cap` AFTER `/proc/sys` was masked with tmpfs — fallback of 37 missed CAP_PERFMON(38), CAP_BPF(39), CAP_CHECKPOINT_RESTORE(40) | Read `cap_last_cap` before masking `/proc/sys`, pass to `drop_capabilities()` |
+| 40 | **Medium** | compartment-root | `set_rlimits()` lowered RLIMIT_NOFILE to 1024 before `close_range` fallback — FDs >= 1024 not closed on kernels < 5.9 | Moved `set_rlimits()` to after FD cleanup |
+| 41 | **Medium** | compartment.h | `expand_var()` copied literal `$HOME` when env var was unset, or resolved to filesystem root when empty — silently weakened path rules | Return NULL (error) when `$HOME`/`$USER` is referenced but unset or empty |
+| 42 | **Medium** | compartment-user | Empty Landlock ruleset (0 paths, `landlock on`) denied ALL filesystem access with no warning | Detect and reject with clear error message |
+| 43 | **Medium** | compartment-user | `PATH_RW` included EXECUTE — no W^X enforcement, writable `/tmp` was executable | `PATH_RW` = read+write (no exec), `PATH_RWX` = read+write+exec (explicit opt-in). `$HOME`/`workdir` use RWX, `/tmp` uses RW |
+| 44 | **Medium** | compartment-user | `landlock_add_path()` followed symlinks via `O_PATH` — attacker could symlink a path to `/` to expand sandbox | Added `O_NOFOLLOW` + `realpath()` fallback for symlinks |
+| 45 | **Medium** | sandbox.sh | Mount propagation not set to private inside namespace — host mount events could propagate in, shell intercept bind mounts could propagate out | Added `mount --make-rprivate /` as first operation inside both HARD and SOFT namespaces |
+| 46 | **Medium** | sandbox.sh | Shell intercept only covered `/bin/bash` and `/bin/sh` — bypassed by `/bin/dash`, `/usr/bin/bash`, etc. | Expanded to cover bash, sh, dash, zsh in both `/bin` and `/usr/bin` |
+| 47 | **Medium** | sandbox.sh | SOFT mode: background processes survived sandbox teardown — reparented to host PID 1 | Added `unshare --pid --fork` in SOFT mode nsenter to kill all descendants on exit |
+| 48 | **Info** | sandbox.sh | `SHELL_STASH` discoverable via `/proc/self/mountinfo` | Documented as known limitation — real security boundary is Landlock + seccomp, not path hiding |
 
 ### seccomp Return Action: EPERM vs KILL
 

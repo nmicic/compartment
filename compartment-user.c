@@ -91,16 +91,16 @@ static void apply_profile_ai_agent(Config *cfg)
         }
     }
 
-    /* Add HOME and workdir as RW */
+    /* Add HOME and workdir as RWX (agents write AND execute scripts) */
     const char *home = getenv("HOME");
     if (home && cfg->path_count < MAX_PATHS) {
         cfg->paths[cfg->path_count].path = home;
-        cfg->paths[cfg->path_count].mode = PATH_RW;
+        cfg->paths[cfg->path_count].mode = PATH_RWX;
         cfg->path_count++;
     }
     if (cfg->workdir && cfg->path_count < MAX_PATHS) {
         cfg->paths[cfg->path_count].path = cfg->workdir;
-        cfg->paths[cfg->path_count].mode = PATH_RW;
+        cfg->paths[cfg->path_count].mode = PATH_RWX;
         cfg->path_count++;
     }
 
@@ -190,7 +190,25 @@ static void apply_profile_strict(Config *cfg)
 
 static int landlock_add_path(int ruleset_fd, const char *path, uint64_t access)
 {
-    int fd = open(path, O_PATH | O_CLOEXEC);
+    int fd = open(path, O_PATH | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 && errno == ELOOP) {
+        /* Path is a symlink (e.g. /lib -> /usr/lib). Resolve it and use
+         * the target. This prevents an attacker from creating a symlink
+         * like /tmp/workdir -> / to expand the sandbox to the whole fs. */
+        char resolved[PATH_MAX];
+        if (!realpath(path, resolved)) {
+            fprintf(stderr, "compartment-user: landlock: symlink %s: %s\n",
+                    path, strerror(errno));
+            return 0; /* skip nonexistent symlink target */
+        }
+        fd = open(resolved, O_PATH | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0 && errno == ELOOP) {
+            /* Resolved path is still a symlink — give up */
+            fprintf(stderr, "compartment-user: landlock: chained symlink %s -> %s\n",
+                    path, resolved);
+            return 0;
+        }
+    }
     if (fd < 0) {
         /* Path doesn't exist — skip silently (e.g. /lib32 on some systems) */
         return 0;
@@ -250,6 +268,14 @@ static int apply_landlock(Config *cfg)
         handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
 #endif
 
+    /* An empty ruleset (0 paths) with a non-zero handled mask would deny
+     * ALL filesystem access — the process couldn't even load libc. */
+    if (cfg->path_count == 0) {
+        fprintf(stderr, "compartment-user: landlock enabled but no paths "
+                "configured — this would deny all filesystem access\n");
+        return -1;
+    }
+
     struct landlock_ruleset_attr rs_attr = { .handled_access_fs = handled };
     int ruleset_fd = syscall(__NR_landlock_create_ruleset,
                              &rs_attr, sizeof(rs_attr), 0);
@@ -283,7 +309,7 @@ static int apply_landlock(Config *cfg)
         uint64_t access = 0;
         switch (cfg->paths[i].mode) {
         case PATH_RO:   access = read_access | exec_access; break;
-        case PATH_RW:   access = read_access | write_access | exec_access; break;
+        case PATH_RW:   access = read_access | write_access; break; /* W^X: no exec */
         case PATH_EXEC: access = read_access | exec_access; break;
         case PATH_RWX:  access = read_access | write_access | exec_access; break;
         }

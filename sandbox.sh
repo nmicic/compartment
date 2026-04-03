@@ -219,12 +219,16 @@ if [ -n "$COMPARTMENT" ]; then
         if mount --bind /bin/bash /bin/bash 2>/dev/null; then
             mkdir -p "'"$SHELL_STASH"'" 2>/dev/null
             export COMPARTMENT_SHELL_DIR="'"$SHELL_STASH"'"
-            for sh in /bin/bash /bin/sh; do
+            for sh in /bin/bash /usr/bin/bash /bin/sh /usr/bin/sh /bin/dash /usr/bin/dash /bin/zsh /usr/bin/zsh; do
                 [ -x "$sh" ] || continue
                 mount --bind "$sh" "'"$SHELL_STASH"'/$(basename "$sh")" 2>/dev/null
                 mount --bind "'"$COMPARTMENT"'" "$sh" 2>/dev/null && \
-                    echo "sandbox: shell intercept: $sh -> compartment-user -> '"$SHELL_STASH"'/$(basename $sh)" >&2
+                    echo "sandbox: shell intercept: $sh -> compartment-user" >&2
             done
+            # NOTE: SHELL_STASH path is discoverable via /proc/self/mountinfo.
+            # This is a known limitation of the bind-mount approach. The real
+            # security boundary is Landlock + seccomp, not path hiding.
+            # The randomized name (~2^64 entropy) prevents blind guessing.
         else
             echo "sandbox: WARNING: shell intercept bind mount failed — child processes will use real shell" >&2
         fi
@@ -262,6 +266,7 @@ if unshare --user --mount --net --map-root-user --fork -- \
     log "network: lo=UP, tap0=NONE, routes=NONE, only unix socket bridge"
     # Do NOT use exec here — the EXIT trap must run to clean up socat/slirp
     unshare --user --mount --net --map-root-user --fork -- bash -c '
+        mount --make-rprivate / 2>/dev/null || true
         ip link set lo up 2>/dev/null
         '"$INNER_SETUP" -- "$@"
     STATUS=$?
@@ -300,6 +305,11 @@ done
 nsenter -U -n --preserve-credentials -t "$NS_PID" -- \
     ip link show tap0 >/dev/null 2>&1 || die "slirp4netns tap0 did not appear"
 
-nsenter -U -m -n --preserve-credentials -t "$NS_PID" -- bash -c "$INNER_SETUP" -- "$@"
+# Use --pid --fork so all descendant processes die when the main command
+# exits (prevents background processes from surviving sandbox teardown).
+nsenter -U -m -n --preserve-credentials -t "$NS_PID" -- \
+    unshare --pid --fork -- bash -c '
+    mount --make-rprivate / 2>/dev/null || true
+    '"$INNER_SETUP" -- "$@"
 STATUS=$?
 exit $STATUS
