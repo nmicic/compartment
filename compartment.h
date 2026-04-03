@@ -31,7 +31,7 @@
 #define _GNU_SOURCE
 #endif
 
-#define COMPARTMENT_VERSION "1.0.0"
+#define COMPARTMENT_VERSION "1.2.0"
 
 #include <stdio.h>
 #include <stdlib.h>
