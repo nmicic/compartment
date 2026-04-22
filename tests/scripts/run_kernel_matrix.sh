@@ -176,6 +176,30 @@ for K in $KERNELS; do
     # Test 7: env sanitization (works everywhere)
     run_kernel_test "$K" "env strip LD_PRELOAD" \
         "LD_PRELOAD=evil.so $REPO_DIR/compartment-user --insecure --no-landlock --no-seccomp -- env | grep -c LD_PRELOAD" 1
+
+    # Test 8+: Each example profile parses + its seccomp/env directives install.
+    # All shipped profiles set `landlock on`, so apply_landlock() runs even
+    # under --insecure; that aborts on kernels without Landlock support
+    # (v5.4, v5.10) and on Ubuntu mainline v5.15 unless the LSM is enabled
+    # at boot. We therefore skip v5.4/v5.10 entirely and append the same
+    # lsm= boot param on v5.15 that existing test 2 uses. On v6.1+ with
+    # virtme-ng (9p), Landlock rules are accepted by the kernel but cannot
+    # enforce on 9p paths — that's the right semantics for this test, since
+    # we're verifying parser + seccomp install + env-deny, not enforcement.
+    if [[ "$K" != "v5.4" && "$K" != "v5.10" ]]; then
+        profile_extra=()
+        if [[ "$K" == "v5.15" ]]; then
+            profile_extra=(--append "lsm=landlock,lockdown,capability,yama,apparmor")
+        fi
+        for prof in tcpdump curl-wget net-trace tcp-udp-relay dns-client dhclient net-admin-ro; do
+            profpath="${REPO_DIR}/examples/${prof}.conf"
+            if [[ -f "$profpath" ]]; then
+                run_kernel_test "$K" "profile ${prof} loads" \
+                    "$REPO_DIR/compartment-user --insecure --profile \"$profpath\" -- /bin/true" \
+                    0 "${profile_extra[@]}"
+            fi
+        done
+    fi
 done
 
 # ─── Summary ────────────────────────────────────────────────────────────
