@@ -3,8 +3,13 @@
 
 # Compartment — Linux Process Isolation Toolkit
 
-Kernel-enforced sandboxing for untrusted processes. Two tools, one
-profile format, zero dependencies.
+Kernel-enforced sandboxing for untrusted processes. Two zero-dependency
+core tools, one shared profile format, plus an optional BPF-LSM module.
+
+> **Core vs optional module:** `compartment-user` and
+> `compartment-root` are the zero-dependency core. `compartment-bpf`
+> is an optional advanced module with kernel and toolchain
+> requirements.
 
 > **Note:** This is an open-source Linux isolation toolkit, not a
 > formally validated security product. The code has been through
@@ -23,9 +28,14 @@ profile format, zero dependencies.
 | **compartment-user** | Landlock + seccomp + env sanitize + audit | no | none |
 | **compartment-root** | Full namespace container + seccomp + audit | yes | none |
 | **sandbox.sh** | Network namespace + proxy bridge | no | unshare, socat, newuidmap |
+| **compartment-bpf** | Optional BPF LSM inode sealing (kernel-side deny, even root) | yes (CAP_BPF + CAP_SYS_ADMIN) | clang ≥ 12, libbpf, bpftool, libsodium, BTF, kernel ≥ 6.6 with `lsm=...,bpf` |
 
-Same `.conf` profile files drive both tools. Write your policy once,
-enforce it at whatever privilege level you have.
+`compartment-user` / `compartment-root` use Landlock + seccomp
+(userspace policy) and are the default zero-dependency path.
+`compartment-bpf` seals individual inodes at the BPF LSM level —
+enforcement lives in the kernel and survives even root. The two
+approaches are complementary. See `compartment-bpf/HOWTO.md` for
+the BPF tool and its requirements.
 
 ## Quick Start
 
@@ -38,11 +48,21 @@ make
 ## Build
 
 ```bash
-make                    # builds both tools (zero dependencies)
+make                    # builds the zero-dependency core tools
 make test               # run core tests (Landlock + seccomp + env + inheritance)
 make test-integration   # run all tests (includes Claude CLI smoke test)
 make hardened           # build with randomized shell stash path
 ```
+
+Optional BPF module:
+
+```bash
+cd compartment-bpf
+make vmlinux.h && make
+```
+
+Requires Linux kernel 6.6+ with BPF LSM enabled, plus clang,
+libbpf-dev, bpftool, libsodium-dev, and BTF for the running kernel.
 
 ## Usage
 
