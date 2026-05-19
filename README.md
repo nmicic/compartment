@@ -6,10 +6,10 @@
 Kernel-enforced sandboxing for untrusted processes. Two zero-dependency
 core tools, one shared profile format, plus an optional BPF-LSM module.
 
-> **Core vs optional module:** `compartment-user` and
-> `compartment-root` are the zero-dependency core. `compartment-bpf`
-> is an optional advanced module with kernel and toolchain
-> requirements.
+> **v1.3.0 note:** `compartment-user` and `compartment-root` are
+> unchanged and remain the zero-dependency core. `compartment-bpf`
+> is a new optional advanced module for kernel-level inode sealing,
+> with its own kernel and toolchain requirements.
 
 > **Note:** This is an open-source Linux isolation toolkit, not a
 > formally validated security product. The code has been through

@@ -5,7 +5,8 @@ If you are reading this in a fresh clone and want to confirm that
 pick one of the three paths below. They differ in fidelity, setup
 cost, and what they prove.
 
-For the design rationale, read `experimental/ARCHITECTURE.md`.
+For the design rationale, start with `README.md`, `HOWTO.md`, and
+`experimental/EXEC-DOMAIN-SPEC.md`.
 
 ## Path A — full-fidelity KVM VM (production-grade)
 

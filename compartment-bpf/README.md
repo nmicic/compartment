@@ -166,8 +166,7 @@ See `LIMITATIONS.md` for the full table. Highlights:
   namespace lockdown for stronger guarantees.
 - **btrfs / overlayfs anon_bdev**: on these filesystems, `(dev, ino)` can be
   reused across bind-mount views of the same inode; see LIMITATIONS.md.
-- **No cryptographic policy signing** (design intent in
-  `experimental/SIGNED-POLICY-SPEC.md`).
+- **No cryptographic policy signing** yet.
 
 ---
 

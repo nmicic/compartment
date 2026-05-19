@@ -3,7 +3,8 @@
 > Status: draft v0.3, May 2026 — authoritative consolidation of the
 >          exec-domain feature family for compartment-bpf
 > Audience: implementers, profile authors, reviewers
-> Companion to: `SIGNED-POLICY-SPEC.md`, `ARCHITECTURE.md`
+> Companion to: the future signed-policy / `bpf_gate` design notes and
+>               the broader compartment-bpf design rationale
 > Prerequisite: v0 enforcement surface (existing seal model)
 > Lineage: LIDS exec-domain (1998–2002) — historical motivation
 >          for the actor-allowlist property; the author's 2001
@@ -300,7 +301,7 @@ worker has the same `mm->exe_file` inode.
 - **T-X4. CAP_BPF process direct map mutation.** Root with
   `bpftool map update` against the seal map can bypass enforcement
   without a kernel-side gate. The v0 model assumes a trusted load
-  phase. The defense is `SIGNED-POLICY-SPEC.md` §7 `bpf_gate` —
+  phase. The defense is future `bpf_gate` work —
   *out of this spec's scope* but compatible with it.
 
 - **T-X5. Exec via interpreter chain — NOT a bypass.** Actor
@@ -468,7 +469,7 @@ every failed unpin attempt durable — silent suppression requires
 compromising both channels.
 
 The real defense against malicious unpin by a CAP_BPF-equipped
-attacker remains `bpf_gate` (see `SIGNED-POLICY-SPEC.md` §7),
+attacker remains `bpf_gate` (see the future signed-policy work),
 which puts an LSM gate on `BPF_PROG_DETACH` and `BPF_OBJ_GET`
 from non-agent tasks. That is out of this spec's scope and is not
 implemented in v0.x. Until `bpf_gate` lands, a CAP_BPF user can
@@ -1419,7 +1420,7 @@ unpacker. The unpacker is a transport.
 
 ### 15.2 What the addendum proposes
 
-Two reserved TLVs in `SIGNED-POLICY-SPEC.md` §4.3 — `EXEC_DELEGATE`
+Two reserved TLVs in the future signed-policy design — `EXEC_DELEGATE`
 (0x07) and `DOMAIN_CLAIM_MAP` (0x08) — plus `DOMAIN_FLAG_ALLOW_ANON_EXEC`
 on `DOMAIN_DEF`. Six requirements (R-22..R-27 in the addendum's
 numbering) wire `bpf_gate` to admit claim-map writes only from
@@ -1552,11 +1553,11 @@ additions (T-7 / T-8 / T-9 in the addendum's numbering).
 
 ## 17. References
 
-- `SIGNED-POLICY-SPEC.md` — §7 `bpf_gate`. Compatible with this
+- Future signed-policy / `bpf_gate` work — compatible with this
   spec; not required. Shape B for unpin protection.
-- `ARCHITECTURE.md` — overall component shape; this exec-domain
-  family slots into the daemon's existing inode-keyed seal model
-  without changing the management-plane assumptions.
+- Broader compartment-bpf design rationale — this exec-domain family
+  slots into the daemon's existing inode-keyed seal model without
+  changing the management-plane assumptions.
 - `tools/profile-draft.py` — drafting tool that this spec extends
   with discovery-input ingestion (§13). DT_NEEDED expansion is
   explicitly NOT part of this spec; libraries are loaded via
@@ -1607,7 +1608,7 @@ additions (T-7 / T-8 / T-9 in the addendum's numbering).
   binary's identity comes from the binary being itself sealed
   against modification (E-6 for actors, X-6 for exec-trust),
   not from cryptographic measurement. TPM / IMA integration is
-  `SIGNED-POLICY-SPEC.md` territory.
+  future signed-policy territory.
 - **Not anonymous-inode content verification.** Even with the
   Exec_Enc addendum (§15) adopted, the spec does NOT verify what
   bytes the kernel runs from an anonymous inode; trust is
