@@ -1,0 +1,17 @@
+# seq: seq6-alias-create
+# desc: alias-creation as bind-mount-style aliasing preview (§3.23).
+#       Real bind-mount requires CAP_SYS_ADMIN + mount(2); this sequence
+#       uses symlink as a portable, in-userland aliasing primitive that
+#       exercises the same seal-follows-inode invariant.
+#       Step 1: actor reads sealed secret (ALLOW per actor list).
+#       Step 2: outsider attempts open-via-symlink through the existing alias
+#               that resolves to ME19_SECRET → DENY (resolved inode is sealed
+#               full actor=a1; b1 not in actor list).
+#       Step 3: outsider attempts to WRITE the sealed file by absolute
+#               path → DENY (same inode; path irrelevant). (v0 has no
+#               read-restriction; only write-class ops surface DENY.)
+#       The witness: alias does NOT bypass the seal — neither the original
+#       path nor any user-created alias matters; only (dev,ino) does.
+me21_step 1 a1 open-ro          "$ME19_SECRET" ALLOW expected-ALLOW-actor-reads-sealed-secret
+me21_step 2 b1 open-via-symlink "$ME19_ALIAS"  DENY  expected-DENY-outsider-via-alias-write-to-sealed-secret
+me21_step 3 b1 write            "$ME19_SECRET" DENY  expected-DENY-outsider-direct-path-write

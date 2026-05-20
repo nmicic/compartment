@@ -1,0 +1,6 @@
+# seq: seq1-infoflow
+# desc: actor copies sealed secret to unsealed escape; outsider reads escape
+#       (documents v0 NO information-flow tracking limitation)
+me21_step 1 a1 open-ro "$ME19_SECRET" ALLOW intended-ALLOW-actor-reads-secret
+me21_step 2 a1 write   "$ME19_ESCAPE" ALLOW intended-ALLOW-actor-writes-unsealed-escape
+me21_step 3 b1 open-ro "$ME19_ESCAPE" ALLOW intended-ALLOW-outsider-reads-unsealed-NO-INFO-FLOW

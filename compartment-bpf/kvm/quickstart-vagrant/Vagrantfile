@@ -1,0 +1,289 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# compartment-bpf reproducibility on-ramp — Path C (Vagrant + libvirt).
+# See README.md for the operator command sequence and timing notes.
+# The companion build-local-box.sh must have already added the
+# `compartment/resolute` box for provider libvirt (one-time bootstrap).
+
+VAGRANTFILE_API_VERSION = "2"
+
+# vagrant-libvirt 0.12.2 hardcodes a 2-second wait inside
+# get_ipaddress_from_domain (driver.rb:303), which is too short for
+# vanilla Ubuntu cloud images that lack qemu-guest-agent — DHCP-lease
+# parsing typically takes 10-30 s on first boot. The upstream-blessed
+# workaround is to bake qemu-guest-agent into the box image; on Ubuntu
+# Noble that requires libguestfs's supermin appliance to talk to apt
+# inside an isolated network namespace, which fails for DNS reasons
+# we can't fix without operator-root. Monkey-patching the timeout
+# here keeps the on-ramp self-contained: every outside operator gets
+# the same patched timeout the moment they `vagrant up`, no
+# build-step changes required.
+begin
+  require 'vagrant-libvirt/driver'
+  VagrantPlugins::ProviderLibvirt::Driver.class_eval do
+    define_method(:get_ipaddress_from_domain) do |domain|
+      ip_address = nil
+      domain.wait_for(180) do
+        addresses.each_pair do |_type, ip|
+          ip_address = ip[0].split("\n").first unless ip[0].nil?
+        end
+        !ip_address.nil?
+      end
+      ip_address
+    end
+  end
+rescue LoadError
+  # vagrant-libvirt not installed in this context (e.g. vagrant validate
+  # on a host without the plugin); the friendlier error message from
+  # vagrant itself will surface that.
+end
+
+# Path C's NVRAM bootstrap problem.
+#
+# vagrant-libvirt 0.12.2's templates/domain.xml.erb (lines 80-89) emits
+# the loader/nvram pair as
+#
+#   <loader readonly='yes' type='pflash'>$LOADER</loader>
+#   <nvram>$NVRAM</nvram>
+#
+# without a `template=` attribute on <nvram>. That requires the operator
+# to pre-create the per-VM nvram file before `vagrant up` — which they
+# cannot do without root because /var/lib/libvirt/qemu/nvram/ is mode
+# 0755 owned by libvirt-qemu:kvm. The fix is to emit the libvirt 7.2+
+# form
+#
+#   <nvram template='$VARS_TEMPLATE'>/var/lib/libvirt/qemu/nvram/$NAME_VARS.fd</nvram>
+#
+# which libvirtd (root) copies into the per-VM path on domain start.
+# The libvirt-qemu AppArmor abstraction whitelists rw on
+# /var/lib/libvirt/qemu/nvram/*_VARS.fd, so qemu can mutate the per-VM
+# copy without operator AppArmor changes.
+#
+# We point `template=` at the in-repo file `resolute-nvram-template.fd`
+# rather than the stock /usr/share/OVMF/OVMF_VARS_4M.ms.fd because the
+# stock template is an empty varstore (no Boot#### entries). On a fresh
+# empty varstore, Ubuntu Noble's OVMF lands the VM in the EFI
+# Interactive Shell or at "BdsDxe: No bootable option" instead of
+# walking the disk's ESP for \EFI\BOOT\BOOTX64.EFI (the BdsDxe build in
+# `ovmf 2024.02-2ubuntu0.8` does not implement the removable-media
+# fallback path). The captured `resolute-nvram-template.fd` is a single
+# byte-snapshot of Path A's SecureBoot-enrolled varstore taken AFTER
+# Ubuntu's autoinstaller ran efibootmgr to register the
+# \EFI\ubuntu\shimx64.efi Boot#### entry — partition GUIDs in the
+# Resolute cloud image are stable, so the same device path that boots
+# Path A also boots Path C. See INVENTORY.md and README.md for refresh
+# / re-capture instructions.
+#
+# We patch the rendered XML rather than the ERB on disk so the
+# operator's gem stays untouched. Triggered only when the rendered XML
+# contains a `<loader>` pointing at /usr/share/OVMF/OVMF_CODE_*.fd;
+# harmless on non-OVMF setups.
+#
+# The companion lv.nvram setting further down is load-bearing: without
+# it, vagrant-libvirt's StartDomain action (start_domain.rb:546-548)
+# strips our `<nvram template='...'>...</nvram>` element back out
+# before submitting the final XML to libvirt — see the comment next to
+# `lv.nvram = NVRAM_PER_VM` for the full StartDomain rationale.
+#
+# The template ITSELF must live somewhere libvirtd can read AND where
+# qemu/virt-aa-helper's path validation accepts it. The libvirt-qemu
+# AppArmor abstraction (`/etc/apparmor.d/abstractions/libvirt-qemu`)
+# whitelists three locations relevant to nvram seeding:
+#
+#   /usr/share/OVMF/**                            rk    (system OVMF + stock varstore templates)
+#   /var/lib/libvirt/qemu/nvram/*_VARS.fd         rwk   (per-VM mutable varstores)
+#   /var/lib/libvirt/images/**                    rwk   (libvirt storage pools)
+#
+# It does NOT whitelist /home/<operator>/. With a template under
+# /home/<operator>/, libvirtd silently falls back to seeding the per-VM
+# nvram from the stock OVMF_VARS_4M template instead of from ours — no
+# error to vagrant, no error in `virsh dumpxml`, just an empty varstore
+# at boot, which OVMF on Ubuntu Noble can't fall back from (its BdsDxe
+# build doesn't do the removable-media fallback to \EFI\BOOT\BOOTX64.EFI
+# from a fresh empty varstore). The visible failure is identical to
+# V-5's original "BdsDxe: No bootable option" panic.
+#
+# So we store the captured template as a libvirt-pool volume named
+# `compartment-bpf-resolute-nvram-template.fd` in the system `images`
+# pool (default `/var/lib/libvirt/images/`). `bootstrap-nvram.sh`
+# uploads it via `virsh vol-upload` (which goes through libvirtd, so the
+# operator does not need direct write access to /var/lib/libvirt/images/);
+# `build-local-box.sh` calls bootstrap-nvram.sh at one-time-bootstrap
+# time, and `Vagrantfile` references the resolved pool path here.
+# V-5c pivot: instead of seeding the per-VM varstore from a captured
+# template (which OVMF actively rejects when its Boot#### entries don't
+# match the QEMU-supplied `bootorder` fw_cfg blob — see the lower
+# monkey-patch comment), let libvirtd seed the per-VM varstore from the
+# stock SecureBoot-enrolled OVMF varstore (`OVMF_VARS_4M.ms.fd`). That
+# initial empty-but-SB-enrolled state lets the cloud image's
+# `\EFI\BOOT\fbx64.efi` register the Ubuntu shim Boot#### on first boot
+# via the standard UEFI fallback path. We supplement that with the
+# `<boot order='1'/>` injection on the disk further down — without it,
+# QEMU doesn't pass bootindex to OVMF and Noble's Edk2 build of OVMF
+# doesn't autonomously fall back to `\EFI\BOOT\BOOTX64.EFI`.
+#
+# Cost: the first `vagrant up` on a fresh host pays the fbx64 +
+# shim + grub + kernel cold-boot time, ~30-60 s. Every subsequent
+# `vagrant up` (warm cache) lands on the now-written `Boot0002
+# 'Ubuntu'` entry directly. The V-5/V-5b/V-5c warm-cache gate
+# measures the warm path.
+NVRAM_TEMPLATE = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd"
+# vagrant-libvirt names domains "<vagrant_project>_<machine_name>";
+# our project dir is `kvm/quickstart-vagrant/` and the only machine is
+# `default`, so the libvirt domain comes up as
+# `quickstart-vagrant_default`. Keep this in sync with NVRAM_PER_VM and
+# the monkey-patch's `nvram_target` derivation below.
+DOMAIN_NAME    = "#{File.basename(__dir__)}_default"
+NVRAM_PER_VM   = "/var/lib/libvirt/qemu/nvram/#{DOMAIN_NAME}_VARS.fd"
+
+begin
+  require 'vagrant-libvirt/util/erb_template'
+  mod = VagrantPlugins::ProviderLibvirt::Util::ErbTemplate
+  unless mod.method_defined?(:to_xml_compartment_bpf_orig)
+    nvram_template_path = NVRAM_TEMPLATE
+    nvram_target_path   = NVRAM_PER_VM
+    mod.send(:alias_method, :to_xml_compartment_bpf_orig, :to_xml)
+    mod.send(:define_method, :to_xml) do |template_name = nil, data = binding|
+      xml = to_xml_compartment_bpf_orig(template_name, data)
+      next xml unless template_name.to_s == 'domain'
+      loader_re = %r{<loader readonly='yes' type='(?:rom|pflash)'>(/usr/share/OVMF/[^<]+_CODE[^<]*\.fd)</loader>}
+      next xml unless xml =~ loader_re
+      code_path = Regexp.last_match(1)
+      # Drop any pre-existing <nvram>...</nvram> the template may have
+      # emitted (lv.nvram below is set, so vagrant-libvirt's stock
+      # template will emit a no-template-attribute <nvram> element here
+      # — we replace it).
+      xml = xml.sub(%r{\s*<nvram[^>]*>[^<]*</nvram>}, '')
+      # Inject `secure='yes'` on <loader> and `<smm state='on'/>` in
+      # <features> manually. Path A gets these elements via libvirt
+      # firmware autoselection (which only fires when the NVRAM
+      # template path matches /usr/share/qemu/firmware/*.json's stock
+      # OVMF descriptors); we override the nvram template path so
+      # autoselection is bypassed. The SB-enrolled OVMF_CODE_4M.ms.fd
+      # is built with SMM_REQUIRE=TRUE: it needs `<smm state='on'/>`
+      # plus the secure pflash attribute or it cannot read /
+      # validate its varstore at all, which is what made the captured
+      # Path A NVRAM look empty to OVMF in earlier V-5b attempts.
+      xml = xml.sub(
+        loader_re,
+        "<loader readonly='yes' secure='yes' type='pflash'>#{code_path}</loader>\n    <nvram template='#{nvram_template_path}'>#{nvram_target_path}</nvram>")
+      unless xml.include?('<smm')
+        xml = xml.sub(%r{(<features>[^<]*(?:<[^/][^>]*/>[^<]*)*)</features>}m) do
+          "#{Regexp.last_match(1)}<smm state='on'/>\n  </features>"
+        end
+      end
+      # vagrant-libvirt emits the legacy global `<boot dev='hd'/>` on
+      # Q35+OVMF. With an empty SB-enrolled NVRAM template (our pivot
+      # strategy), QEMU only forwards a usable bootindex hint to OVMF
+      # when the box-volume disk has `<boot order='N'/>` set. Without
+      # the hint, Ubuntu Noble's Edk2 build of OVMF lands on "BdsDxe:
+      # No bootable option" because the BdsDxe in
+      # `ovmf 2024.02-2ubuntu0.8` does not do the removable-media
+      # fallback to `\EFI\BOOT\BOOTX64.EFI` autonomously on a fresh
+      # varstore. With `bootindex=1`, OVMF synthesises a Boot#### for
+      # the disk, runs ConnectAll, loads `\EFI\BOOT\BOOTX64.EFI`
+      # (=cloud image's shim+fbx64 chain), fbx64 registers the
+      # permanent `Boot0002 'Ubuntu'` entry, reset, and the second
+      # boot lands on the new Boot0002 → grub → kernel → systemd.
+      unless xml.match?(%r{<disk[^>]*device='disk'[^>]*>[^<]*<[^>]*>[^<]*(?:<[^>]*>[^<]*)*?<boot order=})
+        xml = xml.sub(
+          %r{(<disk type='[^']+' device='disk'>.*?)(\s*</disk>)}m) do
+          inner = Regexp.last_match(1)
+          tail  = Regexp.last_match(2)
+          if inner.include?('<boot order=')
+            "#{inner}#{tail}"
+          else
+            "#{inner}\n      <boot order='1'/>#{tail}"
+          end
+        end
+      end
+      xml
+    end
+  end
+rescue LoadError
+  # see comment above on validate-without-plugin.
+end
+
+REPO_ROOT       = File.expand_path("../..", __dir__)
+STORAGE_POOL    = ENV.fetch("COMPARTMENT_BPF_VAGRANT_POOL", "images")
+GUEST_MEMORY_MB = Integer(ENV.fetch("COMPARTMENT_BPF_VAGRANT_MEM",  "4096"))
+GUEST_VCPUS     = Integer(ENV.fetch("COMPARTMENT_BPF_VAGRANT_CPUS", "4"))
+
+# System-scoped libvirt: vagrant-libvirt talks to libvirtd over the
+# RPC socket, which the operator's user has access to via the libvirt
+# group or world-rw /var/run/libvirt/libvirt-sock. Volumes are
+# allocated by libvirtd as root inside the system "images" pool
+# (default `/var/lib/libvirt/images/`), so the AppArmor profile that
+# already ships with the libvirt-daemon-system package permits
+# libvirt-qemu reads without a custom drop-in.
+#
+# Why not qemu:///session: vagrant-libvirt 0.12.2 in session mode
+# hardcodes the management interface to type=bridge, which requires
+# /etc/qemu/bridge.conf + the qemu-bridge-helper setuid binary —
+# i.e. operator-root setup that the bridged system path does not
+# need.
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box      = "compartment/resolute"
+  config.vm.hostname = "compartment-bpf-vagrant"
+
+  config.vm.synced_folder ".",       "/vagrant", disabled: true
+  # Note on rsync exclusions: `kvm/ubuntu-resolute*.sh` are Path A's
+  # privileged helpers, root-owned on the host doing the
+  # gate measurement. They are NOT needed in the guest for `make smoke`
+  # (which only exercises tests/profiles/ and the in-repo BPF loader),
+  # and Vagrant's rsync errors out hard on Permission-denied source
+  # reads. Excluded here so the on-ramp does not require operator-root
+  # for those scripts on the host.
+  config.vm.synced_folder REPO_ROOT, "/repo",    type: "rsync",
+                          rsync__exclude: [".git/", "tests/results/", "*.box",
+                                           "kvm/ubuntu-resolute*"]
+
+  config.vm.provider :libvirt do |lv|
+    lv.driver            = "kvm"
+    lv.memory            = GUEST_MEMORY_MB
+    lv.cpus              = GUEST_VCPUS
+    lv.cpu_mode          = "host-passthrough"
+    lv.storage_pool_name = STORAGE_POOL
+    lv.qemu_use_session  = false
+    # Resolute cloud images are UEFI-only (ESP at /dev/sda15, no MBR
+    # / GRUB-BIOS path). Match Path A's KVM domain exactly: Q35
+    # chipset plus the SecureBoot-enrolled OVMF flavour. The OVMF
+    # variant must be .ms.fd (not the plain .fd) because the in-repo
+    # NVRAM template above (resolute-nvram-template.fd) was captured
+    # from Path A's SecureBoot-enrolled varstore, which is the .ms.fd
+    # flavour — varstore format and key enrolment differ between the
+    # two flavours and libvirt would reject the mismatch. Resolute's
+    # cloud image ships signed shim + grub + kernel out of the box so
+    # SecureBoot enforcement is invisible from the operator side.
+    #
+    # lv.nvram MUST match what the monkey-patch above writes into the
+    # <nvram> element's text content. vagrant-libvirt's StartDomain
+    # action (start_domain.rb:533-549) reads config.nvram (this value)
+    # and, if it differs from the existing <nvram> element's text,
+    # rewrites the element — stripping our `template='...'` attribute
+    # in the process. By setting lv.nvram to the same per-VM path the
+    # monkey-patch emits, StartDomain treats the XML as already
+    # current and leaves the `template='...'` attribute intact, which
+    # is what makes libvirtd auto-copy the captured Path A NVRAM into
+    # the per-VM file on first boot. lv.loader / lv.nvram pair also
+    # forces vagrant-libvirt's ERB template to emit type='pflash'
+    # (not 'rom'), which is required because OVMF is a pflash image,
+    # not a legacy BIOS ROM.
+    lv.machine_type      = "q35"
+    lv.loader            = "/usr/share/OVMF/OVMF_CODE_4M.ms.fd"
+    lv.nvram             = NVRAM_PER_VM
+    # Resolute cloud image's virtual disk is 3.5 GiB. The provisioner
+    # apt-installs clang+libbpf-dev+linux-tools-generic which need
+    # ~600 MB of /var/cache/apt headroom that the base /dev/sda1
+    # doesn't have. Set per-VM virtual size to 8 GiB so vagrant-libvirt
+    # grows the COW snapshot enough that the root partition can hold
+    # the build toolchain.
+    lv.machine_virtual_size = 8
+  end
+
+  config.vm.provision "shell",
+    path:       "provision.sh",
+    privileged: true,
+    keep_color: true
+end

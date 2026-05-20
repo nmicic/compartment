@@ -1,0 +1,18 @@
+# seq: seq5-symlink-chain
+# desc: chained symlink resolution — open-via-symlink to sealed target
+#       must follow the seal regardless of which alias is used.
+#
+# HIGH-8 (mesh Review-1) rewrite: the previous step 3 used op_symlink
+# which hardcoded "/nonexistent-mesh-target" AND unlinked the new
+# alias before returning. Step 4 then re-probed the ORIGINAL alias,
+# making it a duplicate of step 2 — the dynamic-alias seal-follow
+# property was NOT empirically witnessed for any alias created after
+# the daemon launched. Replaced with op_symlink_persistent which
+# points the new alias at $ME18_SEALED_TARGET (deterministic name
+# "$WORK/me21/sym-parent/persist-sym", not unlinked) so step 4 can
+# probe through it and witness the seal binding the resolved inode,
+# not the path.
+me21_step 1 a1 open-via-symlink "$ME18_ALIAS"     ALLOW expected-ALLOW-actor-via-original-alias
+me21_step 2 b1 open-via-symlink "$ME18_ALIAS"     DENY  expected-DENY-outsider-via-original-alias
+me21_step 3 a1 symlink-persistent "$WORK/me21/sym-parent|$ME18_SEALED_TARGET" ALLOW expected-ALLOW-actor-creates-new-alias-pointing-at-sealed-target
+me21_step 4 b1 open-via-symlink "$WORK/me21/sym-parent/persist-sym" DENY  expected-DENY-outsider-via-NEW-alias-seal-follows-resolved-inode

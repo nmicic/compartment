@@ -1,0 +1,6 @@
+The kernel BPF program (compartment.bpf.c and compartment-observe.bpf.c) is
+licensed under the GNU General Public License, version 2.
+
+SPDX-License-Identifier: GPL-2.0
+
+Full license text: https://spdx.org/licenses/GPL-2.0-only.html

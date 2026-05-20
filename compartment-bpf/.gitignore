@@ -1,0 +1,34 @@
+original/
+
+# Build artifacts at repo root only (anchored — must not match
+# directories named compartment-bpf elsewhere in the tree, e.g.
+# experimental/compartment-bpf/ which holds design-bundle sketches).
+/compartment-bpf
+/compartment.bpf.o
+/compartment.skel.h
+/vmlinux.h
+/vmlinux.h.tmp
+
+# Test instrument binaries / output (built by `make test-tools`, `make bench`)
+test/sealprobe
+tests/fuzz_oracle
+tests/matrix-results-*.csv
+tests/bypass-results-*.txt
+tests/fuzz-summary.json
+tests/fuzz-summary-*.json
+tests/bench-results-*.csv
+tests/stress-summary-*.txt
+tests/results/
+
+# Phase 2 mesh stub binaries (built by `make mesh-stubs` / `make check-mesh`).
+# Sources live under tests/mesh/stubs/ (tracked); compiled stubs are
+# host-/VM-specific and never committed.
+tests/mesh/build/
+
+# Mesh trial-record artifacts (per-run CSV + summary).
+tests/mesh-results-*.csv
+tests/mesh-results-*.txt
+
+# kvm/ recreate-trigger files (signed scripts and ubuntu-resolute.sh
+# itself stay tracked; recreate.txt is operator-side, never committed)
+kvm/*_recreate.txt

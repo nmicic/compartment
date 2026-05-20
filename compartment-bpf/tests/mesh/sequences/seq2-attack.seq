@@ -1,0 +1,6 @@
+# seq: seq2-attack
+# desc: outsider/actor create + unlink in sealed-no-write dir; documents
+#       v0 split-flag scope (no-write does NOT gate unlink-from-parent)
+me21_step 1 b1 creat-in-parent "$WORK/me16/nowrite/aa1" DENY  expected-DENY-outsider-create-in-sealed-dir
+me21_step 2 a1 creat-in-parent "$WORK/me16/nowrite/aa1" ALLOW expected-ALLOW-actor-create-in-sealed-dir
+me21_step 3 b1 unlink          "$ME19_LEGIT"            ALLOW intended-ALLOW-no-unlink-not-set-on-parent

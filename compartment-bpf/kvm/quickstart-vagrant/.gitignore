@@ -1,0 +1,5 @@
+# Captured OVMF NVRAM template — per-host artifact produced by
+# bootstrap-nvram.sh. See INVENTORY.md.
+resolute-nvram-template.fd
+# Vagrant state
+.vagrant/

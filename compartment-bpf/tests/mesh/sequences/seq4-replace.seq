@@ -1,0 +1,4 @@
+# seq: seq4-replace
+# desc: actor-binary replacement attempt; uniform-deny on self-seal even for actor
+me21_step 1 b1 unlink "$WORK/bin/mesh_actor_a1" DENY expected-DENY-outsider-unlinks-actor-binary
+me21_step 2 a1 unlink "$WORK/bin/mesh_actor_a1" DENY expected-DENY-actor-uniform-deny-on-own-binary

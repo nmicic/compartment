@@ -1,0 +1,5 @@
+# seq: seq3-link
+# desc: mkdir + link-dest into sealed dir; outsider DENY, actor ALLOW
+me21_step 1 b1 mkdir     "$WORK/me16/nowrite/aa2" DENY  expected-DENY-outsider-mkdir-in-sealed-dir
+me21_step 2 a2 mkdir     "$WORK/me16/nowrite/aa2" ALLOW expected-ALLOW-actor-mkdir-in-sealed-dir
+me21_step 3 b1 link-dest "$WORK/me16/nowrite/aa2" DENY  expected-DENY-outsider-link-into-sealed-dir
