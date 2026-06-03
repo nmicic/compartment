@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Nenad Mićić <nenad@micic.be>
-// compartment-bpf observe subcommand — AO-1 (CLI), AO-4 (path resolver),
-// AO-5 (profile draft transform).
+// compartment-bpf observe subcommand — CLI, path resolver,
+// profile draft transform.
 //
 // Entry point: observe_main(argc, argv) — called from compartment-bpf.c
 // when argv[1] == "observe".
 //
-// AO-6 (global compact mode) and AO-7 (deny-first bridge) are deferred.
-// DEFERRED: AO-6 — global compact mode (--global all-task with aggressive aggregation).
-// DEFERRED: AO-7 — deny-first bridge / handoff to compartment-bpf genprofile.
+// DEFERRED: global compact mode (--global all-task with aggressive aggregation).
+// DEFERRED: deny-first bridge / handoff to compartment-bpf genprofile.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,7 +128,7 @@ struct ao_observed_value {
 	uint8_t  under_current_actor;
 	uint8_t  under_actor_lineage;
 	uint8_t  _pad[2];
-	uint32_t _lock; /* matches struct bpf_spin_lock in BPF-side observed_value (M-9) */
+	uint32_t _lock; /* matches struct bpf_spin_lock in BPF-side observed_value */
 };
 
 struct ao_launcher_key {
@@ -479,7 +478,7 @@ static int validate_loader_compatible_actor_path(const char *name,
 	return 0;
 }
 
-/* ===== AO-4: path resolution ===== */
+/* ===== path resolution ===== */
 
 /* Sanitize a path returned by readlink(/proc/PID/fd/N) before it
  * flows into emit_profile() as a `seal %s ...` argument. The kernel does not
@@ -570,7 +569,7 @@ static int resolve_by_procfd(uint64_t dev, uint64_t ino, char *buf, size_t bufsz
 }
 
 /* Map dev number to mount point via /proc/mounts.
- * M-15: /proc/mounts is read once per resolve_path call. The map is stale if
+ * /proc/mounts is read once per resolve_path call. The map is stale if
  * a filesystem is mounted or unmounted after the call. This is acceptable for
  * short observation sessions; a production implementation would refresh
  * periodically or watch for mount events via inotify on /proc/mounts. */
@@ -588,7 +587,7 @@ static int dev_to_mountpoint(uint64_t dev, char *mp, size_t mpsz)
 			continue;
 		struct stat st;
 		if (stat(mountpoint, &st) == 0 && to_kernel_dev(st.st_dev) == dev) {
-			/* A5-P2-1: symmetric with the procfd branch — drop the
+			/* Symmetric with the procfd branch — drop the
 			 * mountpoint if it carries bytes that would split a seal
 			 * directive (whitespace, '#', '\n', '\r') so the synthetic
 			 * `<ino=N>` hint cannot tunnel a hostile mountpoint string
@@ -605,7 +604,7 @@ static int dev_to_mountpoint(uint64_t dev, char *mp, size_t mpsz)
 	return found ? 0 : -1;
 }
 
-/* AO-4: resolve (dev, ino) → path hint + parent hint (best-effort).
+/* Resolve (dev, ino) → path hint + parent hint (best-effort).
  * Failures keep dev/ino record; increment g_path_resolve_fail. */
 static void resolve_path(uint64_t dev, uint64_t ino,
 			 char *buf, size_t bufsz,
@@ -627,7 +626,7 @@ static void resolve_path(uint64_t dev, uint64_t ino,
 	}
 
 	/* Fallback: find mount point for this device.
-	 * M-14: count as fallback (partial resolution), not total failure. */
+	 * Count as fallback (partial resolution), not total failure. */
 	char mp[PATH_MAX] = "";
 	if (dev_to_mountpoint(dev, mp, sizeof(mp)) == 0) {
 		/* avoid double-slash when mountpoint is root "/" */
@@ -756,7 +755,7 @@ static int terminate_observe_child(pid_t pid)
 
 static int is_broad_root(const char *path)
 {
-	/* M-16: extended with Ubuntu-common paths where per-file enumeration
+	/* Extended with Ubuntu-common paths where per-file enumeration
 	 * is preferred over a broad directory-destination seal. */
 	static const char *broad[] = {
 		"/", "/usr", "/etc", "/var", "/var/lib", "/run", "/tmp",
@@ -767,7 +766,7 @@ static int is_broad_root(const char *path)
 	return 0;
 }
 
-/* ===== ABI version detection for dir-destination (AO-5 SPEC §9.1) ===== */
+/* ===== ABI version detection for dir-destination (SPEC §9.1) ===== */
 
 static int read_pinned_u32_map_cell(const char *path, uint32_t *out)
 {
@@ -909,7 +908,7 @@ static int handle_event(void *ctx, void *data, size_t sz)
 	return 0;
 }
 
-/* ===== AO-5: profile draft transform ===== */
+/* ===== profile draft transform ===== */
 
 /* dir_group: tracks files observed in one parent directory */
 struct dir_group {
@@ -934,7 +933,7 @@ static void emit_profile(FILE *out,
 	int recursive_dir_dest = (abi >= 0x0006);
 	const char *ts = iso_now();
 
-	/* Build actor names list for header (M-18) */
+	/* Build actor names list for header */
 	char actor_names[AO_MAX_ACTORS * 64 + 1];
 	actor_names[0] = '\0';
 	for (int ai = 0; ai < nactors; ai++) {
@@ -1022,7 +1021,7 @@ static void emit_profile(FILE *out,
 		}
 
 		/* Build directory groups for this actor.
-		 * M-13: heap-allocate dir array to avoid ~2MB stack (512 * PATH_MAX). */
+		 * Heap-allocate dir array to avoid ~2MB stack (512 * PATH_MAX). */
 		int max_dirs = 512;
 		struct dir_group *dirs = malloc((size_t)max_dirs * sizeof(*dirs));
 		if (!dirs) {
@@ -1035,7 +1034,7 @@ static void emit_profile(FILE *out,
 			struct obs_entry *e = &entries[ei];
 			if (e->key.actor_slot != a->slot) continue;
 
-			/* M-17: skip lineage-only observations from DD rule candidates.
+			/* Skip lineage-only observations from DD rule candidates.
 			 * Lineage helper opens should not be promoted to directory-
 			 * destination seals for the primary actor. */
 			if (e->val.under_actor_lineage && !e->val.under_current_actor)
@@ -1198,7 +1197,7 @@ static void emit_profile(FILE *out,
 				op_class_str(e->key.op_class),
 				e->key.dev, e->key.ino, e->val.count);
 		}
-		free(dirs);  /* M-13: heap-allocated above */
+		free(dirs);  /* heap-allocated above */
 	}
 	(void)obs_fd;  /* reserved for future unresolved-entry enrichment */
 }
@@ -1450,7 +1449,7 @@ int observe_main(int argc, char **argv)
 				opts.actors[ai].dev, opts.actors[ai].ino, slot);
 	}
 
-	/* M-12: freeze actor_targets after population; consistent with
+	/* Freeze actor_targets after population; consistent with
 	 * launcher_to_actor freeze pattern in enforcement loader. */
 	if (bpf_map_freeze(tgt_fd) < 0) {
 		fprintf(stderr, "observe: actor_targets freeze: %s\n", strerror(errno));
@@ -1557,7 +1556,7 @@ int observe_main(int argc, char **argv)
 		bpf_map_lookup_elem(cntrs_fd, &k, &obs_overflow);
 	}
 	if (opts.format == FMT_PROFILE) {
-		/* AO-4: iterate observed_files and resolve paths */
+		/* Iterate observed_files and resolve paths */
 		struct obs_entry *entries = calloc(AO_MAX_OBSERVED, sizeof(*entries));
 		if (!entries) {
 			fprintf(stderr, "observe: out of memory\n");

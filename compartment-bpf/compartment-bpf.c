@@ -22,14 +22,14 @@
 #include <sys/resource.h>
 #include <sys/utsname.h>
 #include <sys/vfs.h>
-#include <sys/file.h>  /* Sec-9/F14: flock(2) on pin lifecycle */
-#include <sys/time.h>  /* ED-11: clock_gettime() for unpin-auth ts_ns */
-#include <time.h>      /* ED-11: clock_gettime() POSIX declaration */
-#include <syslog.h>    /* ED-11: openlog/syslog for unpin-auth audit */
-#include <termios.h>   /* ED-11: interactive passphrase prompt (no echo) */
+#include <sys/file.h>  /* flock(2) on pin lifecycle */
+#include <sys/time.h>  /* clock_gettime() for unpin-auth ts_ns */
+#include <time.h>      /* clock_gettime() POSIX declaration */
+#include <syslog.h>    /* openlog/syslog for unpin-auth audit */
+#include <termios.h>   /* interactive passphrase prompt (no echo) */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
-#include <sodium.h>    /* ED-11: Argon2id passphrase hashing */
+#include <sodium.h>    /* Argon2id passphrase hashing */
 
 #ifndef BPF_FS_MAGIC
 #define BPF_FS_MAGIC 0xcafe4a11
@@ -37,31 +37,30 @@
 
 #include "compartment.skel.h"
 #include "compartment-abi.h"
-/* Review-1 HIGH-6 (2026-05-15): shared dangerous-env-name list between
+/* Shared dangerous-env-name list between
  * the loader and the static actor wrapper. Single source of truth so a
  * future drift cannot land silently. */
 #include "tools/compartment-dangerous-env.h"
 
 #define PIN_ROOT "/sys/fs/bpf/compartment"
 
-// ED-11: the unpin-auth Argon2id sentinel cannot live under PIN_ROOT
+// The unpin-auth Argon2id sentinel cannot live under PIN_ROOT
 // because bpffs (the filesystem PIN_ROOT lives on) does not permit
 // regular-file creation — only BPF object pins. We use a parallel
 // tmpfs directory under /run with the same boot-bound lifecycle (both
-// bpffs pins and /run tmpfs are recreated empty on every reboot). See
-// DEC-LDR7-C.md for the path-substitution rationale.
+// bpffs pins and /run tmpfs are recreated empty on every reboot).
 #define SENTINEL_DIR  "/run/compartment-bpf"
 #define SENTINEL_PATH SENTINEL_DIR "/unpin-sentinel"
 
 static volatile sig_atomic_t running = 1;
 static void on_sigint(int s) { (void)s; running = 0; }
 
-// Sec-13/F27: helper used in the --pin attach→pin window to abort
+// Helper used in the --pin attach→pin window to abort
 // early on a trappable signal (SIGINT / SIGTERM). The handler above
 // flips `running` to 0; this wrapper centralises the diagnostic so
 // every rollback site emits the same operator-facing line. SIGKILL is
 // fundamentally untrappable. With the pin lifecycle lock
-// (Sec-9) and the BPF link lifetime model, a SIGKILL'd loader still
+// and the BPF link lifetime model, a SIGKILL'd loader still
 // has its kernel link refs dropped synchronously by do_exit(), so
 // enforcement evaporates rather than persisting in a stuck state;
 // the lock auto-releases on the same path.
@@ -116,19 +115,18 @@ static void held_fds_release(struct held_fds *h)
 }
 
 /*
- * Exec-domain (actor allowlist) profile state — ED-1 + ED-2 per
- * experimental/EXEC-DOMAIN-SPEC.md §3, §9. ED-3 plumbs (dev, ino)
- * pairs into the BPF maps via struct seal_value; ED-4 enforces them
- * at hook time.
+ * Exec-domain (actor allowlist) profile state — parse + resolution per
+ * experimental/EXEC-DOMAIN-SPEC.md §3, §9. The loader plumbs (dev, ino)
+ * pairs into the BPF maps via struct seal_value; the BPF side enforces
+ * them at hook time.
  *
- * Caps (autonomous decisions, see tests/results/exec-domain-decisions/):
- *   DEC-ED1-A: actor NAME length ≤ 32 bytes incl. NUL.
- *   DEC-ED3-A: ≤ 4 paths per actor group; unified with the ABI cap
- *              COMPARTMENT_MAX_ACTORS_PER_SEAL (replaces DEC-ED1-B's
- *              earlier 8-path cap so the limit is surfaced at parse
- *              time, not at load time).
+ * Caps:
+ *   actor NAME length ≤ 32 bytes incl. NUL.
+ *   ≤ 4 paths per actor group; unified with the ABI cap
+ *   COMPARTMENT_MAX_ACTORS_PER_SEAL (replaces an earlier 8-path cap so
+ *   the limit is surfaced at parse time, not at load time).
  */
-// R2-M3 (Review-2 MEDIUM): unify ACTOR_NAME_MAX with the ABI's
+// Unify ACTOR_NAME_MAX with the ABI's
 // audit_event.actor_name[16] / seal_value.actor_name[16] slot. The
 // loader previously accepted names up to 31 chars at parse time but
 // the audit emit then truncated to 15 chars (sizeof(actor_name)-1)
@@ -139,13 +137,13 @@ static void held_fds_release(struct held_fds *h)
 // widening drives both sides together via _Static_assert below.
 #define ACTOR_NAME_MAX  16
 _Static_assert(ACTOR_NAME_MAX == sizeof(((struct audit_event*)0)->actor_name),
-	"ACTOR_NAME_MAX must match ABI audit_event.actor_name[] size (R2-M3)");
+	"ACTOR_NAME_MAX must match ABI audit_event.actor_name[] size");
 _Static_assert(ACTOR_NAME_MAX == sizeof(((struct seal_value*)0)->actor_name),
-	"ACTOR_NAME_MAX must match ABI seal_value.actor_name[] size (R2-M3)");
-// DEC-ED3-A: parser path cap unified with the BPF seal_value
+	"ACTOR_NAME_MAX must match ABI seal_value.actor_name[] size");
+// Parser path cap unified with the BPF seal_value
 // actor[] inline array cap (COMPARTMENT_MAX_ACTORS_PER_SEAL == 4).
-// The original ED-1 brief allowed 8 paths per group at parse time
-// (DEC-ED1-B). ED-3 lowers it to 4 so the parse-time error message
+// An earlier design allowed 8 paths per group at parse time;
+// this lowers it to 4 so the parse-time error message
 // surfaces the limit to profile authors instead of a load-time
 // failure. The two caps are now a single source of truth (compile-
 // asserted below to fail loud if either drifts).
@@ -153,7 +151,7 @@ _Static_assert(ACTOR_NAME_MAX == sizeof(((struct seal_value*)0)->actor_name),
 _Static_assert(ACTOR_MAX_PATHS == 4,
 	"parser actor cap must match ABI seal_value actor[] capacity");
 
-// F23 (Review-1): actor_binary was a userspace-local duplicate of the
+// actor_binary was a userspace-local duplicate of the
 // ABI's struct actor_id (both: __u64 dev; __u64 ino;). Collapsing onto
 // the single shared type removes the duplicate and keeps the loader's
 // resolved-state shape identical to the on-wire shape carried into
@@ -165,12 +163,12 @@ struct actor_group {
 	char *name;
 	size_t n_paths;
 	char **paths;            /* declared, before resolution */
-	struct actor_id *bin;    /* F23: resolved (dev, ino); n_paths long.
+	struct actor_id *bin;    /* resolved (dev, ino); n_paths long.
 	                          * Was struct actor_binary; collapsed onto
 	                          * the ABI's actor_id since they were
 	                          * byte-identical. May be NULL in
 	                          * parse-only mode. */
-	int sealed_in_profile;   /* DEC-ED2-B informational; set by seal_path() when a sealed path matches one of `bin`. */
+	int sealed_in_profile;   /* informational; set by seal_path() when a sealed path matches one of `bin`. */
 
 	/* v0.4: strict-launch-marker metadata. Populated only by
 	 * `actor-strict NAME = TARGET launcher=PATH`; zero-init for plain
@@ -190,8 +188,7 @@ struct actor_group {
 	 * bin[0] is the actor target. Env policy is sourced from the
 	 * wrapper (`tools/compartment-actor-wrapper.c` +
 	 * `compartment-actor-build.sh`); v0.4 does not carry env directives
-	 * on the actor_group (Review-1 HIGH-7 amend, 2026-05-15; path b in
-	 * the sidebar). See HOWTO.md §6.4 for the wrapper-as-single-source-
+	 * on the actor_group. See HOWTO.md §6.4 for the wrapper-as-single-source-
 	 * of-env-policy invariant.
 	 */
 	int is_strict;
@@ -202,7 +199,7 @@ struct actor_group {
 };
 
 /*
- * ED-5: in-memory shadow of every seal directive successfully applied
+ * In-memory shadow of every seal directive successfully applied
  * to a (dev, ino). Used by enforce_actor_binaries_sealed() after parse
  * + actor-resolution to verify every actor binary is also sealed with
  * the SEAL_FULL flag set. Tracks UNION-of-flags when the same path is
@@ -216,8 +213,8 @@ struct seal_entry {
 	__u64 dev;
 	__u64 ino;
 	__u32 flags;
-	int has_actor;   /* DEC-ED3-B: track for in-memory merge-refusal */
-	char *path;      /* Sec-2/F5: declared path string for strict-mode
+	int has_actor;   /* track for in-memory merge-refusal */
+	char *path;      /* declared path string for strict-mode
 	                  * path-equivalence check (hardlink at a different
 	                  * declared path must not satisfy E-6). strdup'd
 	                  * from the profile line; freed in
@@ -246,14 +243,14 @@ struct profile_state {
 	__u32 next_strict_slot;
 	/* v0.4: the policy_generation written into policy_state_map.
 	 * Currently fixed to 1 at load time; future reload paths bump it
-	 * to invalidate stale markers (SPEC §3 prop 5, G7).  */
+	 * to invalidate stale markers (SPEC §3 prop 5).  */
 	__u32 generation;
 };
 
 /* v0.4: SPEC §4 wrapper-alignment invariant — the dangerous env name
- * list is sourced from `tools/compartment-dangerous-env.h` (Review-1
- * HIGH-6 amend, 2026-05-15). After Review-1 HIGH-7 deleted the loader's
- * `env` directive parser, this symbol is retained solely as the
+ * list is sourced from `tools/compartment-dangerous-env.h`.
+ * After the loader's `env` directive parser was removed,
+ * this symbol is retained solely as the
  * wrapper-alignment witness: both the loader translation unit and the
  * wrapper translation unit must reference the same shared header so a
  * future drift cannot land silently. The grep gate in
@@ -276,7 +273,7 @@ static int actor_name_valid(const char *name)
 	n = strlen(name);
 	if (n + 1 > ACTOR_NAME_MAX)
 		return 0;
-	/* [a-zA-Z_][a-zA-Z0-9_-]* per SPEC §3 + ED-1 brief. */
+	/* [a-zA-Z_][a-zA-Z0-9_-]* per SPEC §3. */
 	if (!(isalpha((unsigned char)name[0]) || name[0] == '_'))
 		return 0;
 	for (size_t i = 1; i < n; i++) {
@@ -317,7 +314,7 @@ static void profile_state_release(struct profile_state *ps)
 	free(ps->actors);
 	ps->actors = NULL;
 	ps->n_actors = ps->cap_actors = 0;
-	// Sec-2/F5: release per-entry declared-path strings before freeing
+	// Release per-entry declared-path strings before freeing
 	// the backing array.
 	for (size_t i = 0; i < ps->n_seals; i++)
 		free(ps->seals[i].path);
@@ -345,10 +342,10 @@ static int path_list_contains_exact(const char *list, const char *path)
 }
 
 /*
- * ED-5: append (or OR-merge) a successful seal entry into ps->seals.
+ * Append (or OR-merge) a successful seal entry into ps->seals.
  * Matches seal_path's merge discipline: if (dev, ino) is already
  * tracked, OR the flag bits into the existing record. The caller is
- * responsible for refusing actor-merge collisions (DEC-ED3-B) before
+ * responsible for refusing actor-merge collisions before
  * invoking this — `has_actor` is recorded so subsequent checks can
  * see the binding without re-walking the actor table. Returns 0 on
  * success, -1 on OOM.
@@ -362,7 +359,7 @@ static int profile_state_record_seal(struct profile_state *ps,
 			ps->seals[i].flags |= flags;
 			if (has_actor)
 				ps->seals[i].has_actor = 1;
-			// Sec-2/F5: a hardlink seal at a different declared
+			// A hardlink seal at a different declared
 			// path arrives as a second record_seal call with the
 			// same (dev, ino) but a different path string. Keep
 			// BOTH paths discoverable: store as 'p1\0p2\0...' so
@@ -383,7 +380,7 @@ static int profile_state_record_seal(struct profile_state *ps,
 					       add_len + 1);
 					ps->seals[i].path = grown;
 				} else {
-					/* R2-M27 (Review-2 MEDIUM): emit an
+					/* Emit an
 					 * operator-visible warn on this OOM
 					 * path. Behaviour is still fail-closed
 					 * (strict-mode will not match the new
@@ -416,7 +413,7 @@ static int profile_state_record_seal(struct profile_state *ps,
 	return 0;
 }
 
-// Sec-2/F5: returns true iff `declared` is one of the newline-separated
+// Returns true iff `declared` is one of the newline-separated
 // declared paths recorded against this seal entry. The contract is path-
 // string equivalence, not realpath canonicalisation: the threat model is
 // "seal at a different declared path satisfies a different declared path",
@@ -458,8 +455,8 @@ static int profile_state_add_actor(struct profile_state *ps,
  *   - duplicate actor name in the same profile.
  *
  * On success, appends a new struct actor_group to `ps` and returns 0.
- * Path resolution (O_PATH+fstat) is NOT performed here; that is ED-2,
- * triggered later for each actor group.
+ * Path resolution (O_PATH+fstat) is NOT performed here; that happens
+ * later for each actor group.
  */
 static int parse_actor_decl(char *rest, int line_no, struct profile_state *ps)
 {
@@ -656,7 +653,7 @@ enomem:
 }
 
 /*
- * v0.4 (Review-1 HIGH-7 amend, path b, 2026-05-15): `env NAME=VALUE`
+ * v0.4: `env NAME=VALUE`
  * / `env NAME=*` directives have been removed from the v0.4 loader
  * grammar. Env policy is the wrapper's responsibility
  * (`tools/compartment-actor-wrapper.c` +
@@ -671,7 +668,7 @@ enomem:
  * The function below now emits a clear loader rejection pointing the
  * operator at HOWTO.md, so legacy profiles surface the change at
  * load time rather than failing silently. The `STRICT_DANGEROUS_ENV_NAMES`
- * table is retained as the wrapper-alignment invariant (HIGH-6 shared
+ * table is retained as the wrapper-alignment invariant (shared
  * header); only the directive parser + per-actor env storage are gone.
  */
 static int parse_env_decl(char *rest, int line_no, struct profile_state *ps)
@@ -688,7 +685,7 @@ static int parse_env_decl(char *rest, int line_no, struct profile_state *ps)
 }
 
 /*
- * HIGH-1 (Review-1 mesh): fail-closed gate against anon_bdev superblocks.
+ * Fail-closed gate against anon_bdev superblocks.
  *
  * btrfs, overlayfs, and FUSE assign an anonymous block device to each
  * mount (s_dev != backing block device). The BPF LSM hook reads
@@ -798,7 +795,7 @@ static int anon_bdev_refuse(int pfd, const char *path, const char *ctx)
 }
 
 /*
- * ED-2: resolve every path declared for `ag` to (dev, ino) via the same
+ * Resolve every path declared for `ag` to (dev, ino) via the same
  * two-phase O_PATH+fstat primitive seal_path uses, with the additional
  * security checks SPEC §4 E-7 mandates:
  *   - O_NOFOLLOW + S_ISLNK check (symlink leaf rejected).
@@ -809,7 +806,7 @@ static int anon_bdev_refuse(int pfd, const char *path, const char *ctx)
  *   - 0-byte file rejected (a freshly-truncated actor binary cannot be
  *     the actor; refuse rather than locking in a placeholder).
  *
- * Sec-1 / F4 (Review-1): the O_PATH fd is retained in `held` for the
+ * The O_PATH fd is retained in `held` for the
  * same lifetime as seal-target fds (released only after
  * compartment_bpf__attach() returns). This closes the resolve→seal
  * TOCTOU window that the original close-after-fstat path opened: an
@@ -820,7 +817,7 @@ static int anon_bdev_refuse(int pfd, const char *path, const char *ctx)
  * forces the kernel to keep the same inode struct alive across the
  * window. `held` may be NULL in parse-only mode (no fds retained).
  */
-// F16: partial-resolve diagnostic semantics. On ANY failure the function
+// Partial-resolve diagnostic semantics. On ANY failure the function
 // returns -1 with `ag->bin` reset to NULL — never partly-filled. This
 // matters because the caller eats the error and continues parsing the
 // rest of the profile; downstream consumers (enforce_actor_binaries_
@@ -863,7 +860,7 @@ static int actor_resolve_paths(struct actor_group *ag, struct held_fds *held)
 			close(pfd);
 			goto fail_partial;
 		}
-		/* HIGH-1: bi-directional anon_bdev refuse — actor binaries on
+		/* Bi-directional anon_bdev refuse — actor binaries on
 		 * btrfs/overlay/FUSE would silently DENY at runtime (BPF reads
 		 * real s_dev; userspace resolves anon_bdev → caller-id miss).
 		 */
@@ -892,7 +889,7 @@ static int actor_resolve_paths(struct actor_group *ag, struct held_fds *held)
 			close(pfd);
 			goto fail_partial;
 		}
-		// F17 (Review-1): extend to S_IWGRP too. The original check
+		// Extend to S_IWGRP too. The original check
 		// only rejected world-writable binaries, but a group-writable
 		// binary is equally bypass-prone if the group includes any
 		// unprivileged user (and on Ubuntu the `adm` group routinely
@@ -912,15 +909,15 @@ static int actor_resolve_paths(struct actor_group *ag, struct held_fds *held)
 			close(pfd);
 			goto fail_partial;
 		}
-		// Sec-10/F18: also reject when the leaf parent directory is
+		// Also reject when the leaf parent directory is
 		// world- or group-writable. A vendor /opt/<vendor>/bin with
 		// unprivileged-user-owned parent lets an attacker swap the
 		// binary file (unlink + recreate at the same name) before
 		// loader resolution — the on-disk binary mode does not
 		// protect against that. The check happens at resolve time
 		// while the O_PATH fd above pins the inode; combined with
-		// Sec-1's resolve→seal pin, the parent-writable window is
-		// closed. DEC-ED2-A backfill.
+		// the resolve→seal pin, the parent-writable window is
+		// closed.
 		{
 			char dbuf[PATH_MAX];
 			size_t n = strlen(path);
@@ -991,7 +988,7 @@ static int actor_resolve_paths(struct actor_group *ag, struct held_fds *held)
 			close(pfd);
 			goto fail_partial;
 		}
-		// F22 (Review-1): actor binary must be executable. A non-
+		// Actor binary must be executable. A non-
 		// executable file at the declared path means the operator
 		// pointed the profile at the wrong file, OR (worse) the
 		// binary is a stub waiting to be replaced. Either way the
@@ -1028,7 +1025,7 @@ static int actor_resolve_paths(struct actor_group *ag, struct held_fds *held)
 		}
 		ag->bin[i].dev = dev;
 		ag->bin[i].ino = (__u64)st.st_ino;
-		// Sec-1 / F4: retain the O_PATH fd in `held` so the inode
+		// Retain the O_PATH fd in `held` so the inode
 		// reference outlives attach. parse-only callers pass NULL
 		// (no fds to hold across an attach that won't happen).
 		if (held) {
@@ -1043,7 +1040,7 @@ static int actor_resolve_paths(struct actor_group *ag, struct held_fds *held)
 	return 0;
 
 fail_partial:
-	// F16: never leave ag->bin partly filled. Downstream consumers
+	// Never leave ag->bin partly filled. Downstream consumers
 	// special-case bin == NULL as "unresolved, skip"; a half-filled
 	// array would let them apply strict-mode against garbage entries
 	// or emit confusing partial output.
@@ -1053,7 +1050,7 @@ fail_partial:
 }
 
 /*
- * DEC-ED2-C: a (dev, ino) collision across actor groups is allowed
+ * A (dev, ino) collision across actor groups is allowed
  * (per-binary actor group membership is intentional; postgres-style
  * shared binary). Log once per collision pair.
  */
@@ -1198,7 +1195,7 @@ static int strict_validate_launchers(struct profile_state *ps,
 		ag->launcher_dev = ldev;
 		ag->launcher_ino = lino;
 
-		/* A2-P2-2: launcher must not be the actor's target binary.
+		/* Launcher must not be the actor's target binary.
 		 * If they share (dev,ino), the strict-launch gate is hollow:
 		 * the "launcher" execve and the "actor" exec are the same
 		 * file, so any execve of that binary is its own launcher and
@@ -1219,13 +1216,13 @@ static int strict_validate_launchers(struct profile_state *ps,
 		/* Cross-check: launcher path is sealed `full` in this profile.
 		 * Cross-check: target path is sealed `full` in this profile.
 		 *
-		 * Q-3 (V-6 re-run #5 follow-up): the launcher match is by
+		 * The launcher match is by
 		 * (dev,ino) only — the loader resolved `ag->launcher_path`
 		 * above via O_NOFOLLOW open + fstat, so the (dev,ino) pair
 		 * names exactly the launcher inode the strict-launch hook
 		 * will see at runtime. The target match (below, and in
 		 * enforce_actor_binaries_sealed) uses seal_entry_matches_declared
-		 * (path + flags) to defend the Sec-2/F5 hardlink-equivalent
+		 * (path + flags) to defend the hardlink-equivalent
 		 * class. The asymmetry is intentional: the launcher's
 		 * (dev,ino) is the pre-validated resolution of the declared
 		 * launcher_path, while the target-side path-equivalence check
@@ -1255,14 +1252,14 @@ static int strict_validate_launchers(struct profile_state *ps,
 			errs++;
 			continue;
 		}
-		/* V-6 re-run #4 P1-B: defense-in-depth — the launcher seal
+		/* Defense-in-depth — the launcher seal
 		 * must NOT carry `actor=`. If it does, the actor would land in
 		 * its own launcher's seal allowlist and could overwrite the
 		 * launcher bytes in place (preserving (dev,ino)). The
 		 * enforce_actor_binaries_sealed() pass also rejects this for
 		 * unification with the target-binary check, but we guard here
 		 * too so a future caller reordering does not bypass it.
-		 * (Symmetric to V-6 re-run #3 P1-C; SPEC §7.1 E-6.) */
+		 * (Symmetric to the target-binary self-modification guard; SPEC §7.1 E-6.) */
 		if (lmatch->has_actor) {
 			fprintf(stderr,
 				"actor-strict '%s' launcher '%s' seal must not carry actor= "
@@ -1385,9 +1382,9 @@ static int strict_populate_maps(struct compartment_bpf *skel,
  * be NULL for callers that do not support actor= syntax (none today,
  * but cheap to keep optional).
  *
- * DEC-ED1-C: a seal with `actor=NAME` MUST also carry ≥1 flag — combining
+ * A seal with `actor=NAME` MUST also carry ≥1 flag — combining
  * actor= with no flags is rejected as a profile-author error.
- * DEC-ED1-D: `seal /p full actor=NAME` is allowed (and recommended) —
+ * `seal /p full actor=NAME` is allowed (and recommended) —
  * `full` is a valid flag.
  */
 static int parse_flagspec(char *s, __u32 *flags_out, char *actor_name_out,
@@ -1469,13 +1466,12 @@ static int parse_flagspec(char *s, __u32 *flags_out, char *actor_name_out,
 		saw_flag_token = 1;
 	}
 
-	/* F2: DEC-ED1-C must fire BEFORE the generic empty-flags check so
+	/* This must fire BEFORE the generic empty-flags check so
 	 * that `seal /etc/a actor=a` reports "must specify at least one
 	 * flag before actor= clause" (the actionable diagnostic) rather
 	 * than "empty seal flags" (the misleading generic one). The two
 	 * checks are mutually exclusive on a well-formed line; ordering
-	 * matters only on the malformed-with-actor= case which Review-1
-	 * caught. */
+	 * matters only on the malformed-with-actor= case. */
 	if (saw_actor_eq && !saw_flag_token) {
 		fprintf(stderr,
 			"%d: seal directive must specify at least one flag before actor= clause\n",
@@ -1486,7 +1482,7 @@ static int parse_flagspec(char *s, __u32 *flags_out, char *actor_name_out,
 		fprintf(stderr, "%d: empty seal flags\n", line_no);
 		return -1;
 	}
-	/* Review-1 HIGH-9 (2026-05-15): `strict-launch` is a modifier on top
+	/* `strict-launch` is a modifier on top
 	 * of an op-flag — a seal that carries SEAL_STRICT_LAUNCH but no
 	 * other op-flag enforces nothing, so the new strict-launch
 	 * counters fire zero on every protected op. False-green class:
@@ -1545,7 +1541,7 @@ static const char *fmt_flags(__u32 flags, char *buf, size_t bufsz)
 		return buf;
 	}
 
-// M-1: clamp n after each snprintf so bufsz-n cannot underflow in size_t.
+// Clamp n after each snprintf so bufsz-n cannot underflow in size_t.
 #define ADD(name, bit) do { \
 	if ((flags) & (bit) && n >= 0 && (size_t)n < bufsz) { \
 		int r = snprintf(buf + n, bufsz - n, "%s" name, sep); \
@@ -1564,12 +1560,12 @@ static const char *fmt_flags(__u32 flags, char *buf, size_t bufsz)
 	return buf;
 }
 
-// ED-5: strict-mode enforcement. After all seal directives have been
+// Strict-mode enforcement. After all seal directives have been
 // applied and all actor groups resolved, every actor binary MUST itself
 // be sealed with the full SEAL_NO_WRITE | SEAL_NO_UNLINK | SEAL_NO_RENAME
 // | SEAL_NO_CHMOD set; otherwise the exec-domain property is trivially
 // bypassed by overwriting the actor binary out-of-band. This is a
-// mandatory v0.x default per SPEC §7.1 E-6 and DEC-ED5-C — no opt-out
+// mandatory v0.x default per SPEC §7.1 E-6 — no opt-out
 // flag.
 //
 // Returns 0 on success (every actor binary is fully sealed, or there
@@ -1585,13 +1581,13 @@ static int enforce_actor_binaries_sealed(const struct profile_state *ps)
 	const __u32 required = SEAL_NO_WRITE | SEAL_NO_UNLINK
 	                     | SEAL_NO_RENAME | SEAL_NO_CHMOD;
 
-	// R2-M8 (Review-2 MEDIUM): ground the strict-mode result in the
+	// Ground the strict-mode result in the
 	// actual actor count. A profile with n_actors == 0 (no actors
 	// declared) trivially "passes" strict-mode — but the silent
 	// pass is indistinguishable from "all N actors checked and
 	// sealed". Annotate up front so the operator sees the set size.
 	fprintf(stderr,
-		"[strict-mode] checking actor-binary seals: n_actors=%zu (R2-M8)\n",
+		"[strict-mode] checking actor-binary seals: n_actors=%zu\n",
 		ps->n_actors);
 
 	for (size_t g = 0; g < ps->n_actors; g++) {
@@ -1602,13 +1598,13 @@ static int enforce_actor_binaries_sealed(const struct profile_state *ps)
 			__u64 a_dev = ag->bin[b].dev;
 			__u64 a_ino = ag->bin[b].ino;
 			const char *bpath = ag->paths[b];
-			// Sec-2/F5: require path-equivalence on top of
+			// Require path-equivalence on top of
 			// (dev, ino) — a hardlink seal at an unrelated
 			// declared path must NOT satisfy E-6 for this actor.
 			// The match is: a seal entry whose (dev, ino) matches
 			// AND whose declared-path list contains this actor's
 			// declared path. Anything weaker permits the hardlink
-			// bypass that Review-1 Sec-2 caught.
+			// bypass.
 			const struct seal_entry *match = NULL;
 			for (size_t s = 0; s < ps->n_seals; s++) {
 				if (ps->seals[s].dev == a_dev &&
@@ -1640,7 +1636,7 @@ static int enforce_actor_binaries_sealed(const struct profile_state *ps)
 					fmt_flags(missing, buf, sizeof buf));
 				return -1;
 			}
-			// V-6 rerun3 P1-C: the actor-binary seal must NOT carry
+			// The actor-binary seal must NOT carry
 			// `actor=` itself. If it does, the actor process would
 			// appear in its own seal allowlist and `actor_check_or_deny`
 			// would return ALLOW for writes/renames/etc to its own
@@ -1657,7 +1653,7 @@ static int enforce_actor_binaries_sealed(const struct profile_state *ps)
 		}
 	}
 
-	// V-6 re-run #4 P1-B: for strict actors, the launcher seal must
+	// For strict actors, the launcher seal must
 	// not carry `actor=` (symmetric to the target-binary check above).
 	// `enforce_actor_binaries_sealed` runs BEFORE `strict_validate_launchers`,
 	// so `ag->launcher_dev`/`launcher_ino` are still calloc-zero here —
@@ -1689,7 +1685,7 @@ static int enforce_actor_binaries_sealed(const struct profile_state *ps)
 	}
 
 	fprintf(stderr,
-		"[strict-mode] OK: %zu actor%s sealed at declared paths (R2-M8)\n",
+		"[strict-mode] OK: %zu actor%s sealed at declared paths\n",
 		ps->n_actors, ps->n_actors == 1 ? "" : "s");
 	return 0;
 }
@@ -1838,7 +1834,7 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 		return -1;
 	}
 
-	// R2-M6 (Review-2 MEDIUM, R1-F16 regression closure): refuse a
+	// Refuse a
 	// seal that references an actor group whose ->bin is NULL. This
 	// happens when actor-binary path resolution failed silently
 	// upstream (the actor_group exists but its (dev, ino) array is
@@ -1869,7 +1865,7 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 		return -1;
 	}
 
-	/* HIGH-1: anon_bdev refuse — btrfs/overlay/FUSE seals are silent
+	/* anon_bdev refuse — btrfs/overlay/FUSE seals are silent
 	 * fail-open in v0 because the BPF hook reads inode->i_sb->s_dev
 	 * (real subvolume / lower s_dev) while userspace fstat() returns
 	 * the anon_bdev. Refuse at load time; v1 will fix BPF-side.
@@ -1936,11 +1932,10 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 	}
 
 	if (!skel) {
-		// ED-3 DEC-ED3-B applied in dry-run too: real-load enforces
+		// Merge-refusal applied in dry-run too: real-load enforces
 		// merge-refusal via the BPF map readback below, but dry-run
 		// never touches the map. Mirror the check at the in-memory
-		// shadow level so the rejection fires in both modes (closes
-		// the deferred-from-Leader-2 testability gap).
+		// shadow level so the rejection fires in both modes.
 		if (ps) {
 			int prior_has_actor = 0;
 			int prior_exists = 0;
@@ -1972,7 +1967,7 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 			fmt_flags(flags, fb, sizeof(fb)),
 			actor_ref ? actor_ref->name : "(none)");
 		close(pfd);
-		// ED-5: record the (dev, ino, flags) so strict-mode
+		// Record the (dev, ino, flags) so strict-mode
 		// enforcement sees the resolved profile in dry-run mode too.
 		if (ps && profile_state_record_seal(ps, dev,
 						    (__u64)st.st_ino, flags,
@@ -1997,7 +1992,7 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 
 	// Build the v0.1 seal_value the kernel will read. actor_count == 0
 	// preserves v0 uniform-deny semantics for seals without actor=NAME.
-	// ED-3 cap (DEC-ED3-A): the parser already rejected actor groups
+	// Actor cap: the parser already rejected actor groups
 	// with > COMPARTMENT_MAX_ACTORS_PER_SEAL paths; the assert below is
 	// the last line of defense against drift.
 	struct seal_value sv = { 0 };
@@ -2030,7 +2025,7 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 	if (actor_ref && actor_ref->bin) {
 		if (actor_ref->n_paths > COMPARTMENT_MAX_ACTORS_PER_SEAL) {
 			// Parser should have caught this; refuse the load
-			// rather than silently truncate (ED-3 fail-closed).
+			// rather than silently truncate (fail-closed).
 			fprintf(stderr,
 				"seal %s: actor %s has %zu paths but seal_value cap is %d\n",
 				path, actor_ref->name,
@@ -2044,7 +2039,7 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 			sv.actor[i].dev = actor_ref->bin[i].dev;
 			sv.actor[i].ino = actor_ref->bin[i].ino;
 		}
-		// v0.3 (Sec-12): copy actor-group name into seal_value so
+		// v0.3: copy actor-group name into seal_value so
 		// the BPF program can carry it into the audit_event on the
 		// actor-mismatch path WITHOUT a userspace lookup table. The
 		// ABI slot is 16 bytes; we truncate to 15 + NUL. Names are
@@ -2063,15 +2058,15 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 	// Merge with any existing entry under the same (dev, ino). A profile
 	// is allowed to name the same path twice with different flags --
 	// `seal /tmp/x no-write` then `seal /tmp/x no-unlink` should leave
-	// BOTH bits set. Pre-ED-3 this site used BPF_ANY with new flags,
+	// BOTH bits set. An earlier version used BPF_ANY with new flags,
 	// silently dropping prior bits. The OR merge below preserves the
 	// legacy behavior when neither side carries an actor=.
 	//
-	// ED-3 fail-closed: if either side has actor_count > 0 (an actor=
+	// Fail-closed: if either side has actor_count > 0 (an actor=
 	// allowlist), refuse to merge. Combining two seal lines that carry
 	// different actor sets is ambiguous (intersection? union? per-flag
 	// actor binding?); the safest answer is to refuse and tell the
-	// author to collapse the two lines into one. See DEC-ED3-B.
+	// author to collapse the two lines into one.
 	struct seal_value prev = { 0 };
 	int have_prev = 0;
 	if (bpf_map_lookup_elem(mfd, &k, &prev) == 0) {
@@ -2102,7 +2097,7 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 		return -1;
 	}
 
-	// ED-5: record the merged flags into ps->seals so the post-resolve
+	// Record the merged flags into ps->seals so the post-resolve
 	// strict-mode pass sees the same flag set the kernel just wrote.
 	if (ps && profile_state_record_seal(ps, dev, (__u64)st.st_ino,
 					    sv.flags,
@@ -2146,22 +2141,22 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 // path).
 //
 // `allow_empty` lets a profile with zero seal directives load anyway.
-// Default behavior is fail-closed (Codex finding 2): an empty or
+// Default behavior is fail-closed: an empty or
 // comment-only profile would otherwise attach with no rules, leaving
 // the daemon enforcing nothing -- a fail-OPEN posture indistinguishable
 // from "policy not loaded yet". Soak runs that intentionally want a
 // no-op load pass --allow-empty.
 //
-// Actor-allowlist (ED-1 + ED-2):
+// Actor-allowlist:
 //   - `actor NAME = PATH [PATH ...]` declares a named actor group;
 //     declarations are local to a profile, MUST precede any seal that
 //     references them (forward references rejected with "unknown actor").
 //   - `seal <path> <flags> actor=NAME` binds a seal to that actor group.
-//     At hook time (ED-4) the seal will deny unless the calling task's
+//     At hook time the seal will deny unless the calling task's
 //     exe inode matches one of the group's resolved binaries.
-//   - In ED-1 + ED-2 the actor pointer is recorded but NOT propagated
-//     into BPF maps; that's ED-3.
-/* P1-C (v6-rerun1): `pin_enforce_path` is 1 when load_conf is called from
+//   - During parse the actor pointer is recorded but NOT propagated
+//     into BPF maps; that happens at map-population time.
+/* `pin_enforce_path` is 1 when load_conf is called from
  * the `--pin` enforcement-enabling code path; 0 for --dry-run / --parse-only.
  * `allow_candidate` is 1 when the operator passed `--allow-candidate` to
  * acknowledge they want to load a candidate-marked profile under --pin.
@@ -2183,7 +2178,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 	int errs = 0;
 	int sealed = 0;
 	int line_no = 0;
-	/* V-6 P0-2: detect the candidate-profile marker BEFORE the
+	/* Detect the candidate-profile marker BEFORE the
 	 * `#`-strip line below collapses it to an empty comment. A
 	 * `compartment-bpf observe`-generated profile must surface a
 	 * loud stderr warning so an operator cannot promote a candidate
@@ -2192,7 +2187,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 	static const char candidate_marker[] =
 		"#@compartment-bpf-profile-status:";
 	for (;;) {
-		// F21 (Review-1): pre-zero the buffer so we can detect an
+		// Pre-zero the buffer so we can detect an
 		// embedded NUL that fgets() would have written into the
 		// middle of the line (silent truncation at strlen()). The
 		// caller would otherwise parse only line[0..strlen(line))
@@ -2210,7 +2205,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 
 		line_no++;
 		len = strlen(line);
-		// F21: if the buffer holds non-zero bytes BEYOND the first
+		// If the buffer holds non-zero bytes BEYOND the first
 		// strlen-terminating NUL (i.e. the byte at index `len + 1`
 		// or any byte after, up to where fgets stopped), the input
 		// contained an embedded NUL. Reject hard with a clear
@@ -2232,7 +2227,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 				continue;
 			}
 		}
-		// Sec-8/F13: an un-newline-terminated read from fgets()
+		// An un-newline-terminated read from fgets()
 		// means the input line is at least sizeof(line)-1 bytes
 		// wide and was truncated. Refuse hard with an explicit
 		// diagnostic naming the buffer size — auto-growing would
@@ -2248,7 +2243,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 				"shorten paths; Sec-8/F13)\n",
 				line_no, sizeof(line) - 1);
 			errs++;
-			// M-7: also check ferror during the flush drain so an
+			// Also check ferror during the flush drain so an
 			// I/O error mid-drain is reported with the correct
 			// line_no instead of being silently absorbed.
 			while (fgets(line, sizeof(line), f)) {
@@ -2265,10 +2260,10 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 			continue;
 		}
 
-		/* V-6 P0-2: scan for the candidate-profile marker before
+		/* Scan for the candidate-profile marker before
 		 * stripping `#`-comments. Tolerates leading whitespace
 		 * and any whitespace between the colon and the value.
-		 * Q-2: use isspace() in skip loops so the accepted set
+		 * Use isspace() in skip loops so the accepted set
 		 * matches trim() (catches '\v'/'\f' too) — an attacker
 		 * cannot smuggle the marker past detection by prefixing
 		 * '\v'. Tail set stays narrow intentionally: it is not a
@@ -2315,7 +2310,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 				errs++;
 				continue;
 			}
-			// ED-2: resolve declared paths now, unless we're in
+			// Resolve declared paths now, unless we're in
 			// parse-only mode (parser-fixture tests).
 			if (!parse_only) {
 				struct actor_group *ag =
@@ -2424,11 +2419,11 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 			errs++;
 		} else {
 			sealed++;
-			// DEC-ED2-B: an actor binary that is also a seal
+			// An actor binary that is also a seal
 			// target in the same profile is the recommended
-			// secure state (SPEC §4 E-6). F29 (Review-1): the
-			// "TODO(exec-domain ED-5): emit informational note"
-			// that previously stood here is superseded by ED-5's
+			// secure state (SPEC §4 E-6). The
+			// informational-note TODO that previously stood here
+			// is superseded by the
 			// enforce_actor_binaries_sealed() pass, which makes
 			// "actor binary not sealed" a hard load error rather
 			// than something to log informationally. No follow-up
@@ -2446,7 +2441,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 		errs++;
 	}
 
-	/* V-6 P0-2: candidate-profile warning. The observe(1) draft is
+	/* Candidate-profile warning. The observe(1) draft is
 	 * not intended for direct production enforcement; surfacing this
 	 * on stderr makes that explicit in dry-run, parse-only, and
 	 * real-load paths alike. */
@@ -2457,7 +2452,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 			"draft and is not intended for direct production enforcement; "
 			"review and edit before loading as policy.\n",
 			path);
-		/* V-6 re-run #1 P1-C: warn-only is trivially silenced by
+		/* Warn-only is trivially silenced by
 		 * `2>/dev/null`. On the --pin enforcement-enabling path,
 		 * fail closed unless the operator explicitly opted in with
 		 * --allow-candidate. dry-run / parse-only remain warn-only:
@@ -2475,21 +2470,21 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 		}
 	}
 
-	// DEC-ED2-C: report inode collisions informationally.
+	// Report inode collisions informationally.
 	if (!parse_only && errs == 0)
 		actor_log_inode_collisions(&ps);
 
-	// ED-5: strict-mode actor-binary-sealed enforcement. Runs only when
-	// actors have been resolved (i.e. not parse-only). R2-M7
-	// (Review-2 MEDIUM): un-gated from `errs == 0` so the strict
+	// Strict-mode actor-binary-sealed enforcement. Runs only when
+	// actors have been resolved (i.e. not parse-only).
+	// Un-gated from `errs == 0` so the strict
 	// check fires even when the parser has already accumulated some
-	// errors. Pre-this, a single parse error would silently skip the
+	// errors. Otherwise a single parse error would silently skip the
 	// strict-mode check; the operator saw 'load failed' but had no
 	// way to know whether the strict check would have rejected the
 	// actor binaries too. Strict check counts +=1 on its own
 	// failures, so the existing `errs > 0 → return -1` exit path
-	// captures both error sources uniformly. R2-M8 (Review-2
-	// MEDIUM): the inner enforce_actor_binaries_sealed prints a
+	// captures both error sources uniformly.
+	// The inner enforce_actor_binaries_sealed prints a
 	// `[strict-mode] n_actors=N result=...` line so the failure /
 	// success is grounded in the actual set size.
 	if (!parse_only) {
@@ -2534,7 +2529,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 	if (errs)
 		return -1;
 
-	// Codex finding 2: a profile that resolves zero seals is a fail-open
+	// A profile that resolves zero seals is a fail-open
 	// no-op load. Refuse unless the operator opted in via --allow-empty.
 	if (sealed == 0 && !allow_empty) {
 		fprintf(stderr,
@@ -2555,7 +2550,7 @@ static int audit_handler(void *ctx, void *data, size_t sz)
 	}
 
 	struct audit_event *e = data;
-	// v0.3 (Sec-6): the ABI version word at offset 0 lets the consumer
+	// v0.3: the ABI version word at offset 0 lets the consumer
 	// detect a producer/consumer mismatch instead of silently parsing a
 	// foreign layout. Reject loud and skip the event. This is the
 	// fail-closed path: if the kernel and userspace disagree on
@@ -2572,7 +2567,7 @@ static int audit_handler(void *ctx, void *data, size_t sz)
 	}
 	// %.16s caps comm width to its struct size in case a future ABI bump
 	// reuses this consumer with a different producer layout.
-	// M-9: comm is user-settable via prctl(PR_SET_NAME) so it could
+	// comm is user-settable via prctl(PR_SET_NAME) so it could
 	// contain ANSI-escape control bytes that would inject into operator
 	// stderr. Sanitize to printable ASCII before logging.
 	char safe_comm[sizeof(e->comm) + 1];
@@ -2585,7 +2580,7 @@ static int audit_handler(void *ctx, void *data, size_t sz)
 		safe_comm[i] = (c >= 0x20 && c <= 0x7e) ? (char)c : '?';
 	}
 	safe_comm[sizeof(e->comm)] = 0;
-	// v0.3 (Sec-12): actor_name carries the actor-group name on the
+	// v0.3: actor_name carries the actor-group name on the
 	// actor-mismatch path; for every other event type the slot is
 	// zeroed by the producer. Sanitize the same way as comm because
 	// although the loader validates name bytes today, a future ABI
@@ -2700,7 +2695,7 @@ static int probe_lsm_environment(void)
 {
 	struct utsname uts;
 	FILE *f;
-	// M-3: 4 KiB tolerates pathological stacked-LSM configurations that
+	// 4 KiB tolerates pathological stacked-LSM configurations that
 	// would have truncated the 512-byte buffer (and falsely reported
 	// 'bpf' missing).
 	char lsm[4096];
@@ -2853,7 +2848,7 @@ static void unlink_pinned_links(char pinned[][PATH_MAX], int pinned_count)
 	}
 }
 
-// Sec-9/F14: --pin and --unpin must not race each other or two
+// --pin and --unpin must not race each other or two
 // concurrent --pin invocations against the same PIN_ROOT. A naïve race
 // can unlink-then-recreate, or split a half-pinned state across the two
 // processes. Use a process-wide flock on a lockfile under /run; the
@@ -2879,7 +2874,7 @@ static int pin_lifecycle_lock(const char *who)
 		return -1;
 	}
 	if (fd < 0) {
-		// R2-M21 (Review-2 MEDIUM): O_NOFOLLOW on the fallback path
+		// O_NOFOLLOW on the fallback path
 		// /tmp/.compartment-bpf-pin.lock too. /tmp is world-writable;
 		// an attacker can pre-create a symlink at that path pointing
 		// at any file root can write to and trick us into opening it.
@@ -2923,7 +2918,7 @@ static void pin_lifecycle_unlock(int fd)
 
 static int pin_links(struct compartment_bpf *skel)
 {
-	// M-10: pin_one_link writes into pinned[*pinned_count] without an
+	// pin_one_link writes into pinned[*pinned_count] without an
 	// explicit bound. We currently make 16 PIN_LINK invocations and have
 	// 32 slots. The assert hard-codes the current count (16) because
 	// KNOWN_LINK_NAMES is declared later in the file; if the PIN_LINK
@@ -2976,7 +2971,7 @@ err:
 	return -1;
 }
 
-// V-4: known pin shapes for --unpin enumeration. Must stay in lockstep
+// Known pin shapes for --unpin enumeration. Must stay in lockstep
 // with pin_links() above. The unpin path is name-based so that an unknown
 // filename under PIN_ROOT/links (e.g. a stray pin from a hand-edited
 // experiment) is refused and left intact rather than blindly removed.
@@ -3042,7 +3037,7 @@ static int pin_tree_exists(void)
 	return 0;
 }
 
-// PIN_ROOT/maps is populated by V-4b for the two deny/audit-drop counter
+// PIN_ROOT/maps is populated for the two deny/audit-drop counter
 // maps when --pin is set with a profile. The seal maps (sealed_inodes,
 // sealed_dirs) and audit_rb are still NOT pinned in v0 but their names
 // are listed for forward-compatibility with future map-pinning revisions;
@@ -3053,7 +3048,7 @@ static int pin_tree_exists(void)
 	"audit_rb",
 	"deny_total",
 	"audit_drop_total",
-	"actor_mismatch_total",   // ED-7
+	"actor_mismatch_total",
 	/* v0.4: strict-launch-marker maps + counters */
 	"launcher_to_actor",
 	"actor_marker_map",
@@ -3081,12 +3076,11 @@ static int name_in(const char *name, const char *const *table, size_t n)
 }
 
 // Unlink the known pin files in <dir>. Directories themselves are left
-// in place (the Claude appendix to the V-4 brief makes this explicit:
-// preserving PIN_ROOT and its substructure lets a subsequent --pin
-// invocation reuse them with no mkdir gymnastics). Unknown filenames are
+// in place: preserving PIN_ROOT and its substructure lets a subsequent
+// --pin invocation reuse them with no mkdir gymnastics. Unknown filenames are
 // reported as warnings and left intact -- the unpin path never deletes
 // an unrecognised bpffs object.
-// F28 (Review-1): walk the pin directory through an fd opened with
+// Walk the pin directory through an fd opened with
 // O_DIRECTORY | O_NOFOLLOW, then unlinkat(dirfd, name, 0) for each
 // match. This closes a TOCTOU window where the dir component could
 // be swapped (symlink to /etc replaced the bpffs directory) between
@@ -3283,11 +3277,11 @@ static int collect_link_prog_ids(const char *links_dir,
 	return 0;
 }
 
-// V-4b: block until the kernel has released the specific BPF programs
+// Block until the kernel has released the specific BPF programs
 // whose prog_ids we collected from the pinned link files. Removing a
 // bpffs pin only drops the kernel-side refcount; the actual link /
 // program teardown runs on a workqueue with RCU grace periods. With the
-// V-4b counter map pins added, teardown takes longer (more kobjs to
+// counter map pins added, teardown takes longer (more kobjs to
 // free) and can exceed the 30s budget used by tests/pin-regression.sh's
 // wait_for_kernel_drain. Making --unpin synchronous gives operators a
 // strong post-condition: when this returns 0, no enforcement remains
@@ -3345,7 +3339,7 @@ static int wait_program_drain(const __u32 *ids, size_t nids, int timeout_ms)
 	}
 }
 
-// V-4b: pin the two deny-side counter maps under PIN_ROOT/maps. Called
+// Pin the two deny-side counter maps under PIN_ROOT/maps. Called
 // alongside pin_links() when --pin is set. The kernel keeps the maps
 // alive while the pins exist, so userspace can sum them after the
 // loader exits via `compartment-bpf --stats`. Failure rolls back the
@@ -3358,7 +3352,7 @@ static int pin_counter_maps(struct compartment_bpf *skel)
 	} entries[] = {
 		{ "deny_total",           skel->maps.deny_total },
 		{ "audit_drop_total",     skel->maps.audit_drop_total },
-		{ "actor_mismatch_total", skel->maps.actor_mismatch_total },  // ED-7
+		{ "actor_mismatch_total", skel->maps.actor_mismatch_total },
 		/* v0.4 strict-launch-marker counters + state maps */
 		{ "strict_launch_missing_total",      skel->maps.strict_launch_missing_total },
 		{ "strict_launch_allowed_total",      skel->maps.strict_launch_allowed_total },
@@ -3417,7 +3411,7 @@ err:
 	return -1;
 }
 
-// Sec-11/F19: a v0 leftover pin at PIN_ROOT/maps/{sealed_inodes,
+// A v0 leftover pin at PIN_ROOT/maps/{sealed_inodes,
 // sealed_dirs} with the old __u32 value shape (rather than struct
 // seal_value — 88 bytes through v0.3, 96 bytes since v0.4) shadows
 // our PIN_ROOT layout and is an attack
@@ -3471,7 +3465,7 @@ static int check_pinned_seal_map_shapes(void)
 	return 0;
 }
 
-// V-4b --stats entry point. Read-only: opens the pinned counter maps via
+// --stats entry point. Read-only: opens the pinned counter maps via
 // bpf_obj_get(), reads each as BPF_MAP_TYPE_PERCPU_ARRAY[0], sums values
 // across libbpf_num_possible_cpus(), and prints the result on stdout.
 // Exit 0 on success. Exit 2 with a stderr line if neither pin exists.
@@ -3534,7 +3528,7 @@ static int read_pinned_counter(const char *path, __u64 *out)
 
 static int freeze_seal_maps(struct compartment_bpf *skel)
 {
-	// Review-1 HIGH-8 (2026-05-15): extend the freeze list to the v0.4
+	// Extend the freeze list to the v0.4
 	// strict-launch maps + counters. Pre-fix, `launcher_to_actor`,
 	// `policy_state_map`, and the 9 v0.4 counters were writable from
 	// userspace — a CAP_BPF attacker on the same host could forge
@@ -3549,7 +3543,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 	//
 	// Listed in a table-driven shape so the _Static_assert below counts
 	// entries and a future map addition without a matching freeze entry
-	// fails to compile (symmetric gate per HIGH-8 fix shape).
+	// fails to compile (symmetric gate).
 	struct freeze_entry {
 		const char *name;
 		struct bpf_map *map;
@@ -3562,7 +3556,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		 * freezing blocks userspace writes, BPF-side (*v)++ still works. */
 		{ "deny_total",                       skel->maps.deny_total },
 		{ "audit_drop_total",                 skel->maps.audit_drop_total },
-		/* ED-7 actor-mismatch counter (v0.3) */
+		/* actor-mismatch counter (v0.3) */
 		{ "actor_mismatch_total",             skel->maps.actor_mismatch_total },
 		/* v0.4 strict-launch state maps */
 		{ "launcher_to_actor",                skel->maps.launcher_to_actor },
@@ -3580,7 +3574,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		{ "ptrace_traceme_denied_total",      skel->maps.ptrace_traceme_denied_total },
 	};
 	const size_t n = sizeof(entries) / sizeof(entries[0]);
-	/* Symmetric-gate assert per HIGH-8: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 = 17.
+	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 = 17.
 	 * If you add a freezable map to compartment.bpf.c without extending
 	 * this table, the assert below catches it at build time. */
 	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 17,
@@ -3604,7 +3598,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 
 static int stats_action(void)
 {
-	// Review-1 HIGH-12 (2026-05-15): extend --stats to surface the
+	// Extend --stats to surface the
 	// v0.4 strict-launch counters in addition to the v0.3 baseline.
 	// Pre-fix, an operator hitting a strict-launch deny had no
 	// aggregate counter visibility via the documented operator tool;
@@ -3622,7 +3616,7 @@ static int stats_action(void)
 		{ "deny_total",                       0, 0 },
 		{ "audit_drop_total",                 0, 0 },
 		{ "actor_mismatch_total",             0, 0 },
-		/* v0.4 strict-launch counters (HIGH-12) */
+		/* v0.4 strict-launch counters */
 		{ "strict_launch_missing_total",      0, 0 },
 		{ "strict_launch_allowed_total",      0, 0 },
 		{ "marker_set_total",                 0, 0 },
@@ -3671,7 +3665,7 @@ static int stats_action(void)
 	return 0;
 }
 
-// V-4 --unpin entry point. `requested` is the operator-supplied path or
+// --unpin entry point. `requested` is the operator-supplied path or
 // NULL for "operate on PIN_ROOT". This function does no BPF load/attach;
 // it only enumerates known pin files under PIN_ROOT and removes them. It
 // is invoked from main() before any BPF setup and main() returns its
@@ -3680,7 +3674,7 @@ static int stats_action(void)
 // pin file decrements the kernel's reference and tears down enforcement
 // once no other holder remains. The seal maps follow the same shape.
 // Synchronous-drain wrapper used after root unpin and after scoped unpin
-// operations that remove link pins. V-4b's root/link contract is that
+// operations that remove link pins. The root/link contract is that
 // when `--unpin` returns 0 after link removal, no compartment-bpf
 // enforcement remains; honouring that contract means propagating drain
 // timeout to the exit code. ids[] / nids identify the specific
@@ -3699,15 +3693,15 @@ static int unpin_drain_or_warn(const __u32 *ids, size_t nids)
 	return 0;
 }
 
-// ED-11 — unpin passphrase (Argon2id sentinel, SPEC §7.2 Shape A).
+// Unpin passphrase (Argon2id sentinel, SPEC §7.2 Shape A).
 //
 // Optional operator-supplied passphrase gates --unpin. This is a
 // **credential gate / accidental-unpin guard**, NOT a root-of-trust
 // against unrestricted privileged root: an attacker with CAP_BPF /
 // CAP_SYS_ADMIN on the box can remove the sentinel file (it lives on
 // tmpfs at /run/compartment-bpf/unpin-sentinel) and tear pins down via
-// `bpftool prog detach`. The honest threat model lives in HOWTO.md §3
-// (R2-F6 framing): the gate raises cost against a non-CAP_BPF-restricted
+// `bpftool prog detach`. The honest threat model lives in HOWTO.md §3:
+// the gate raises cost against a non-CAP_BPF-restricted
 // root attacker (setuid binary, confined-container root, dropped-cap
 // daemon) and provides offline-brute-force resistance via Argon2id work
 // factor on a captured sentinel. The passphrase travels in via
@@ -3723,11 +3717,11 @@ static int unpin_drain_or_warn(const __u32 *ids, size_t nids)
 // gate is not bulk-pw-hashing, so the interactive params (~70ms +
 // 64 MiB) are right-sized.
 //
-// Sentinel storage: see DEC-LDR7-C.md. PIN_ROOT lives on bpffs which
+// Sentinel storage: PIN_ROOT lives on bpffs which
 // rejects regular-file creation; the sentinel goes to /run/compartment-
 // bpf/unpin-sentinel (tmpfs, same boot lifecycle as the pins).
 //
-// Audit emission on verify-fail: see DEC-LDR7-B.md. The kernel audit
+// Audit emission on verify-fail: the kernel audit
 // ringbuf is producer-side BPF-only — userspace cannot push into it via
 // the standard libbpf API. We emit the same logical event via syslog
 // (LOG_AUTHPRIV / LOG_WARNING) plus a structured stderr line, with the
@@ -3747,7 +3741,7 @@ static char *ed11_read_passphrase(const char *prompt)
 		if (n > 4096) {
 			fprintf(stderr,
 				"ed11: COMPARTMENT_BPF_PASSPHRASE too long (>4096 bytes)\n");
-			// R2-F9: scrub the env-var string even on the
+			// Scrub the env-var string even on the
 			// too-long path before bailing.
 			sodium_memzero(env, n);
 			(void)unsetenv("COMPARTMENT_BPF_PASSPHRASE");
@@ -3818,7 +3812,7 @@ static void ed11_wipe_passphrase(char *buf)
 	if (!buf)
 		return;
 	size_t n = strlen(buf);
-	// R2-M4 (Review-2 MEDIUM): zero n+1 so the trailing NUL slot is
+	// Zero n+1 so the trailing NUL slot is
 	// also wiped — same width as the malloc + sodium_mlock + the
 	// sodium_munlock below. Off-by-one let one byte of clear-text
 	// linger across free(); the rounding is free.
@@ -3867,7 +3861,7 @@ static int ed11_write_sentinel(const char *pass)
 	}
 	// Pre-unlink any stale sentinel so O_EXCL fires on a clean slate.
 	// Stale sentinel from a crashed peer should not block a fresh pin;
-	// the lock around --pin (Sec-9/F14) excludes concurrent --pin so we
+	// the lock around --pin excludes concurrent --pin so we
 	// own this filesystem state for the duration of the pin window.
 	if (unlink(SENTINEL_PATH) < 0 && errno != ENOENT) {
 		fprintf(stderr, "ed11: unlink stale sentinel %s: %s\n",
@@ -3883,7 +3877,7 @@ static int ed11_write_sentinel(const char *pass)
 			      crypto_pwhash_OPSLIMIT_INTERACTIVE,
 			      crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0) {
 		fprintf(stderr, "ed11: crypto_pwhash_str failed (out of memory?)\n");
-		// R2-M5 (Review-2 MEDIUM): defense-in-depth zero on this
+		// Defense-in-depth zero on this
 		// early-return path. crypto_pwhash_str may have partially
 		// written before failing; symmetric with the explicit
 		// sodium_memzero(hash) on every other return path.
@@ -3969,7 +3963,7 @@ static int ed11_pin_maybe_write_sentinel(void)
 }
 
 // Emit a userspace-side audit event for ACTION_DENY_UNPIN_AUTH_FAIL.
-// Per DEC-LDR7-B: the kernel audit ringbuf cannot be produced into from
+// The kernel audit ringbuf cannot be produced into from
 // userspace via the standard libbpf API. We log the structured fields
 // (ts_ns, pid, uid, comm, action, dev, ino) via syslog
 // (LOG_AUTHPRIV / LOG_WARNING) AND on stderr in a parseable format so a
@@ -3995,7 +3989,7 @@ static void ed11_emit_unpin_auth_fail(__u64 dev, __u64 ino)
 		}
 		close(cfd);
 	}
-	// R2-F2 + R2-M23: emit in the same `[audit] <ACTION> ts=… pid=…
+	// Emit in the same `[audit] <ACTION> ts=… pid=…
 	// ppid=… uid=… comm=… dev=… ino=…` format as the kernel-side
 	// audit_handler legacy (no-caller) branch. action_name() now covers
 	// case 7 so SIEM consumers see DENY_UNPIN_AUTH_FAIL by symbol.
@@ -4108,7 +4102,7 @@ static int unpin_action(const char *requested)
 	if (ensure_bpffs("/sys/fs/bpf") < 0)
 		return 1;
 
-	// Sec-9/F14: refuse to race a concurrent --pin / --unpin against
+	// Refuse to race a concurrent --pin / --unpin against
 	// the same PIN_ROOT. Lock held for the entire enumerate-and-unlink
 	// window. The function has many early returns; rather than thread
 	// pin_lifecycle_unlock() through each, we rely on OS process-exit
@@ -4120,7 +4114,7 @@ static int unpin_action(const char *requested)
 		return 1;
 	(void)lock_fd;  /* held until process exits; release-on-close. */
 
-	// A3-P2-1: ED-11 authgate runs INSIDE the pin lifecycle lock to
+	// The unpin authgate runs INSIDE the pin lifecycle lock to
 	// close a TOCTOU window where operator A authgates against tree T1
 	// then operator B replaces the tree (different passphrase) before
 	// A's unpin runs. Running auth under the lock binds the verified
@@ -4182,14 +4176,14 @@ static int unpin_action(const char *requested)
 		fprintf(stderr,
 			"[unpin] %s preserved; %d pin%s removed, %d unknown left intact.\n",
 			root, removed, removed == 1 ? "" : "s", unknown);
-		// ED-11: root unpin tore the whole pin tree down, so the
+		// Root unpin tore the whole pin tree down, so the
 		// passphrase sentinel is no longer load-bearing. Subdir/leaf
 		// unpins below don't reach this; they leave the sentinel in
 		// place because some pins remain.
 		ed11_unpin_sentinel_unlink();
 		// Post-condition: when this returns 0, the specific compartment-bpf
 		// prog_ids we collected from the pin files are all gone
-		// (V-4b T4.2). Drain timeout propagates to a nonzero exit
+		// Drain timeout propagates to a nonzero exit
 		// if the drain times out.
 		return unpin_drain_or_warn(link_prog_ids, n_link_prog_ids);
 	}
@@ -4334,7 +4328,7 @@ static int unpin_action(const char *requested)
 	return removed_link ? unpin_drain_or_warn(&leaf_prog_id, n_leaf) : 0;
 }
 
-/* Implemented in compartment-observe.c (AO-1..AO-5) */
+/* Implemented in compartment-observe.c */
 extern int observe_main(int argc, char **argv);
 
 int main(int argc, char **argv)
@@ -4347,7 +4341,7 @@ int main(int argc, char **argv)
 	int dry_run = 0;
 	int parse_only = 0;
 	int allow_empty = 0;
-	int allow_candidate = 0;  /* P1-C (v6-rerun1) */
+	int allow_candidate = 0;  /* opt-in to load a candidate-marked profile under --pin */
 	int unpin_mode = 0;
 	int stats_mode = 0;
 	const char *unpin_path = NULL;
@@ -4369,7 +4363,7 @@ int main(int argc, char **argv)
 			allow_empty = 1;
 			i++;
 		} else if (!strcmp(argv[i], "--allow-candidate")) {
-			/* P1-C (v6-rerun1): opt-in to load a candidate-marked
+			/* Opt-in to load a candidate-marked
 			 * profile under --pin. Without this flag, --pin against
 			 * a profile carrying
 			 * `#@compartment-bpf-profile-status: candidate` exits
@@ -4442,7 +4436,7 @@ int main(int argc, char **argv)
 
 	if (!conf) { usage(argv[0]); return 2; }
 
-	// Sec-11/F19: refuse to start if a pre-existing pinned seal map at
+	// Refuse to start if a pre-existing pinned seal map at
 	// PIN_ROOT/maps/{sealed_inodes,sealed_dirs} has the wrong value
 	// shape. v0 used __u32; v0.1+ uses struct seal_value (88 bytes
 	// through v0.3; 96 bytes since v0.4 with strict-launch fields).
@@ -4450,7 +4444,7 @@ int main(int argc, char **argv)
 	// parse-only / dry-run / real-load — anywhere an operator might
 	// validate a profile against a deployed pin tree. --unpin (above)
 	// is the documented recovery path, so it stays exempt; --stats is
-	// counter-map-only and never opens seal maps. Mirrors the V-4b
+	// counter-map-only and never opens seal maps. Mirrors the
 	// counter-map schema check in read_pinned_counter().
 	if (check_pinned_seal_map_shapes() < 0)
 		return 1;
@@ -4490,7 +4484,7 @@ int main(int argc, char **argv)
 	// We hold an O_PATH fd per sealed path across attach (see comment on
 	// `struct held_fds`). On a large policy this can exceed the default
 	// soft NOFILE limit; bump to the hard limit as a best effort.
-	// M-6: surface failure with the same warn pattern as RLIMIT_MEMLOCK
+	// Surface failure with the same warn pattern as RLIMIT_MEMLOCK
 	// above — a silent failure manifests as a confusing "open: Too many
 	// open files" downstream rather than naming the actual cause.
 	struct rlimit rf;
@@ -4520,7 +4514,7 @@ int main(int argc, char **argv)
 	// unprivileged user on the box can `link("/usr/sbin/aide",
 	// "/tmp/myactor")` and `exec /tmp/myactor` to inherit actor
 	// identity (the kernel resolves current->mm->exe_file to the
-	// same (dev, ino) under either path). R2-F11 already closes
+	// same (dev, ino) under either path). The kernel already closes
 	// the surface at the LSM layer via comp_inode_link's source-
 	// inode SEAL_NO_WRITE check; this is the defense-in-depth
 	// callout that surfaces the sysctl gap to the operator before
@@ -4543,7 +4537,7 @@ int main(int argc, char **argv)
 					"[loader] WARNING: fs.protected_hardlinks=0; "
 					"unprivileged hardlinks to actor binaries are "
 					"the documented bypass class (LIMITATIONS.md). "
-					"R2-F11 comp_inode_link source-inode check is "
+					"The comp_inode_link source-inode check is "
 					"the LSM-layer defense; set "
 					"fs.protected_hardlinks=1 for defense-in-depth.\n");
 			}
@@ -4556,7 +4550,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	// Sec-11/F19 shape check already ran above (before parse-only /
+	// The pinned-seal-map shape check already ran above (before parse-only /
 	// dry-run early returns) so adversarial pinned maps are rejected
 	// for every mode the operator could plausibly run against a hot
 	// pin tree, not just real-load.
@@ -4567,7 +4561,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	// V-4b T4b.2: optional test-only override for the audit ringbuf size,
+	// Optional test-only override for the audit ringbuf size,
 	// so counter-smoke.sh can deterministically induce ringbuf drops with
 	// a small burst of denies. Value is bytes; libbpf will reject anything
 	// that is not a positive power-of-two multiple of the page size. No
@@ -4656,7 +4650,7 @@ int main(int argc, char **argv)
 	// already reference inode numbers that the kernel hooks will check.
 	held_fds_release(&held);
 
-	// Order matters (Codex finding 4): set up the audit ringbuf BEFORE
+	// Order matters: set up the audit ringbuf BEFORE
 	// pinning links. If ring_buffer__new() fails after pin, the daemon
 	// exits but the pinned program persists with no audit reader, leaving
 	// enforcement live and silent. Ringbuf-first means a ringbuf failure
@@ -4670,7 +4664,7 @@ int main(int argc, char **argv)
 	}
 
 	if (!pin) {
-		// H-4 (partial): without --pin, enforcement evaporates the
+		// Without --pin, enforcement evaporates the
 		// instant this process dies (kernel drops all link refs on
 		// process exit). The default invocation is no-pin; operators
 		// expecting enforcement to survive loader death must pass
@@ -4682,7 +4676,7 @@ int main(int argc, char **argv)
 	}
 
 	if (pin) {
-		// Sec-9/F14: refuse to race a concurrent --pin / --unpin
+		// Refuse to race a concurrent --pin / --unpin
 		// during the pin lifecycle. Held for the attach-to-pin
 		// window only; released as soon as pin_counter_maps
 		// completes so a subsequent --unpin against the same
@@ -4694,7 +4688,7 @@ int main(int argc, char **argv)
 			compartment_bpf__destroy(skel);
 			return 1;
 		}
-		// Sec-13/F27: SIGINT/SIGTERM may have already arrived
+		// SIGINT/SIGTERM may have already arrived
 		// between attach() and here. Check before we begin
 		// creating bpffs files so the rollback is trivial (no
 		// pins to undo). compartment_bpf__destroy() drops the
@@ -4751,9 +4745,9 @@ int main(int argc, char **argv)
 			compartment_bpf__destroy(skel);
 			return 1;
 		}
-		// Sec-13/F27: SIGTERM between pin_links and
+		// SIGTERM between pin_links and
 		// pin_counter_maps would leave a half-pinned state. Sweep
-		// the link pins we just created before exiting; R2-M20
+		// the link pins we just created before exiting; this
 		// also removes the sentinel we wrote up front.
 		if (pin_window_aborted("--pin")) {
 			int removed = 0, unknown = 0;
@@ -4768,7 +4762,7 @@ int main(int argc, char **argv)
 		}
 		if (pin_counter_maps(skel) < 0) {
 			// pin_links() already succeeded -- roll it back so we
-			// do not leave a half-pinned state on bpffs. R2-M20:
+			// do not leave a half-pinned state on bpffs;
 			// also remove the sentinel we wrote up front.
 			int removed = 0, unknown = 0;
 			(void)sweep_known(PIN_ROOT "/links",
@@ -4780,7 +4774,7 @@ int main(int argc, char **argv)
 			compartment_bpf__destroy(skel);
 			return 1;
 		}
-		// R2-M20: ed11_pin_maybe_write_sentinel already ran before
+		// ed11_pin_maybe_write_sentinel already ran before
 		// pin_links above. The pin tree is now in place AND the
 		// sentinel matches it. The pre-this-commit ordering wrote
 		// the sentinel here AFTER the pins, so a SIGKILL between
@@ -4790,7 +4784,7 @@ int main(int argc, char **argv)
 		pin_lifecycle_unlock(pin_lock_fd);
 	}
 
-	// R2-F7 BX-9: synthetic ringbuf-emit test. When the test env knob
+	// Synthetic ringbuf-emit test. When the test env knob
 	// is set, fabricate one audit_event with a deliberately mismatched
 	// ABI version and run it through audit_handler. The handler hits
 	// the version-mismatch branch and emits its `warn:` line to

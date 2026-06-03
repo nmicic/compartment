@@ -24,7 +24,7 @@
 // forward-incompatible at the map-shape level (old v0 pinned maps must
 // be repinned).
 //
-// ABI v0.2 — exec-domain audit extension (ED-6). struct audit_event
+// ABI v0.2 — exec-domain audit extension. struct audit_event
 // grew 56 → 72 bytes: two new __u64 fields caller_dev / caller_ino
 // carry the caller-exe identity on the actor-mismatch deny path. New
 // ACTION_DENY_ACTOR_MISMATCH (=4) reclaimed the historical gap.
@@ -71,7 +71,7 @@
 //      bpf_map_update_elem time.
 //    - `__u32 strict_generation` (0 when SEAL_STRICT_LAUNCH not set).
 //      Wraps at 255; loader rejects a strict actor whose marker
-//      policy_generation does not match this value (M-2). Mirrors
+//      policy_generation does not match this value. Mirrors
 //      policy_state.generation at load time. v0.4 is fresh-load-only
 //      (SPEC §3a) — the loader never bumps
 //      generation after the initial `--pin`. The dual-side check is
@@ -176,7 +176,7 @@ struct inode_key {
 #define SEAL_FULL \
 	(SEAL_NO_UNLINK | SEAL_NO_RENAME | SEAL_NO_WRITE | SEAL_NO_CHMOD)
 
-// Code 4 was historically skipped; ABI v0.2 (ED-6) reclaims it for
+// Code 4 was historically skipped; ABI v0.2 reclaims it for
 // ACTION_DENY_ACTOR_MISMATCH so the value-drift asserts below remain
 // dense and a future scan does not find the gap surprising.
 #define ACTION_DENY_UNLINK         1
@@ -254,10 +254,10 @@ _Static_assert(ACTION_DENY_PTRACE_TRACEME == 13, "ACTION_DENY_PTRACE_TRACEME val
 //   off 28: __u32 action
 //   off 32: __u64 dev
 //   off 40: __u64 ino
-//   off 48: __u64 caller_dev    — ED-6: actor-mismatch path; 0 elsewhere.
-//   off 56: __u64 caller_ino    — ED-6: actor-mismatch path; 0 elsewhere.
+//   off 48: __u64 caller_dev    — actor-mismatch path; 0 elsewhere.
+//   off 56: __u64 caller_ino    — actor-mismatch path; 0 elsewhere.
 //   off 64: char  comm[16]
-//   off 80: char  actor_name[16]— ED-6 v0.3: actor-group name on the
+//   off 80: char  actor_name[16]— v0.3: actor-group name on the
 //                                 actor-mismatch path; truncated to
 //                                 15 bytes + NUL; empty on all other
 //                                 event types.
@@ -280,7 +280,7 @@ struct audit_event {
 _Static_assert(sizeof(struct audit_event) == 96,
 	"audit_event size must match across BPF producer and userspace consumer (ABI v0.3)");
 
-// ---------------- ED-3: seal_value (exec-domain actor allowlist) ----------------
+// ---------------- seal_value (exec-domain actor allowlist) ----------------
 //
 // v0 wrote a plain __u32 flags into sealed_inodes / sealed_dirs. v0.1
 // widened the value to a struct so each seal can carry an optional
@@ -289,13 +289,13 @@ _Static_assert(sizeof(struct audit_event) == 96,
 // actor_count == 0 preserves v0 uniform-deny semantics: the seal
 // applies to every caller. actor_count > 0 restricts the seal: the
 // operation is allowed iff the caller's exe inode matches one of the
-// actor[i] (dev, ino) pairs (ED-4 actor_check_or_deny).
+// actor[i] (dev, ino) pairs (actor_check_or_deny).
 //
 // Inline array of 4 actors per SPEC §6.1 default. Wider groups are an
 // explicit profile-author error (loader and parser both cap at this
 // value).
 //
-// v0.3 (ED-6 Sec-12): adds actor_name[16] so actor_check_or_deny can
+// v0.3: adds actor_name[16] so actor_check_or_deny can
 // copy the actor-group name into audit_event.actor_name on the
 // actor-mismatch deny path WITHOUT a userspace lookup table. Loader
 // populates from actor_group->name at bpf_map_update_elem time
@@ -357,7 +357,7 @@ _Static_assert(COMPARTMENT_MAX_ACTORS_PER_SEAL == 4,
 // actor_marker      : BPF_MAP_TYPE_TASK_STORAGE, value=struct
 //                     actor_marker. Per-task; set on launcher exec,
 //                     cleared on foreign exec, copied on fork via the
-//                     lsm/task_alloc hook (G6 Outcome B).
+//                     lsm/task_alloc hook.
 //
 // `state` in actor_marker is a small protocol tag — 0 = uninitialised
 // (defensive; task storage create returns zeroed memory), 1 = valid.

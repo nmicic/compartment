@@ -3,7 +3,7 @@
 //
 // compartment-bpf: kernel-side LIDS-style sealed paths using BPF LSM.
 // Exec domains (the "actor allowlist" — bind a seal to specific caller
-// exe inodes) shipped in ED-1..ED-7 (2026-05-14). Companion to
+// exe inodes). Companion to
 // compartment-user (Landlock+seccomp) and compartment-root (namespaces).
 //
 // Hooks (21 total as of ABI v0.6):
@@ -14,7 +14,7 @@
 //     inode_setxattr, inode_removexattr
 //   v0.4 strict-launch (5):
 //     lsm.s/bprm_check_security (sleepable; sets task-storage marker),
-//     task_alloc (G6 marker copy on fork), task_prctl (PR_SET_MM_EXE_FILE
+//     task_alloc (marker copy on fork), task_prctl (PR_SET_MM_EXE_FILE
 //     deny), ptrace_access_check, ptrace_traceme
 //
 // v0.1 maps:
@@ -22,8 +22,8 @@
 //   sealed_dirs   : (dev, ino) -> struct seal_value     (per-dir, applies to subtree descendants)
 //   audit_rb      : ringbuf of deny events
 //
-// ED-3 widens the map value from __u32 to struct seal_value (72 bytes).
-// actor_count == 0 preserves v0 uniform-deny semantics; ED-4 adds the
+// ABI v0.1 widens the map value from __u32 to struct seal_value (72 bytes).
+// actor_count == 0 preserves v0 uniform-deny semantics; the actor check adds the
 // caller-exe actor check in actor_check_or_deny.
 //
 // Decision policy: any program returns -EACCES => deny. The conventional
@@ -124,7 +124,7 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } audit_rb SEC(".maps");
 
-// V-4b counters. Per-CPU arrays; userspace sums across all possible CPUs.
+// Deny counters. Per-CPU arrays; userspace sums across all possible CPUs.
 // deny_total            : incremented at every enforcement deny, BEFORE
 //                         the ringbuf reserve attempt. Counts the policy
 //                         decision, not the audit success.
@@ -132,11 +132,11 @@ struct {
 //                         NULL after deny_total was already counted. Soak
 //                         evidence that the kernel saw the deny even when
 //                         the audit stream is being dropped.
-// actor_mismatch_total  : ED-7. Incremented at every actor-mismatch deny
+// actor_mismatch_total  : incremented at every actor-mismatch deny
 //                         BEFORE the audit emit. Subset of deny_total
 //                         records the actor-allowlist evictions specifically;
 //                         records every actor-mismatch decision even when
-//                         the audit ringbuf is dropped (mirrors V-4b
+//                         the audit ringbuf is dropped (mirrors the
 //                         invariant for audit_drop_total vs deny_total).
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -169,7 +169,7 @@ struct {
 //                       set by loader from `actor-strict … launcher=…`.
 //   actor_marker_map  : TASK_STORAGE(actor_marker)
 //                       set on launcher exec, cleared on foreign exec,
-//                       copied on fork via lsm/task_alloc (G6 Outcome B).
+//                       copied on fork via lsm/task_alloc.
 //   policy_state_map  : ARRAY[1](policy_state)
 //                       loader writes { generation, strict_loaded } on
 //                       load and bumps generation on reload.
@@ -180,7 +180,7 @@ struct {
 // Counter convention matches the existing v0.1+ pattern: one
 // BPF_MAP_TYPE_PERCPU_ARRAY[1] per counter, incremented BEFORE any
 // ringbuf reserve so deny counts stay correct under audit pressure
-// (the V-4b ordering invariant; SPEC §6.4 + G10).
+// (the ordering invariant; SPEC §6.4).
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 256);
@@ -267,7 +267,7 @@ struct {
 // to match the spike's witness ordering + the SPEC-allowed per-hook
 // granularity. `ptrace_access_denied_total` covers comp_ptrace_access_check
 // (strace, process_vm_writev, pidfd_getfd, /proc/<pid>/mem all route
-// through security_ptrace_access_check on Ubuntu 26.04 (kernel 7.0) — G9 4-vector).
+// through security_ptrace_access_check on Ubuntu 26.04 (kernel 7.0)).
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
@@ -367,7 +367,7 @@ caller_id_resolve_locked(struct caller_id *cid)
 	cid->valid = 1;
 }
 
-// ---------------- ED-4 / ED-6 / ED-7: actor_check_or_deny ----------------
+// ---------------- actor_check_or_deny ----------------
 //
 // Returns 0 if the caller is allowed (seal's actor allowlist matches the
 // caller's exe inode), -EACCES otherwise. On any deny path emits exactly
@@ -393,10 +393,10 @@ caller_id_resolve_locked(struct caller_id *cid)
 // (SPEC §6.2). __always_inline is required so the verifier can reason
 // across all 16 hook call sites.
 //
-// V-4b invariant preserved for actor mismatches: actor_mismatch_total is
+// Counter invariant preserved for actor mismatches: actor_mismatch_total is
 // bumped BEFORE the audit ringbuf reserve so the counter records every
 // actor-mismatch decision even when the audit stream is being dropped.
-// Every actor-mismatch deny path bumps ED-7 then emits
+// Every actor-mismatch deny path bumps the counter then emits
 // ACTION_DENY_ACTOR_MISMATCH with the caller's resolved (dev, ino).
 // Hoist into one helper so the three call sites in actor_check_or_deny
 // stay obviously identical and a future audit-side change touches one
@@ -406,7 +406,7 @@ deny_actor_mismatch(struct seal_value *sv,
                     __u64 dev, __u64 ino, __u64 cdev, __u64 cino)
 {
 	bump_counter(&actor_mismatch_total);
-	// v0.3 (Sec-12): pass sv->actor_name into the audit emit so the
+	// v0.3: pass sv->actor_name into the audit emit so the
 	// event carries the actor-group name. NULL sv falls back to an
 	// empty actor_name (defensive: the sv-NULL caller path below).
 	emit_audit_actor(ACTION_DENY_ACTOR_MISMATCH, dev, ino, cdev, cino,
@@ -430,7 +430,7 @@ actor_check_or_deny(struct seal_value *sv, __u32 action,
 		return -EACCES;
 	}
 
-	// F15: caller_id may already be resolved by a sibling seal check
+	// caller_id may already be resolved by a sibling seal check
 	// in this hook invocation. Lazy-resolve only on first non-uniform
 	// path; the BTF-read chain happens at most once per hook.
 	if (!cid->resolved)
@@ -505,7 +505,7 @@ static __always_inline __u32 cur_strict_loaded(void)
 // -EACCES otherwise.
 //
 // On deny:
-//   - strict_launch_missing_total++ BEFORE any ringbuf reserve (G10).
+//   - strict_launch_missing_total++ BEFORE any ringbuf reserve.
 //   - On generation mismatch specifically, marker_stale_generation_total++
 //     in addition.
 //   - emit ACTION_DENY_STRICT_LAUNCH_MISSING via emit_audit_actor with
@@ -551,7 +551,7 @@ strict_launch_check_or_deny(struct seal_value *sv, __u64 dev, __u64 ino,
 
 	t = (void *)bpf_get_current_task_btf();
 	if (!t) {
-		// F26 cross-phase doctrine: defend against verifier-allowed
+		// Cross-phase doctrine: defend against verifier-allowed
 		// NULL on PTR_TO_BTF_ID; if it ever fires we cannot resolve
 		// the task — fail-closed deny.
 		bump_counter(&strict_launch_missing_total);
@@ -571,9 +571,9 @@ strict_launch_check_or_deny(struct seal_value *sv, __u64 dev, __u64 ino,
 	}
 
 	// Marker target must equal the current task's exe inode. This
-	// closes the foreign-exec → re-exec-actor chain (SL-3, SL-5).
+	// closes the foreign-exec → re-exec-actor chain.
 	// cid->valid is guaranteed true here (entry guard at line 516 denies
-	// on !cid->valid before reaching this point — M-4: guard removed).
+	// on !cid->valid before reaching this point — redundant guard removed).
 	if (am->target.dev != cid->dev || am->target.ino != cid->ino) {
 		bump_counter(&strict_launch_missing_total);
 		emit_audit_actor(ACTION_DENY_STRICT_LAUNCH_MISSING,
@@ -612,7 +612,7 @@ strict_launch_check_or_deny(struct seal_value *sv, __u64 dev, __u64 ino,
 // THIS seal. Returns -EACCES to deny, 0 if the seal does not match the
 // mask or the caller's exe is on the seal's actor allowlist.
 //
-// ED-6: audit emission is OWNED by actor_check_or_deny on all deny
+// Audit emission is OWNED by actor_check_or_deny on all deny
 // paths (uniform-deny → emit_audit with `action`; actor-mismatch →
 // emit_audit_actor with ACTION_DENY_ACTOR_MISMATCH). Callers MUST NOT
 // emit again when this returns nonzero — that would double-audit a
@@ -960,12 +960,12 @@ deny_file_write(struct file *file, struct caller_id *cid)
 					   ACTION_DENY_WRITE_PARENT_DIR, cid);
 }
 
-// ED-6 widened emit. Used directly by the actor-mismatch path so the
+// ABI v0.2 widened emit. Used directly by the actor-mismatch path so the
 // caller_dev/caller_ino fields are populated; the legacy 3-arg
 // emit_audit wrapper below preserves all v0 call sites unchanged by
 // passing zeros for the caller fields.
 //
-// v0.3 (Sec-6 + Sec-12): writes the ABI version word at offset 0 of
+// v0.3: writes the ABI version word at offset 0 of
 // every emitted event (per the header MUST rule); copies the actor
 // group name into e->actor_name when actor_name_src is non-NULL.
 // Every field of audit_event is written explicitly here — the buffer
@@ -978,7 +978,7 @@ emit_audit_actor(__u32 action, __u64 dev, __u64 ino,
 {
 	struct audit_event *e;
 
-	// V-4b ordering invariant: count the deny BEFORE attempting the
+	// Ordering invariant: count the deny BEFORE attempting the
 	// ringbuf reserve. The counter records the policy decision; the
 	// ringbuf is best-effort audit.
 	bump_counter(&deny_total);
@@ -989,8 +989,7 @@ emit_audit_actor(__u32 action, __u64 dev, __u64 ino,
 		return;
 	}
 
-	// R2-M1 + cross-phase F26 uniform doctrine (Review-2 cross-phase
-	// audit §8.3): guard bpf_get_current_task_btf() against a NULL
+	// Cross-phase uniform doctrine: guard bpf_get_current_task_btf() against a NULL
 	// return the same way caller_id_resolve_locked does. The verifier
 	// is allowed to optimize the NULL check out on PTR_TO_BTF_ID, but
 	// if a future kernel ever introduces an LSM context where task is
@@ -1013,7 +1012,7 @@ emit_audit_actor(__u32 action, __u64 dev, __u64 ino,
 	e->caller_ino  = caller_ino;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
-	// v0.3 (Sec-12): actor_name carries the group name on the actor-
+	// v0.3: actor_name carries the group name on the actor-
 	// mismatch path. NULL src → zero out (uniform-deny / legacy paths).
 	// The userspace loader populates sv->actor_name with a NUL-
 	// terminated string truncated to 15 bytes, so this fixed-size copy
@@ -1061,7 +1060,7 @@ int BPF_PROG(comp_inode_unlink, struct inode *dir, struct dentry *dentry, int re
 	return 0;
 }
 
-// TODO(exec-domain F25, VM-equipped): explore folding comp_inode_rename
+// TODO(exec-domain, VM-equipped): explore folding comp_inode_rename
 // into deny_parent_dir_action so the per-direction logic below collapses
 // into reused helpers. The change is
 // stylistic + verifier-sensitive (the unrolled per-direction scan keeps
@@ -1082,9 +1081,9 @@ int BPF_PROG(comp_inode_rename,
 	// Per-direction mask: a rename OUT of old_dir is gated by NO_RENAME
 	// and NO_UNLINK because it removes a directory entry from old_dir. A
 	// rename INTO new_dir is also a "create entry" of sorts, so NO_WRITE on
-	// the destination directory must block it (Codex finding 3:
+	// the destination directory must block it: previously
 	// `seal /etc no-write` did not stop `mv payload /etc/payload` because
-	// the loop only checked NO_RENAME on both dirs). The action emitted
+	// the loop only checked NO_RENAME on both dirs. The action emitted
 	// reflects what was conceptually denied: rename-out vs. write-into.
 	int r;
 	struct caller_id cid = {};
@@ -1231,15 +1230,15 @@ int BPF_PROG(comp_inode_link, struct dentry *old_dentry, struct inode *dir,
 	// writable) could `link("/usr/sbin/aide", "/tmp/aide-alias")`,
 	// `exec /tmp/aide-alias`, and have `current->mm->exe_file`
 	// resolve to the same (dev, ino) as /usr/sbin/aide — inheriting
-	// actor identity. ED-9 strict mode requires every actor binary
+	// actor identity. Strict mode requires every actor binary
 	// to carry a `full` (=SEAL_NO_WRITE | SEAL_NO_UNLINK |
 	// SEAL_NO_RENAME | SEAL_NO_CHMOD) seal, so we close the surface
 	// at the LSM layer: deny the link if the source inode is
 	// SEAL_NO_WRITE, regardless of where the new hardlink lives.
 	// One additional bpf_map_lookup_elem on the source inode key;
-	// verifier-load risk is small. R2-F10 covers the sysctl side
+	// verifier-load risk is small. The sysctl side
 	// (protected_hardlinks=1 as defense-in-depth) and the
-	// LIMITATIONS row.
+	// LIMITATIONS row document the complementary mitigation.
 	struct inode *src = BPF_CORE_READ(old_dentry, d_inode);
 	if (src) {
 		r = deny_inode_action(src, SEAL_NO_WRITE,
@@ -1460,7 +1459,7 @@ int BPF_PROG(comp_inode_removexattr, struct mnt_idmap *idmap,
 }
 
 // ============================================================
-// v0.4 strict-launch-marker hooks (SPEC §6.1, §6.3 + G6 Outcome B)
+// v0.4 strict-launch-marker hooks (SPEC §6.1, §6.3)
 // ============================================================
 
 // §6.1 bprm_check_security — marker set / keep / clear. NOT a deny hook
@@ -1547,15 +1546,15 @@ int BPF_PROG(comp_bprm_check_security, struct linux_binprm *bprm, int ret)
 	if (am->target.dev == exec_id.dev && am->target.ino == exec_id.ino)
 		return 0;
 
-	// 3b: foreign exec → clear marker (after counter bump per G10).
+	// 3b: foreign exec → clear marker (after counter bump).
 	bump_counter(&marker_clear_foreign_exec_total);
 	bpf_task_storage_delete(&actor_marker_map, t);
 	return 0;
 }
 
-// G6 Outcome (B): copy parent marker to child on fork/clone so a
-// fork-without-exec actor (postgres-prefork style; AIDE fork-write
-// witness SL-4) keeps actor identity. SPEC §8 G6 alternative for
+// Copy parent marker to child on fork/clone so a
+// fork-without-exec actor (postgres-prefork style; AIDE fork-write)
+// keeps actor identity. SPEC §8 alternative for
 // kernels without BPF_F_INHERIT_TASK_STORAGE (Ubuntu 26.04 (kernel 7.0) has none —
 // verified by `grep -ni 'inherit' /usr/include/linux/bpf.h`).
 SEC("lsm/task_alloc")
@@ -1606,13 +1605,13 @@ int BPF_PROG(comp_task_alloc, struct task_struct *task, u64 clone_flags, int ret
 // (current->mm->exe_file is what caller_id_resolve_locked reads) before
 // reaching the file-op enforcement path. The deny short-circuits BEFORE
 // strict-launch's file-op check sees a tampered exe inode, closing
-// SL-7a/b.
+// the exe-file-tampering bypass.
 //
 // Broadened from `arg2 == PR_SET_MM_EXE_FILE`
 // only to ALL PR_SET_MM sub-ops. PR_SET_MM_MAP (sub-op 14) accepts a
 // `struct prctl_mm_map` whose `exe_fd` field overwrites
 // current->mm->exe_file at the same CAP_SYS_RESOURCE privilege tier as
-// PR_SET_MM_EXE_FILE — the narrow gate left a direct G8 bypass. Per-sub-op
+// PR_SET_MM_EXE_FILE — the narrow gate left a direct bypass. Per-sub-op
 // enumeration is fragile (new sub-ops have been added to the kernel
 // between releases); legitimate userspace doesn't need PR_SET_MM under
 // strict-launch, so deny the whole option family. The counter name
@@ -1641,14 +1640,14 @@ int BPF_PROG(comp_task_prctl, int option, unsigned long arg2,
 	// PR_SET_MM_MAP etc. require CAP_SYS_RESOURCE; all sub-ops are denied
 	// above via the PR_SET_MM family deny. All other prctl options (not
 	// PR_SET_MM) are out of scope for compartment-bpf and treated as
-	// allowed — CAP_SYS_RESOURCE is not typically granted to actors (M-25).
+	// allowed — CAP_SYS_RESOURCE is not typically granted to actors.
 	return 0;
 }
 
 // §6.3 ptrace_access_check — deny ptrace targeting a marked strict
 // actor task. Covers strace, process_vm_writev, pidfd_getfd,
 // /proc/<pid>/mem read (all route through security_ptrace_access_check
-// on Ubuntu 26.04 (kernel 7.0); G9 4-vector witness confirmed 2026-05-15).
+// on Ubuntu 26.04 (kernel 7.0)).
 SEC("lsm/ptrace_access_check")
 int BPF_PROG(comp_ptrace_access_check, struct task_struct *child,
              unsigned int mode, int ret)

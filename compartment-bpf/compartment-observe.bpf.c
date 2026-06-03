@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 // Copyright (c) 2026 Nenad Mićić <nenad@micic.be>
-// compartment-bpf observe BPF program — AO-2 (actor marker + lineage)
-// and AO-3 (filesystem event aggregation).
+// compartment-bpf observe BPF program — actor marker + lineage
+// and filesystem event aggregation.
 //
 // Production port from experimental/actor-fs-observe/bpf/observe.bpf.c.
-// Feasibility verdict: SHIP (AO-2 5/5 + AO-3 10/10 on Ubuntu 26.04 (kernel 7.0)).
 // SPEC: experimental/ACTOR-FS-OBSERVE-SPEC.md
 //
-// AO-6 (global compact mode) and AO-7 (deny-first bridge) are deferred.
-// DEFERRED: AO-6 — global compact mode (--global all-task marker mode with aggressive aggregation).
-// DEFERRED: AO-7 — deny-first bridge / documented handoff to compartment-bpf genprofile.
+// DEFERRED: global compact mode (--global all-task marker mode with aggressive aggregation).
+// DEFERRED: deny-first bridge / documented handoff to compartment-bpf genprofile.
 //
 // FEASIBILITY.md known limitations addressed:
 // 1. bprm/file_open ordering: actor binary open during exec fires before
@@ -125,7 +123,7 @@ struct observed_value {
 	__u8  under_current_actor;
 	__u8  under_actor_lineage;
 	__u8  _pad[2];
-	/* M-9: spinlock guards last_ns update against SMP torn writes. */
+	/* spinlock guards last_ns update against SMP torn writes. */
 	struct bpf_spin_lock lock;
 };
 
@@ -260,13 +258,13 @@ static __always_inline int inode_to_id(struct inode *ino_p, struct file_id *out)
  * Priority order:
  *  1. current_actor_markers for this task (direct actor or thread clone).
  *     Threads receive their own copy in ao_task_alloc (no CLONE_THREAD guard)
- *     so no leader-pointer lookup is needed here (HIGH-5 fix; the BPF verifier
+ *     so no leader-pointer lookup is needed here (the BPF verifier
  *     rejects BPF_CORE_READ pointers as bpf_task_storage_get keys).
- *  2. lineage_markers for this task — HIGH-6 fix: helper execs (fork children
+ *  2. lineage_markers for this task: helper execs (fork children
  *     that have exec'd a non-actor binary) carry only lineage_markers.
  */
 /* resolve_lane2_actor: return actor_slot for current task, or -1 if none.
- * Sets *is_lineage_out to 1 if attribution came from lineage_markers (M-8). */
+ * Sets *is_lineage_out to 1 if attribution came from lineage_markers. */
 static __always_inline __s32 resolve_lane2_actor(struct task_struct *t,
 						  __u8 *is_lineage_out)
 {
@@ -323,9 +321,9 @@ static __always_inline void emit(__u32 type, __u32 actor_slot,
 }
 
 /* SPEC §7.3 map-full behavior: preserve existing, count overflow.
- * is_lineage: 1 if attribution came from lineage_markers (M-8).
- * last_ns protected by spinlock against SMP torn writes (M-9).
- * overflow counted only on -ENOSPC; -EEXIST race silently ignored (M-11). */
+ * is_lineage: 1 if attribution came from lineage_markers.
+ * last_ns protected by spinlock against SMP torn writes.
+ * overflow counted only on -ENOSPC; -EEXIST race silently ignored. */
 static __always_inline void agg_obs(struct observed_key *key,
 				    __u32 pid, __u32 tgid,
 				    __u32 ev_type, __u32 actor_slot,
@@ -383,7 +381,7 @@ int BPF_PROG(ao_bprm, struct linux_binprm *bprm, int ret)
 		return ret;
 
 	struct task_struct *t = bpf_get_current_task_btf();
-	if (!t) return 0;  /* M-7: F26 null guard */
+	if (!t) return 0;  /* null guard */
 	struct file *f = BPF_CORE_READ(bprm, file);
 	struct file_id exec_id = {};
 
@@ -465,11 +463,11 @@ int BPF_PROG(ao_bprm, struct linux_binprm *bprm, int ret)
 
 /*
  * task_alloc: copy both marker maps to child on fork.
- * Reuses exact G6 Outcome B pattern from strict-launch-marker/bpf/slm.bpf.c,
+ * Reuses the same fork-marker-copy pattern as the strict-launch hooks,
  * proven on Ubuntu 26.04 (kernel 7.0).
  *
  * All clones including threads get their own current_actor_markers copy
- * (HIGH-5 fix: BPF_CORE_READ of group_leader yields a scalar that the
+ * (BPF_CORE_READ of group_leader yields a scalar that the
  * verifier rejects as bpf_task_storage_get key; per-thread copy is correct).
  * lineage_markers is copied for all clones.
  */
@@ -569,7 +567,7 @@ int BPF_PROG(ao_file_open, struct file *file, int ret)
 		if (flags & O_TRUNC)
 			op_class = AO_OP_OPEN_TRUNC;
 		else if ((flags & O_ACCMODE) == O_RDWR)
-			op_class = AO_OP_OPEN_RW;  /* M-10: distinguish O_RDWR */
+			op_class = AO_OP_OPEN_RW;  /* distinguish O_RDWR */
 		else
 			op_class = AO_OP_OPEN_W;
 	} else {
