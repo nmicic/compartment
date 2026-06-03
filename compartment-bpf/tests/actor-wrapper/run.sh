@@ -57,6 +57,12 @@ PVM_BIN="$BUILD_DIR/pvm_writev_attempter"
 FD_BIN="$BUILD_DIR/fd_probe"
 ENV_BIN="$BUILD_DIR/env_probe"
 NOOP_BIN="$BUILD_DIR/noop"
+# Dynamic (non-static, regular-file) target for the LD_PRELOAD tests.
+# /usr/bin/env is a symlink on usrmerge/uutils distros, which the wrapper
+# correctly refuses — so it can't serve as the wrapped preload target.
+# A dynamically-linked noop keeps ld.so in play (so LD_PRELOAD is honoured)
+# while being a regular file the wrapper accepts.
+DYN_NOOP_BIN="$BUILD_DIR/dyn_noop"
 
 "$CC" -Wall -Wextra -O2 -static \
     -o "$WRAP_STATIC" "$REPO_ROOT/tools/compartment-actor-wrapper.c" \
@@ -84,6 +90,12 @@ for src in ptrace_attempter pvm_writev_attempter fd_probe env_probe noop; do
     [ -x "$out" ] || { nok "build $src"; exit 2; }
 done
 ok "build fixtures (static)"
+
+# Dynamic noop (NOT -static) so ld.so processes LD_PRELOAD in the target.
+"$CC" -Wall -Wextra -O2 -o "$DYN_NOOP_BIN" \
+    "$REPO_ROOT/tests/actor-wrapper/fixtures/noop.c" 2>&1 | tee -a "$LOG"
+[ -x "$DYN_NOOP_BIN" ] || { nok "build dyn_noop"; exit 2; }
+ok "build dyn_noop (dynamic)"
 
 ###############################################################################
 section "T8 — static link defeats LD_PRELOAD against the wrapper itself"
@@ -115,31 +127,51 @@ section "T1 — LD_PRELOAD scrubbed before target execve"
 # in the target (because env was scrubbed by the wrapper before execve).
 MARKER="$RESULTS_DIR/T1_target_marker.marker"
 
-# T1a: direct run (no wrapper) — for a glibc-dyn target, evil .so loads.
-# Use /usr/bin/env as the dynamic target so ld.so is in play.
+# Liveness gate. The env-scrub checks below are NEGATIVE assertions ("bad
+# var absent"). If the wrapper fails to exec the target it produces no
+# output, so every "absent" check passes vacuously — exactly how a
+# wrapper that had its execveat commented out once shipped reporting
+# 16/20 instead of all-fail. env_probe prints an "EXE <path>" line first
+# thing, so its presence proves the target actually ran. Call this before
+# any "absent" assertion on env_probe output.
+assert_target_ran() {
+    local out="$1" label="$2"
+    if ! grep -q '^EXE ' "$out"; then
+        nok "$label: target did NOT execute (no EXE marker) — wrapper dead; 'absent' would be a vacuous pass"
+        return 1
+    fi
+    return 0
+}
+
+# T1a: direct run (no wrapper) — for a dynamic target, evil .so loads.
+# Use the dynamic noop so ld.so is in play (and it is a regular file, not
+# a symlink like /usr/bin/env, so T1b's wrapper does not refuse it).
 rm -f "$MARKER"
-EVIL_MARKER="$MARKER" LD_PRELOAD="$EVIL_SO" /usr/bin/env >/dev/null 2>>"$LOG" || true
+EVIL_MARKER="$MARKER" LD_PRELOAD="$EVIL_SO" "$DYN_NOOP_BIN" >/dev/null 2>>"$LOG" || true
 if [ -f "$MARKER" ]; then
-    ok "T1a direct: LD_PRELOAD loaded evil_preload into /usr/bin/env (expected)"
+    ok "T1a direct: LD_PRELOAD loaded evil_preload into dyn target (expected)"
 else
-    nok "T1a direct: no marker (env may be hardened by glibc secure-exec heuristics)"
+    nok "T1a direct: no marker (dynamic target did not load LD_PRELOAD)"
 fi
 
 # T1b: wrapped — wrapper static, evil .so must NOT load in target.
 rm -f "$MARKER"
 EVIL_MARKER="$MARKER" LD_PRELOAD="$EVIL_SO" "$WRAP_STATIC" \
-    --actor t1 -- /usr/bin/env >/dev/null 2>>"$LOG" || true
-if [ -f "$MARKER" ]; then
+    --actor t1 -- "$DYN_NOOP_BIN" >/dev/null 2>>"$LOG"; t1b_rc=$?
+if [ "$t1b_rc" -ne 0 ]; then
+    nok "T1b wrapped: target did NOT run (rc=$t1b_rc) — wrapper dead; 'scrubbed' would be a vacuous pass"
+elif [ -f "$MARKER" ]; then
     nok "T1b wrapped: evil_preload still loaded — env not scrubbed"
 else
-    ok "T1b wrapped: evil_preload absent (LD_PRELOAD scrubbed)"
+    ok "T1b wrapped: evil_preload absent (LD_PRELOAD scrubbed; target ran rc=0)"
 fi
 
 # T1c: positive cross-check — env_probe sees no LD_PRELOAD line.
 out="$RESULTS_DIR/T1c_env.txt"
 EVIL_MARKER=/dev/null LD_PRELOAD="$EVIL_SO" "$WRAP_STATIC" \
     --actor t1c -- "$ENV_BIN" >"$out" 2>>"$LOG" || true
-if grep -q '^ENV LD_PRELOAD=' "$out"; then
+if ! assert_target_ran "$out" "T1c"; then :
+elif grep -q '^ENV LD_PRELOAD=' "$out"; then
     nok "T1c env_probe sees LD_PRELOAD (scrub broken)"
 else
     ok "T1c env_probe: LD_PRELOAD absent in target env"
@@ -150,7 +182,8 @@ section "T2 — LD_AUDIT scrubbed"
 ###############################################################################
 out="$RESULTS_DIR/T2_env.txt"
 LD_AUDIT="$EVIL_SO" "$WRAP_STATIC" --actor t2 -- "$ENV_BIN" >"$out" 2>>"$LOG" || true
-if grep -q '^ENV LD_AUDIT=' "$out"; then nok "T2 LD_AUDIT survived"; else ok "T2 LD_AUDIT scrubbed"; fi
+if ! assert_target_ran "$out" "T2"; then :
+elif grep -q '^ENV LD_AUDIT=' "$out"; then nok "T2 LD_AUDIT survived"; else ok "T2 LD_AUDIT scrubbed"; fi
 
 ###############################################################################
 section "T3 — GLIBC_TUNABLES / GCONV_PATH scrubbed"
@@ -158,7 +191,8 @@ section "T3 — GLIBC_TUNABLES / GCONV_PATH scrubbed"
 out="$RESULTS_DIR/T3_env.txt"
 GLIBC_TUNABLES="x=y" GCONV_PATH="/tmp" "$WRAP_STATIC" --actor t3 -- "$ENV_BIN" \
     >"$out" 2>>"$LOG" || true
-if grep -qE '^ENV (GLIBC_TUNABLES|GCONV_PATH)=' "$out"; then
+if ! assert_target_ran "$out" "T3"; then :
+elif grep -qE '^ENV (GLIBC_TUNABLES|GCONV_PATH)=' "$out"; then
     nok "T3 GLIBC_TUNABLES/GCONV_PATH survived"
 else
     ok "T3 GLIBC_TUNABLES + GCONV_PATH scrubbed"
