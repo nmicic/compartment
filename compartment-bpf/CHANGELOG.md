@@ -3,6 +3,26 @@
 All notable changes to compartment-bpf are documented here.
 Format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.7.1] — 2026-05-19
+
+Patch release (no ABI change; `0x0007` unchanged). Fixes surfaced by an
+external review and a full end-to-end VM run of the public tree.
+
+- **Security (loader):** close a `--pin` over an already-pinned tree that
+  left the live tree without its Argon2id unpin sentinel, downgrading the
+  next `--unpin` to the no-passphrase path. A new up-front + under-lock
+  stale-pin check refuses re-pin before any side effect.
+- **Fix (actor-wrapper):** restore a dropped `*/` that had commented out
+  the wrapper's entire exec + hardening sequence (env scrub, seccomp,
+  fd-close, `execveat`), leaving it non-functional.
+- **Tests:** add a liveness gate so a non-functional wrapper fails loudly
+  instead of passing negative assertions vacuously; vendor the
+  strict-launch fixtures so that suite runs (15 witnesses) instead of
+  skipping; re-point parser/bypass/pin-regression checks at the current
+  loader diagnostics.
+- **Hygiene:** finish removing internal tracking tags from comments,
+  messages, the demo config, and dev-box paths.
+
 ## [v0.7] — 2026-05-18
 
 ### ABI bump 0x0006 → 0x0007
