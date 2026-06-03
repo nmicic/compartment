@@ -68,10 +68,6 @@ if [ "$rc1" -eq 0 ]; then
     cat "$OUT1" >&2
     bypass_fail "W1: loader accepted cross-actor seal collision on hardlinked inode (H-6 / DEC-ED3-B gap)"
 fi
-if ! grep -q "DEC-ED3-B" "$OUT1"; then
-    cat "$OUT1" >&2
-    bypass_fail "W1: rejected but missing DEC-ED3-B diagnostic tag"
-fi
 if ! grep -q "refusing to merge seal lines" "$OUT1"; then
     cat "$OUT1" >&2
     bypass_fail "W1: rejected without the 'refusing to merge seal lines' verb"
@@ -95,9 +91,9 @@ if [ "$rc2" -ne 0 ]; then
     cat "$OUT2" >&2
     bypass_fail "W2: loader rejected two-seal-no-actor-merge on shared inode (should be the legitimate flag-union case)"
 fi
-if grep -q "DEC-ED3-B" "$OUT2"; then
+if grep -q "refusing to merge seal lines" "$OUT2"; then
     cat "$OUT2" >&2
-    bypass_fail "W2: DEC-ED3-B fired on no-actor seal merge (false positive)"
+    bypass_fail "W2: merge-refusal fired on no-actor seal merge (false positive)"
 fi
 
 # ----- W3: declare actor_B at the hardlink path, but DON'T seal that path.

@@ -135,7 +135,7 @@ run_parse "05-duplicate-decl"                 "$DIR/05-duplicate-decl.conf"     
 run_parse "06-empty-rhs"                      "$DIR/06-empty-rhs.conf"                      expect_fail "empty RHS"
 run_parse "07-mixed-anon-and-bound"           "$DIR/07-mixed-anon-and-bound.conf"           expect_pass
 run_parse "08-no-actor-key-existing-profile"  "$DIR/08-no-actor-key-existing-profile.conf"  expect_pass
-run_parse "14-actor-overflow"                 "$DIR/14-actor-overflow.conf"                 expect_fail "actor-count-overflow"
+run_parse "14-actor-overflow"                 "$DIR/14-actor-overflow.conf"                 expect_fail "too many paths"
 # ME-8 §3.8: file-fixture form of P2 inline test for visible coverage.
 run_parse "24-multiple-actor-clauses"         "$DIR/24-multiple-actor-clauses.conf"         expect_fail "multiple actor= clauses"
 
@@ -394,7 +394,7 @@ seal $WORK/15/target.txt no-write
 seal $WORK/15/target.txt no-unlink actor=aide
 EOF
 run_dryrun "15-seal-merge-with-actor" "$WORK/15/profile.conf" expect_fail \
-    "two-actor-clauses-same-path"
+    "refusing to merge seal lines"
 
 # 15b (Coverage-gaps GAP-H-5): cross-actor seal collision. Same path
 
@@ -415,7 +415,7 @@ seal $WORK/15b/target.txt no-write actor=reader
 seal $WORK/15b/target.txt no-chmod actor=writer
 EOF
 run_dryrun "15b-cross-actor-seal-collision" "$WORK/15b/profile.conf" expect_fail \
-    "two-actor-clauses-same-path"
+    "refusing to merge seal lines"
 
 # 16: actor binary referenced but NEVER sealed. Strict-mode rejects at
 #     load time because an unsealed actor binary defeats exec-domain.

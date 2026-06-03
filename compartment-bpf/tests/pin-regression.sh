@@ -447,11 +447,11 @@ test_t45()
 		>"${RESULTS}/t45-loader.log" 2>&1 || rc=$?
 	"${BIN}" --unpin >/dev/null 2>&1 || true
 	if [ "${rc}" -ne 0 ] && \
-	   grep -q "Sec-11/F19" "${RESULTS}/t45-loader.log"; then
-		record T4.5 PASS "loader refused fake-shape pin with Sec-11/F19 diagnostic"
+	   grep -q "pin-shape: refusing to start" "${RESULTS}/t45-loader.log"; then
+		record T4.5 PASS "loader refused fake-shape pin with pin-shape diagnostic"
 		return 0
 	fi
-	record T4.5 FAIL "loader rc=${rc}; expected nonzero with Sec-11/F19 diagnostic"
+	record T4.5 FAIL "loader rc=${rc}; expected nonzero with pin-shape diagnostic"
 	return 1
 }
 

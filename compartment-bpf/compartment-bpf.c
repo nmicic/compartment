@@ -70,7 +70,7 @@ static int pin_window_aborted(const char *site)
 		return 0;
 	fprintf(stderr,
 		"%s: SIGTERM/SIGINT received during --pin window; "
-		"rolling back partial pin state and exiting (Sec-13/F27).\n",
+		"rolling back partial pin state and exiting.\n",
 		site);
 	return 1;
 }
@@ -2240,7 +2240,7 @@ static int load_conf(struct compartment_bpf *skel, const char *path,
 				"%d: line too long (truncated at %zu bytes by fgets — "
 				"the parser hard-rejects this rather than auto-grow the "
 				"buffer; split the directive across multiple lines or "
-				"shorten paths; Sec-8/F13)\n",
+				"shorten paths)\n",
 				line_no, sizeof(line) - 1);
 			errs++;
 			// Also check ferror during the flush drain so an
@@ -3447,7 +3447,7 @@ static int check_one_pinned_seal_shape(const char *path)
 			"value=%zu = sizeof(struct seal_value)). This usually "
 			"means a v0 deployment left a pinned __u32-valued seal "
 			"map under PIN_ROOT. Unpin it explicitly (compartment-"
-			"bpf --unpin %s) and retry. Sec-11/F19 fail-closed.\n",
+			"bpf --unpin %s) and retry. Fail-closed.\n",
 			path, info.key_size, info.value_size,
 			sizeof(struct inode_key),
 			sizeof(struct seal_value), path);
