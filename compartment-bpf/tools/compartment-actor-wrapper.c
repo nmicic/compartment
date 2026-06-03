@@ -593,6 +593,7 @@ int main(int argc, char **argv) {
      * resolves the new image from the held inode, not from any path
      * lookup. Option B (baked TARGET_PATH + sealed actor binary) is
      * the primary defender; this is belt-and-braces for Option A.
+     */
 
     close_inherited_fds();
 
