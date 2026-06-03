@@ -36,27 +36,35 @@ grep -qw bpf /sys/kernel/security/lsm || {
     exit 77
 }
 
-SPIKE_DIR="experimental/strict-launch-marker"
-LAUNCHER="$SPIKE_DIR/build/slm-launcher"
-ACTOR="$SPIKE_DIR/build/slm-actor"
-FOREIGN="$SPIKE_DIR/build/slm-foreign"
-
-# Build the spike artifacts if missing — they are the strict-launch
-# fixtures (static launcher + dynamic-link test actor + foreign helper).
-# Review-1 HIGH-2 (2026-05-15): also gate on slm-foreign so the SL-5
-# foreign-helper chain-break witness has its fixture available.
-if [ ! -x "$LAUNCHER" ] || [ ! -x "$ACTOR" ] || [ ! -x "$FOREIGN" ]; then
-    if [ -x "$SPIKE_DIR/scripts/build_on_vm.sh" ]; then
-        echo "[strict-launch] building spike fixtures …"
-        ( cd "$SPIKE_DIR" && bash scripts/build_on_vm.sh ) >/tmp/slm-build.log 2>&1 || {
-            echo "[strict-launch] SKIP (spike build failed; see /tmp/slm-build.log)"
-            exit 77
-        }
-    else
-        echo "[strict-launch] SKIP (spike fixtures not built and no builder)"
-        exit 77
-    fi
+# Strict-launch fixtures are vendored under tests/strict-launch/fixtures/
+# and built here — self-contained, no external dir needed:
+#   slm-actor    : the strict-launch actor target (static)
+#   slm-foreign  : foreign-exec helper for the foreign-exec chain-break
+#                  witness (static, distinct inode)
+#   slm-launcher : a generated actor-wrapper (tools/compartment-actor-wrapper.c)
+#                  with TARGET_PATH baked to slm-actor; static so
+#                  strict_validate_launchers accepts it.
+if ! command -v gcc >/dev/null 2>&1; then
+    echo "[strict-launch] SKIP (no gcc to build fixtures)"
+    exit 77
 fi
+SLM_BUILD=$(mktemp -d /tmp/slm-fix.XXXXXX) || exit 2
+LAUNCHER="$SLM_BUILD/slm-launcher"
+ACTOR="$SLM_BUILD/slm-actor"
+FOREIGN="$SLM_BUILD/slm-foreign"
+FIX_DIR="tests/strict-launch/fixtures"
+{
+    gcc -O2 -Wall -static "$FIX_DIR/slm-actor.c"   -o "$ACTOR"   &&
+    gcc -O2 -Wall -static "$FIX_DIR/slm-foreign.c" -o "$FOREIGN" &&
+    gcc -O2 -Wall -static -DWRAPPER_GENERATED \
+        -DTARGET_PATH="\"$ACTOR\"" -DACTOR_NAME="\"slm-actor\"" \
+        tools/compartment-actor-wrapper.c -o "$LAUNCHER"
+} 2>"$SLM_BUILD/build.log" || {
+    echo "[strict-launch] SKIP (fixture build failed; see below)"
+    cat "$SLM_BUILD/build.log" >&2
+    rm -rf "$SLM_BUILD"
+    exit 77
+}
 
 # ------- fixture setup -------
 
@@ -64,7 +72,7 @@ TS=$(date -u +%Y%m%dT%H%M%SZ)
 TMP=$(mktemp -d /tmp/slm-test.XXXXXX) || exit 2
 RESULTS=tests/results/strict-launch-${TS}
 mkdir -p "$RESULTS"
-trap 'rm -rf "$TMP"; pkill -P $$ 2>/dev/null || true' EXIT
+trap 'rm -rf "$TMP" "$SLM_BUILD"; pkill -P $$ 2>/dev/null || true' EXIT
 
 LAUNCHER_ABS=$(readlink -f "$LAUNCHER")
 ACTOR_ABS=$(readlink -f "$ACTOR")
