@@ -3007,6 +3007,41 @@ static const char *const KNOWN_LINK_NAMES[] = {
 static const size_t N_KNOWN_LINK_NAMES =
 	sizeof(KNOWN_LINK_NAMES) / sizeof(KNOWN_LINK_NAMES[0]);
 
+// Detect an already-pinned tree. Returns 1 if any known link pin exists
+// under <PIN_ROOT>/links, 0 if none is present.
+//
+// This gates re-pinning over a live tree. Without it, a second --pin
+// attaches a fresh skel, then writes (or, in the no-passphrase case,
+// clobbers on rollback) the unpin-auth sentinel BEFORE pin_links() fails
+// EEXIST against the still-present old pins — and the EEXIST rollback
+// path calls ed11_unpin_sentinel_unlink(). Net effect: the live,
+// previously-pinned tree is left with no sentinel, so the next --unpin
+// takes the legacy (no-passphrase) path and tears down enforcement with
+// no auth. Refusing up front, before any side effect, closes that
+// downgrade and matches the documented "reject a new --pin if stale
+// pins exist" contract.
+//
+// Fail-closed: a bpf_obj_get() error other than ENOENT means we cannot
+// prove the pin is absent, so we report existence and let the caller
+// refuse rather than risk clobbering a sentinel we could not inspect.
+static int pin_tree_exists(void)
+{
+	for (size_t i = 0; i < N_KNOWN_LINK_NAMES; i++) {
+		char path[PATH_MAX];
+		if (snprintf(path, sizeof(path), PIN_ROOT "/links/%s",
+			     KNOWN_LINK_NAMES[i]) >= (int)sizeof(path))
+			continue;
+		int fd = bpf_obj_get(path);
+		if (fd >= 0) {
+			close(fd);
+			return 1;
+		}
+		if (errno != ENOENT)
+			return 1;
+	}
+	return 0;
+}
+
 // PIN_ROOT/maps is populated by V-4b for the two deny/audit-drop counter
 // maps when --pin is set with a profile. The seal maps (sealed_inodes,
 // sealed_dirs) and audit_rb are still NOT pinned in v0 but their names
@@ -4561,6 +4596,21 @@ int main(int argc, char **argv)
 			sz);
 	}
 
+	// If --pin is requested and a tree is already pinned, refuse up
+	// front — before load, attach, or any sentinel write — so we never
+	// reach the EEXIST rollback that would clobber the existing tree's
+	// unpin-auth sentinel (see pin_tree_exists()). Operator must --unpin
+	// first. This early check is advisory (the pin lifecycle lock is not
+	// held yet); the authoritative re-check runs under the lock below.
+	if (pin && pin_tree_exists()) {
+		fprintf(stderr,
+			"--pin: a pinned tree already exists at " PIN_ROOT
+			"/links; run --unpin first. Refusing to re-pin "
+			"(fail-closed; preserves the existing unpin auth gate).\n");
+		compartment_bpf__destroy(skel);
+		return 1;
+	}
+
 	if (compartment_bpf__load(skel) < 0) {
 		fprintf(stderr, "load BPF: %s\n", strerror(errno));
 		compartment_bpf__destroy(skel);
@@ -4655,7 +4705,23 @@ int main(int argc, char **argv)
 			compartment_bpf__destroy(skel);
 			return 1;
 		}
-		// R2-M20 (Review-2 MEDIUM): write the sentinel BEFORE the
+		// Authoritative stale-pin re-check, now that we hold the pin
+		// lifecycle lock. The pre-load check above is advisory (lock
+		// not yet held); a concurrent --pin could have created the
+		// tree in the race window. Refuse here BEFORE the sentinel
+		// write so we never reach the EEXIST rollback that unlinks the
+		// sentinel and downgrades the existing tree's unpin auth.
+		if (pin_tree_exists()) {
+			fprintf(stderr,
+				"--pin: a pinned tree appeared under " PIN_ROOT
+				"/links while acquiring the pin lock; run "
+				"--unpin first. Refusing fail-closed.\n");
+			pin_lifecycle_unlock(pin_lock_fd);
+			ring_buffer__free(rb);
+			compartment_bpf__destroy(skel);
+			return 1;
+		}
+		// Write the sentinel BEFORE the
 		// pin tree. Pre-this, the order was attach → pin_links →
 		// pin_counter_maps → ed11_pin_maybe_write_sentinel; a
 		// SIGKILL between pin_counter_maps and the sentinel write

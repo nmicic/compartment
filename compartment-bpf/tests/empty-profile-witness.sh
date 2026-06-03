@@ -17,7 +17,7 @@
 #   3. Empty profile, --allow-empty  -> daemon REACHES live (prior behavior)
 set -u
 
-REPO=${REPO:-/root/compartment-bpf-fixes}
+REPO=${REPO:-/root/compartment-bpf}
 DAEMON="$REPO/compartment-bpf"
 
 [ "$(id -u)" -eq 0 ] || { echo "SKIP empty-profile-witness: needs root" >&2; exit 77; }

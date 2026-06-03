@@ -4,7 +4,7 @@
 // and AO-3 (filesystem event aggregation).
 //
 // Production port from experimental/actor-fs-observe/bpf/observe.bpf.c.
-// Feasibility verdict: SHIP (AO-2 5/5 + AO-3 10/10 on Resolute 7.0).
+// Feasibility verdict: SHIP (AO-2 5/5 + AO-3 10/10 on Ubuntu 26.04 (kernel 7.0)).
 // SPEC: experimental/ACTOR-FS-OBSERVE-SPEC.md
 //
 // AO-6 (global compact mode) and AO-7 (deny-first bridge) are deferred.
@@ -466,7 +466,7 @@ int BPF_PROG(ao_bprm, struct linux_binprm *bprm, int ret)
 /*
  * task_alloc: copy both marker maps to child on fork.
  * Reuses exact G6 Outcome B pattern from strict-launch-marker/bpf/slm.bpf.c,
- * proven on Resolute 7.0.
+ * proven on Ubuntu 26.04 (kernel 7.0).
  *
  * All clones including threads get their own current_actor_markers copy
  * (HIGH-5 fix: BPF_CORE_READ of group_leader yields a scalar that the

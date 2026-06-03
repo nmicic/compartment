@@ -17,7 +17,7 @@
 VM_HOST=${VM_HOST:-192.168.122.253}
 VM_USER=${VM_USER:-root}
 SSH_OPTS=${SSH_OPTS:-"-o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10"}
-VM_WORKDIR=${VM_WORKDIR:-/root/compartment_ebpf-tests}
+VM_WORKDIR=${VM_WORKDIR:-/root/compartment-bpf}
 SEALPROBE=${SEALPROBE:-./tests/sealprobe}
 
 # Map sealprobe exit codes back to symbolic names so harness output is

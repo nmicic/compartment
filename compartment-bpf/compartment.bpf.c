@@ -267,7 +267,7 @@ struct {
 // to match the spike's witness ordering + the SPEC-allowed per-hook
 // granularity. `ptrace_access_denied_total` covers comp_ptrace_access_check
 // (strace, process_vm_writev, pidfd_getfd, /proc/<pid>/mem all route
-// through security_ptrace_access_check on Resolute 7.0 — G9 4-vector).
+// through security_ptrace_access_check on Ubuntu 26.04 (kernel 7.0) — G9 4-vector).
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
@@ -1068,7 +1068,7 @@ int BPF_PROG(comp_inode_unlink, struct inode *dir, struct dentry *dentry, int re
 // the rename hook obviously matching SPEC §6.3), so it needs a
 // `clang -fsyntax-only -target bpf` round-trip on a clang+libbpf host
 // before landing. Defer to the compartment-vng matrix host or another
-// clang-capable build host; this Resolute host lacks clang.
+// clang-capable build host; the local build host may lack clang.
 SEC("lsm/inode_rename")
 int BPF_PROG(comp_inode_rename,
              struct inode *old_dir, struct dentry *old_dentry,
@@ -1556,7 +1556,7 @@ int BPF_PROG(comp_bprm_check_security, struct linux_binprm *bprm, int ret)
 // G6 Outcome (B): copy parent marker to child on fork/clone so a
 // fork-without-exec actor (postgres-prefork style; AIDE fork-write
 // witness SL-4) keeps actor identity. SPEC §8 G6 alternative for
-// kernels without BPF_F_INHERIT_TASK_STORAGE (Resolute 7.0 has none —
+// kernels without BPF_F_INHERIT_TASK_STORAGE (Ubuntu 26.04 (kernel 7.0) has none —
 // verified by `grep -ni 'inherit' /usr/include/linux/bpf.h`).
 SEC("lsm/task_alloc")
 int BPF_PROG(comp_task_alloc, struct task_struct *task, u64 clone_flags, int ret)
@@ -1648,7 +1648,7 @@ int BPF_PROG(comp_task_prctl, int option, unsigned long arg2,
 // §6.3 ptrace_access_check — deny ptrace targeting a marked strict
 // actor task. Covers strace, process_vm_writev, pidfd_getfd,
 // /proc/<pid>/mem read (all route through security_ptrace_access_check
-// on Resolute 7.0; G9 4-vector witness confirmed 2026-05-15).
+// on Ubuntu 26.04 (kernel 7.0); G9 4-vector witness confirmed 2026-05-15).
 SEC("lsm/ptrace_access_check")
 int BPF_PROG(comp_ptrace_access_check, struct task_struct *child,
              unsigned int mode, int ret)

@@ -11,7 +11,7 @@
 # in, runs each script, and aggregates results.
 
 # Caller must have set REPO before sourcing.
-: "${REPO:=/root/compartment_ebpf-tests}"
+: "${REPO:=/root/compartment-bpf}"
 SEALPROBE="$REPO/tests/sealprobe"
 DAEMON="$REPO/compartment-bpf"
 

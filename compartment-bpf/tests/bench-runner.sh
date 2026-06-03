@@ -44,7 +44,7 @@ set -u
 
 MODE=${MODE:-B}
 
-REPO=${REPO:-/root/compartment_ebpf-tests}
+REPO=${REPO:-/root/compartment-bpf}
 SEALPROBE="$REPO/tests/sealprobe"
 DAEMON="$REPO/compartment-bpf"
 KERNEL=$(uname -r)

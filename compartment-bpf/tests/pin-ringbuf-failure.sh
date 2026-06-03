@@ -16,7 +16,7 @@
 #   2. /sys/fs/bpf/compartment/links/ is empty (or absent)
 set -u
 
-REPO=${REPO:-/root/compartment-bpf-fixes}
+REPO=${REPO:-/root/compartment-bpf}
 DAEMON="$REPO/compartment-bpf"
 PIN_ROOT=/sys/fs/bpf/compartment
 

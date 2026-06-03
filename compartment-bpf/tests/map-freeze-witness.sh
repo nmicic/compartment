@@ -15,7 +15,7 @@
 # assert it fails with EPERM. Repeat for both maps.
 set -u
 
-REPO=${REPO:-/root/compartment-bpf-fixes}
+REPO=${REPO:-/root/compartment-bpf}
 DAEMON="$REPO/compartment-bpf"
 
 [ "$(id -u)" -eq 0 ] || { echo "SKIP map-freeze-witness: needs root" >&2; exit 77; }

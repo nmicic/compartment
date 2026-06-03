@@ -13,11 +13,11 @@
 # Expected post-fix: open-write DENY *and* unlink DENY.
 # Pre-fix: open-write would ALLOW (no-write dropped), unlink DENY.
 #
-# Runs on the VM. Defaults to VM workdir /root/compartment-bpf-fixes;
+# Runs on the VM. Defaults to VM workdir /root/compartment-bpf;
 # override with REPO=/elsewhere.
 set -u
 
-REPO=${REPO:-/root/compartment-bpf-fixes}
+REPO=${REPO:-/root/compartment-bpf}
 DAEMON="$REPO/compartment-bpf"
 SEALPROBE="$REPO/tests/sealprobe"
 

@@ -13,7 +13,7 @@
 
 set -u
 
-REPO=${REPO:-/root/compartment_ebpf-tests}
+REPO=${REPO:-/root/compartment-bpf}
 DAEMON="$REPO/compartment-bpf"
 ORACLE="$REPO/tests/fuzz_oracle"
 N_FILES=${N_FILES:-200}

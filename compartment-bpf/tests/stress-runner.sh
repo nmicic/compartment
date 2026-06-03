@@ -9,7 +9,7 @@
 # Suggestion ID: 4.5h, 1.4, 3.8d, 5.3.
 set -u
 
-REPO=${REPO:-/root/compartment_ebpf-tests}
+REPO=${REPO:-/root/compartment-bpf}
 SEALPROBE="$REPO/tests/sealprobe"
 DAEMON="$REPO/compartment-bpf"
 DURATION=${DURATION:-60}
