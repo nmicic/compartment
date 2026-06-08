@@ -1305,11 +1305,18 @@ int BPF_PROG(comp_file_truncate, struct file *file, int ret)
 	return deny_file_write(file, &cid);
 }
 
-SEC("lsm/inode_setattr")
-int BPF_PROG(comp_inode_setattr, struct mnt_idmap *idmap,
-	     struct dentry *dentry, struct iattr *attr, int ret)
+// The inode_setattr LSM hook signature differs across kernels: 7.0+ prepends a
+// `struct mnt_idmap *idmap` argument (BTF func-proto vlen=3), while pre-7.0
+// kernels (e.g. Ubuntu Noble, 6.8) have only (dentry, attr) (vlen=2). idmap is
+// not used by our policy, so the decision logic lives in one inlined body and
+// we expose TWO SEC("lsm/inode_setattr") entry wrappers below — a 3-arg
+// (modern) and a 2-arg (legacy) form. The userspace loader autoload-gates the
+// one matching the running kernel's BTF before load (see
+// select_inode_setattr_variant() in compartment-bpf.c); the non-matching
+// wrapper is never loaded, so the verifier never sees a bad ctx access.
+static __always_inline int
+comp_inode_setattr_impl(struct dentry *dentry, struct iattr *attr, int ret)
 {
-	(void)idmap;
 	if (ret != 0)
 		return ret;
 
@@ -1368,6 +1375,23 @@ int BPF_PROG(comp_inode_setattr, struct mnt_idmap *idmap,
 	}
 
 	return 0;
+}
+
+// Modern (kernel 7.0+) inode_setattr: (idmap, dentry, attr).
+SEC("lsm/inode_setattr")
+int BPF_PROG(comp_inode_setattr, struct mnt_idmap *idmap,
+	     struct dentry *dentry, struct iattr *attr, int ret)
+{
+	(void)idmap;
+	return comp_inode_setattr_impl(dentry, attr, ret);
+}
+
+// Legacy (pre-7.0, e.g. 6.8) inode_setattr: (dentry, attr), no mnt_idmap.
+SEC("lsm/inode_setattr")
+int BPF_PROG(comp_inode_setattr_legacy, struct dentry *dentry,
+	     struct iattr *attr, int ret)
+{
+	return comp_inode_setattr_impl(dentry, attr, ret);
 }
 
 SEC("lsm/mmap_file")

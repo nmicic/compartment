@@ -134,7 +134,7 @@ syntax.)
 | **Recursive subtree ancestor-walk depth cap** (v0.6+, default `COMPARTMENT_MAX_DIR_ANCESTORS=8`) | The BPF ancestor walk is an unrolled loop bounded at compile time. Each increment adds ~300 B of xlated code per hook; 64 levels caused ~2.5 s BPF load time on Resolute 7.0 (21 KB xlated per hook). The default cap is **8** levels, but custom deployments may rebuild with a larger value. To avoid a silent runtime bypass, the loader now **refuses recursive directory seals** when the live subtree already exceeds the compiled budget: any descendant directory at depth `>= cap`, or any non-directory descendant deeper than `cap`, aborts attach. After attach, the kernel denies `mkdir`, symlink/hardlink creation, non-directory rename-import, and directory rename operations that would violate the compiled recursive-subtree invariants. In particular, directory imports from outside the covering sealed subtree, and same-seal directory deepening renames, fail closed because the BPF hook cannot prove descendant depth portably in-hook across filesystems. | Keep sealed subtrees within the compiled depth budget, split deep layouts into intermediate `seal` rules, or rebuild with a larger `COMPARTMENT_MAX_DIR_ANCESTORS` (for example `make COMPARTMENT_MAX_DIR_ANCESTORS=32`). If an actor must reorganize a large subtree, move files directly or stage changes outside the sealed tree before attach; deepening/importing directories under a live recursive seal is intentionally conservative. v1.x scope: bounded-loop improvements upstream may make larger caps cheaper without linear verifier/load-time cost. |
 | **Loader depth-check to attach race window** (v0.7, P2-9) | `validate_recursive_dir_seal` (the `nftw` callback in `compartment-bpf.c`) walks the sealed subtree and rejects descendants past `COMPARTMENT_MAX_DIR_ANCESTORS` before the BPF programs are attached. A concurrent writer with `mkdir`/`rename` access to the subtree could grow the tree past the cap during the validation→attach window before enforcement goes live, then the runtime walk would silently truncate at the cap (the kernel-side loop has no way to know it didn't reach the seal). The window itself is not closed; commit `b265aef` (runtime recursive subtree growth guard) only closes the **post-attach** widening path via `mkdir`/`rename` denies. | Treat the validation→attach window as a narrow race; serialize policy load with quiescent subtree state in operational workflows (e.g. mount target dir read-only during load, or fence privileged writers under `--pin` for the millisecond-scale window). `bpf_map_freeze` after attach does not help (the race is on the FS, not the map). v1.x scope: pin the subtree shape into a hash-keyed map at validation time and gate runtime denies on a subtree-version mismatch. |
 | **Mount-inside-sealed-subtree bypass** (v0.6) | After policy load, a process with `CAP_SYS_ADMIN` may mount a filesystem whose mountpoint is inside a sealed subtree. The BPF ancestor walk (`d_parent`) is bounded to a single superblock; writes to the nested mount follow the nested FS's dentry tree and never encounter the sealed parent inode. The loader's `nftw(..., FTW_MOUNT)` prevents descending into *existing* nested mounts during validation, but does not guard against mounts created after policy load. | Use an `sb_mount`/`path_mount` deny policy at the OS level (e.g. mount namespaces, seccomp) to prevent new mounts inside sealed trees. A future release may add an LSM `sb_mount` hook. |
-| **In-place writes to files under a sealed directory** (R2-F5, updated v0.5) | **ABI v0.4 and earlier:** a directory seal blocks structural mutations (create/unlink/rename/link/mkdir/etc.) but does NOT block in-place writes to existing files inside the dir. **ABI v0.5 (dir-destination):** `ACTION_DENY_WRITE_PARENT_DIR` (action=9) additionally blocks writes, truncates, and write-mode opens of **immediate children** of a DD-sealed directory. Files at deeper levels (grandchildren and below) are NOT covered by the parent-dir seal — they are only blocked by their own direct inode seal. Concrete impact for `profiles/postgres.conf` with a v0.5 no-write DD seal on the data dir: direct heap files (`base/<oid>/<n>`) and WAL segments (`pg_wal/<seg>`) in the sealed dir root ARE write-denied for non-actors; files nested in subdirectories (e.g. `base/<oid>/`) are not. | v0.5: use `seal DIR no-write actor=NAME` for immediate-child write protection. Add per-file seals for any specific nested file that must freeze (e.g. PG_VERSION). v1.x scope: recursive-subtree-seal — single declaration covers every file under a subtree. |
+| **In-place writes to files under a sealed directory** (R2-F5, updated v0.6) | **ABI v0.4 and earlier:** a directory seal blocked structural mutations (create/unlink/rename/link/mkdir/etc.) but did NOT block in-place writes to existing files inside the dir. **ABI v0.5 (dir-destination):** `ACTION_DENY_WRITE_PARENT_DIR` (action=9) additionally blocked writes, truncates, and write-mode opens of **immediate children** of a DD-sealed directory only — grandchildren and deeper paths were not covered. **ABI v0.6+ (recursive subtree):** the enforcement hooks now walk ancestor dentries at runtime (`deny_dir_ancestor_action_from_dir_dentry`, bounded by `COMPARTMENT_MAX_DIR_ANCESTORS`, default 8), so a `no-write` / `no-chmod` directory seal covers the **entire subtree** up to the compiled depth cap, not just immediate children. Concrete impact for a no-write DD seal on the postgres data dir: heap files (`base/<oid>/<n>`), WAL segments (`pg_wal/<seg>`), and files nested in subdirectories are ALL write-denied for non-actors, provided they sit within `COMPARTMENT_MAX_DIR_ANCESTORS` levels of the sealed directory. The remaining limit is the depth cap, not the one-level boundary — see the `Recursive subtree ancestor-walk depth cap` row above. | Use `seal DIR no-write actor=NAME` for recursive subtree write protection. Keep sealed subtrees within the compiled depth budget, or rebuild with a larger `COMPARTMENT_MAX_DIR_ANCESTORS` (e.g. `make COMPARTMENT_MAX_DIR_ANCESTORS=32`). |
 | **btrfs / FUSE seal enforcement failure** | compartment-bpf v0 does NOT enforce seals on btrfs or FUSE filesystems. The BPF hook reads `inode->i_sb->s_dev` (real subvolume / FUSE-internal block dev) while userspace `stat` returns the anon_bdev — map lookup misses silently and every outsider write through a sealed btrfs/FUSE path receives ALLOW. **Bi-directional**: actor binaries on these filesystems also break (caller-id resolution sees real s_dev; userspace resolved anon_bdev → no match → silent DENY). v1 fix is BPF-side; v0 fix is the loader refuse below. | Keep all sealed paths and actor binaries on ext4 / xfs / tmpfs. Loader refuses btrfs and FUSE paths at `seal_path()` and `actor_resolve_paths()` via `anon_bdev_refuse()` (fail-closed). |
 | **overlayfs copy-up bypass** | A write through an overlay merged path triggers copy-up → kernel opens a NEW upper inode that is not in the seal map → `file_open` fires on the upper, not the sealed lower → outsider ALLOW. Wider: ANY writer can trigger the copy-up itself (the bypass is pre-modification). overlayfs also presents anon_bdev s_dev to userspace so the seal-load gate would miss the lower inode if it were on a merged mount. Requires CAP_SYS_ADMIN to mount the overlay. | Keep sealed files outside overlay mount targets (don't seal anything visible through `lowerdir`/`upperdir`); CAP_SYS_ADMIN is the defensive boundary against operator-attacker mounts. Loader refuses overlayfs paths at `seal_path()` / `actor_resolve_paths()` (fail-closed). |
 | **bind-mount-OVER sealed path** | `mount --bind /unsealed /sealed` of an unsealed source over a sealed-path destination redirects path lookups to the unsealed inode for any process that crosses the bind — seal bypassed without modifying the sealed inode itself. The sibling primitives `move_mount(2)` and `mount(MS_MOVE)` produce the same effect: an existing mount can be re-rooted on top of a sealed path with the same CAP_SYS_ADMIN gate. CAP_SYS_ADMIN required. The mesh §3.23 row witnesses the class on the existing host. | Drop CAP_SYS_ADMIN from actor; `systemd MountFlags=private` so each unit gets a private mount namespace; mount-namespace-private profiles on systemd ≥ v247. |
@@ -183,6 +183,52 @@ requires:
 
 Deploy grandparent protection for any directory whose continued sealed identity
 is security-load-bearing.
+
+## Inode-reuse stale-seal window in `--pin` daemonless mode (P1-1)
+
+Seals are keyed by `(dev, ino)`. A `no-write` seal still permits `unlink`
+(`no-write` != `no-unlink`), so a sealed file can be removed, its inode freed,
+and that inode number **reused** by an unrelated new file — which then inherits
+the stale `(dev, ino)` seal and receives a spurious deny. This is
+fail-**CLOSED** (an unexpected DENY on the new file, never a bypass), but it is
+a real correctness defect, reproduced on kernels whose inode allocator recycles
+immediately (e.g. Noble 6.8).
+
+The daemon mitigates this by holding one `O_PATH` fd per sealed inode for its
+**whole lifetime**, which pins each inode struct so the kernel cannot reuse its
+number. **This closes the window ONLY in daemon-resident mode.** In `--pin`
+persistent (daemonless) mode the pinned enforcement survives process exit while
+the held fds die with the process, so the reuse window **re-opens** for a
+pinned-but-daemonless tree — the exact persistence mode the README describes.
+
+* **Mitigation today (policy):** pair `no-write` with `no-unlink` on any file
+  that must not be replaced. With `no-unlink` the sealed inode can never be
+  freed, so its number can never be recycled and the window is inert by policy.
+* **Follow-up (tracked):** nlink-aware seal eviction when an inode is actually
+  freed. The eviction **must** be nlink-aware — dropping a seal while a
+  hardlink to the inode still exists would be fail-**OPEN**. It is deferred
+  precisely because a naive implementation trades a fail-closed defect for a
+  fail-open one.
+
+## Filesystem `umount` / `remount,ro` returns EBUSY while the daemon runs (P1-2)
+
+Because the daemon holds an `O_PATH` fd per sealed inode (see the inode-reuse
+row above), each held fd pins its filesystem. Any filesystem containing seals
+therefore returns **EBUSY** on `umount` or `mount -o remount,ro` while the
+daemon is alive.
+
+This is **security-positive**: it blocks a remount/umount-to-bypass vector
+(an attacker cannot detach or downgrade the fs out from under live enforcement)
+and it interacts with the `bind-mount-OVER sealed path` and
+`mount-inside-sealed-subtree` rows above. It is documented here so an operator
+performing routine maintenance (LVM snapshot, volume detach, `remount,ro` for
+`fsck`) understands the otherwise-opaque EBUSY.
+
+* **Caveat — do not oversell:** `umount -l` (lazy) still detaches the
+  namespace view; the superblock stays pinned but the mountpoint disappears
+  from the namespace, so this does **not** absolutely "block umount."
+* **Operator action:** run `compartment-bpf --unpin` before unmounting,
+  remounting-ro, or otherwise relocating any filesystem that holds seals.
 
 ---
 

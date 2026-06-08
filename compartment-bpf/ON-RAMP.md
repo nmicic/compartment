@@ -13,8 +13,10 @@ For the design rationale, start with `README.md`, `HOWTO.md`, and
 `kvm/ubuntu-resolute.sh` autoinstalls an Ubuntu 26.04 LTS (Resolute)
 KVM VM with the BPF LSM activated at boot and the build toolchain
 preinstalled. After it finishes, the VM has a persistent IP and you
-can `ssh` in and run `sudo make smoke` plus `sudo tests/aggregate-smoke.sh`
-against a clone of the repo inside the guest. Long-lived; autostarts.
+can `ssh` in and run `sudo make check` against a clone of the repo
+inside the guest. (`make smoke` is a faster subset but does not
+exercise chmod / the legacy `inode_setattr` path, so the runbooks
+gate on `make check`.) Long-lived; autostarts.
 
 This is the path cited by V-1 / V-2 / V-3 / V-4 / V-4b / V-7 evidence
 chains. If you need the fidelity that those tags claim, use this
@@ -44,7 +46,7 @@ to compartment-bpf's seal-path tests.
 
 `kvm/quickstart-vagrant/` packages the same upstream Resolute cloud
 image as a vagrant-libvirt box and gives you `vagrant up` plus
-`vagrant reload --provision` to land in the same smoke gate. Use it
+`vagrant reload --provision` to land in the same `make check` gate. Use it
 when you want the production-grade kernel but do not want to manage
 a long-lived libvirt domain.
 
@@ -68,5 +70,5 @@ exit 0), under the 300 s budget by 174 s.
 |-------------------------------------------------------|----------|
 | Anchor evidence for a release claim                   | Path A   |
 | Sweep kernel versions, isolate LSM activation         | Path B   |
-| Reproduce the smoke gate without managing a KVM VM    | Path C   |
+| Reproduce the `make check` gate without managing a KVM VM | Path C   |
 | Run on macOS                                          | None of the above. compartment-bpf needs a Linux host kernel with `CONFIG_BPF_LSM=y` to load BPF LSM hooks; use a remote Linux libvirt host. |

@@ -118,7 +118,12 @@ start_daemon_with_pass() {
 			>"$TMP/daemon.log" 2>&1 &
 	fi
 	DAEMON_PID=$!
-	for i in 1 2 3 4 5 6 7 8 9 10; do
+	# Poll up to ~15s: the passphrase path runs memory-hard Argon2id (libsodium
+	# crypto_pwhash, intentionally slow) and startup also loads vmlinux BTF +
+	# attaches 21 LSM links, which on slower / older kernels (e.g. Noble 6.8)
+	# can exceed a tight few-second budget. The daemon liveness is startup, not
+	# a hot path, so a generous wait is correct (matches the bench-script poll).
+	for i in $(seq 1 50); do
 		if grep -q '\[run\] compartment-bpf live' "$TMP/daemon.log" 2>/dev/null; then
 			# A-1: daemon is live → policy is now pinned. Cleanup needs
 			# to know this so it can teardown using $PASSPHRASE if the
@@ -126,6 +131,8 @@ start_daemon_with_pass() {
 			policy_pinned=1
 			return 0
 		fi
+		# If the daemon process already exited, stop waiting — it failed fast.
+		kill -0 "$DAEMON_PID" 2>/dev/null || break
 		sleep 0.3
 	done
 	cat "$TMP/daemon.log" >&2

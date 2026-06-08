@@ -17,7 +17,7 @@
 #  dir_symlink     |   allow   |  allow    |  DENY    |  allow
 #  dir_link        |   allow   |  allow    |  DENY    |  allow
 #  dir_rename_in   |   allow   |  DENY     |  DENY    |  allow
-#  dir_rename_out  |   DENY    |  DENY     |  allow   |  allow
+#  dir_rename_out  |   DENY    |  DENY     |  DENY    |  allow
 #  dir_rmdir       |   DENY    |  allow    |  allow   |  allow
 #  dir_chmod       |   allow   |  allow    |  allow   |  DENY
 #
@@ -71,7 +71,15 @@ expected_for() {
 	case "${op}:${flag}" in
 	dir_unlink_child:no-unlink|dir_rmdir:no-unlink) echo DENY ;;
 	dir_create:no-write|dir_mkdir:no-write|dir_mknod:no-write|dir_symlink:no-write|dir_link:no-write|dir_rename_in:no-write) echo DENY ;;
-	dir_rename_in:no-rename|dir_rename_out:no-unlink|dir_rename_out:no-rename) echo DENY ;;
+	# 2026-06-08 coverage audit: dir_rename_out:no-write was STALE here
+	# (predicted ALLOW, structural-only era). Renaming a child OUT of a
+	# no-write-sealed dir removes the source dentry = a write to the sealed
+	# dir = DENY under the recursive write-protection model. This is the
+	# deliberate HIGH-9 behaviour the authoritative mesh §6.4 gate already
+	# asserts (seal <dir> no-write → rename-out denied). The orphaned-runner
+	# table predated that fix; wiring this runner into `make check` surfaced
+	# the drift. Same class as the postgres/SPEC dir-seal doc drift.
+	dir_rename_in:no-rename|dir_rename_out:no-unlink|dir_rename_out:no-rename|dir_rename_out:no-write) echo DENY ;;
 	dir_chmod:no-chmod) echo DENY ;;
 	*) echo ALLOW ;;
 	esac

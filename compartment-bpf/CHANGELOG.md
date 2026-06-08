@@ -3,6 +3,60 @@
 All notable changes to compartment-bpf are documented here.
 Format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.7.2] — 2026-06-09
+
+No ABI change (`0x0007` unchanged). Portability, a correctness fix, and
+tooling/telemetry additions surfaced by a Noble 6.8 bring-up and an
+independent multi-angle review.
+
+- **Portability (Noble 6.8):** the `inode_setattr` LSM hook now ships as a
+  dual wrapper (2-arg and 3-arg signatures) selected at load time, with the
+  unused variant gated off via `bpf_program__set_autoload`. Variant selection
+  uses a BTF probe of the hook's function prototype, autoloaded in the
+  `__open() → set_autoload → __load()` window. Wrong-variant selection is
+  fail-closed (verifier reject at load, never a partially-attached hook set).
+  Ubuntu 24.04 LTS (Noble, kernel 6.8) is now a tested platform.
+- **Fix (inode-reuse stale-seal window):** the loader now holds one `O_PATH`
+  fd per sealed inode for the daemon's whole lifetime, pinning each inode
+  against kernel inode-number recycling so a freed-and-reused inode number can
+  no longer inherit a stale `(dev, ino)` seal (a spurious fail-closed deny,
+  reproduced on Noble 6.8). `RLIMIT_NOFILE` is raised to the hard limit to
+  afford one fd per seal.
+  - **Side-effect (security-positive):** each held fd pins its filesystem, so
+    any filesystem containing seals returns `EBUSY` on `umount` /
+    `mount -o remount,ro` while the daemon runs. This blocks a
+    remount/umount-to-bypass vector; run `--unpin` before relocating a sealed
+    filesystem. (`umount -l` lazy-detach is unaffected — see `LIMITATIONS.md`.)
+  - **Known limitation:** in `--pin` daemonless mode the held fds die with the
+    loader process while pinned enforcement persists, so the reuse window
+    re-opens. Pair `no-write` with `no-unlink` to make it inert by policy. See
+    `LIMITATIONS.md`.
+- **Telemetry:** added `COUNTERS.md` documenting the full counter surface and a
+  `smoke-telemetry` gate (`telemetry-smoke.sh`) that checks pinned-counter
+  parity/drift in `make check`.
+- **Tooling:** added the deny-to-candidate tool (`check-deny-candidate`), which
+  turns observed `DENY` audit events into a commented candidate profile.
+- **Testing (coverage-accountability):** added a static code-surface vs.
+  test-witness gate (`tools/coverage-map.py` + `tests/coverage/coverage-manifest.tsv`
+  + `make check-coverage-static`) — every LSM hook, `ACTION_DENY_*` action, and
+  `*_total` counter must be referenced by a test or carry an explicit
+  exemption-with-reason, so a new un-witnessed surface fails the build. Wired
+  six previously-orphaned witnesses into `make check` (`check-bypass` via a new
+  in-place `tests/bypass/run-local.sh`, `check-codex-witnesses`,
+  `check-dir-matrix`) and added `make check-release`, a strict gate that fails
+  on critical environment skips for VM/release validation. The wiring surfaced
+  and fixed two stale-test drifts (a map-freeze witness using an outdated value
+  size; a directory-matrix prediction that lagged the recursive write-protection
+  semantic).
+- **Build (new Makefile targets):** `bench-overhead`, `bench-concurrency`,
+  `check-counter-longevity`, `smoke-telemetry`, `check-deny-candidate`,
+  `check-coverage-static`, `check-bypass`, `check-codex-witnesses`,
+  `check-dir-matrix`, `check-release`.
+- **Docs:** removed the in-tree `experimental/*.md` design/feasibility specs
+  from the published tree; operator-facing behavior is documented in
+  `HOWTO.md` / `LIMITATIONS.md` / `COUNTERS.md`.
+- **Lab tooling:** added `kvm/ubuntu-noble*.sh` for a Noble 6.8 VM spin-up.
+
 ## [v0.7.1] — 2026-05-19
 
 Patch release (no ABI change; `0x0007` unchanged). Fixes surfaced by an
@@ -27,7 +81,9 @@ external review and a full end-to-end VM run of the public tree.
 
 ### ABI bump 0x0006 → 0x0007
 
-No struct layout change. `seal_value` remains 88 bytes; `audit_event` unchanged.
+No struct layout change. `seal_value` remains 96 bytes (the ABI header's
+`_Static_assert(sizeof(struct seal_value) == 96, ...)` is authoritative);
+`audit_event` unchanged.
 
 - **New audit action codes** (`495b1d6`): split the overloaded
   `ACTION_DENY_STRICT_LAUNCH_MISSING` into three distinct codes so audit consumers

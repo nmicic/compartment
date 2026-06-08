@@ -1253,6 +1253,18 @@ fi
 # "warn: audit event version mismatch" to stderr. We grep DAEMON_LOG
 # globally for that string at end-of-ME-9 and FAIL if present.
 ME9_PASS=0; ME9_FAIL=0
+# Convert a glibc st_dev (what `stat -c %d` returns) into the kernel s_dev
+# encoding (major<<20 | minor) that the BPF hook reads from inode->i_sb->s_dev
+# and emits in [audit] dev=/caller_dev= fields. These coincide only when the
+# fs has major 0 (e.g. tmpfs), so a raw `stat %d` compare passes on a tmpfs
+# /tmp but FAILS on a disk-backed /tmp (ext4, major 253) — the dev-encoding
+# gotcha. Decode glibc major/minor, re-encode kernel s_dev.
+kdev() {
+	local d="$1" maj min
+	maj=$(( (d >> 8) & 0xfff ))
+	min=$(( (d & 0xff) | ((d >> 12) & 0xffffff00) ))
+	echo $(( (maj << 20) | min ))
+}
 me9_action_for_flag() {
 	# Map flag → DENY_<action> token emitted on uniform-deny path.
 	case "$1" in
@@ -1270,9 +1282,11 @@ me9_run() {
 	stub=$(caller_path "$caller")
 	target="$WORK/me9/me9-${case_id}"
 	op="${CANON[$flag]}"
-	dev=$(stat -c '%d' "$target" 2>/dev/null || echo 0)
+	# Use kernel s_dev encoding (kdev) to match the audit stream — a raw
+	# glibc `stat %d` only matches on a tmpfs /tmp (see kdev comment).
+	dev=$(kdev "$(stat -c '%d' "$target" 2>/dev/null || echo 0)")
 	ino=$(stat -c '%i' "$target" 2>/dev/null || echo 0)
-	cdev=$(stat -c '%d' "$stub")
+	cdev=$(kdev "$(stat -c '%d' "$stub")")
 	cino=$(stat -c '%i' "$stub")
 	local before=$(wc -l < "$DAEMON_LOG")
 	rc=0
@@ -1293,10 +1307,20 @@ me9_run() {
 		: > "$trial_log"
 	fi
 	local fail=""
-	case "$exp" in
+	# Guard: a stat() failure yields dev=0/ino=0, which makes the audit grep
+	# match nothing — ALLOW would pass silently and DENY would mis-fail. Treat
+	# an unstattable target as a hard failure, not a vacuous classification.
+	if [ "$dev" = "0" ] || [ "$ino" = "0" ]; then
+		fail="target-stat-failed(dev=$dev ino=$ino)"
+	fi
+	[ -n "$fail" ] || case "$exp" in
 		ALLOW)
-			# No audit event mentioning our (dev, ino).
-			if grep -qE "^\[audit\] .* dev=$dev ino=$ino($| )" "$trial_log"; then
+			# The op must actually have SUCCEEDED (rc=0): an ALLOW that failed
+			# for a non-LSM reason (ENOENT / DAC-EPERM / ESTALE) is a test-env
+			# breakage, not a real allow — do not record it PASS.
+			if [ "$rc" -ne 0 ]; then
+				fail="allow-but-rc=$rc(non-LSM failure?)"
+			elif grep -qE "^\[audit\] .* dev=$dev ino=$ino($| )" "$trial_log"; then
 				fail="unexpected-audit-on-allow"
 			fi
 			;;
@@ -1379,14 +1403,16 @@ me12_run unlink-as-actor "$WORK/bin/mesh_actor_a1" unlink "$ME12_TARGET" ALLOW
 : > "$ME12_TARGET"
 ME12_INO_NEW=$(stat -c '%i' "$ME12_TARGET")
 if [ "$ME12_INO_NEW" = "$ME12_INO_ORIG" ]; then
-	# Inode was actually reused by the kernel — rare on tmpfs but possible.
-	# In that case the OLD seal still binds; new file IS enforced. The
-	# spec ME-12 row says the seal entry tracks the OLD inode; if the
-	# kernel hands us back the SAME inode number, the test is a no-op.
-	# Document but don't fail.
-	echo "[mesh] ME-12 NOTE: kernel reused inode $ME12_INO_NEW; recreate-test no-op"
-	PASS=$((PASS+1))
-	printf 'ME12-inode-reuse,recreate-noop,%s,recreate,n/a,n/a,same-inode,PASS\n' "$ME12_TARGET" >> "$CSV"
+	# REGRESSION WITNESS (review OPEN-1): the daemon (run foreground here, alive
+	# the whole suite) holds one O_PATH fd per sealed inode for its lifetime, so
+	# unlinking ME12_TARGET CANNOT free its inode number — the recreate MUST get
+	# a different inode. Getting the SAME inode back means the held-fd lifetime
+	# hold regressed (fd released after attach), which would let the stale
+	# (dev,ino) seal rebind to the new file. That is the exact bug the held-fds
+	# fix closes, so same-inode is a hard FAIL, not a no-op.
+	echo "[mesh] ME-12 FAIL: recreate reused inode $ME12_INO_NEW — held-O_PATH-fd inode pin regressed"
+	FAIL=$((FAIL+1))
+	printf 'ME12-inode-reuse,recreate-reused-inode,%s,recreate,n/a,different-inode,same-inode,FAIL\n' "$ME12_TARGET" >> "$CSV"
 else
 	# Step 3: outsider b1 writes new file → ALLOW (not sealed).
 	me12_run b1-on-new-inode "$WORK/bin/mesh_outsider_b1" write "$ME12_TARGET" ALLOW

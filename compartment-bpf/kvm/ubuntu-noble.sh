@@ -1,22 +1,30 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Ubuntu 26.04 LTS (Resolute) cloud-image KVM VM for the
-# `compartment-bpf` smoke gate.
+# Ubuntu 24.04 LTS (Noble) cloud-image KVM VM for the `compartment-bpf`
+# smoke gate.
 #
-# Re-running tears down the VM and rebuilds. The defaults assume the
-# libvirt `virbr0` NAT bridge; override the variables below if your host
-# uses a different lab layout.
+# Noble ships the 6.8 kernel — the *previous* LTS relative to Resolute (26.04 /
+# 7.0). It is the lowest kernel we target for production: many deployed servers
+# still run Noble, so compartment-bpf is validated here before the newer Resolute
+# matrix. (The prior-prior LTS, Jammy 22.04 / 5.15, is a separate, later check —
+# 5.15 does not carry 'bpf' in the default LSM set and needs its own bring-up.)
+#
+# Re-running tears down the VM and rebuilds. The defaults assume the libvirt
+# `virbr0` NAT bridge; override the variables below if your host uses a
+# different lab layout.
 
 set -euo pipefail
 
 # ===== USER CONFIG =====
-VM_NAME="${VM_NAME:-compartment-bpf-resolute}"
+VM_NAME="${VM_NAME:-compartment-bpf-noble}"
 
 # Host networking — override to fit your local bridge/NAT layout.
+# .252 = Noble; .253 = Resolute; .254 = webhook-lab (jammy). Distinct IP + MAC
+# so all three can coexist on virbr0 at once.
 BRIDGE_NAME="${BRIDGE_NAME:-virbr0}"
 HOST_IP="${HOST_IP:-192.168.122.1}"
-VM_IP="${VM_IP:-192.168.122.253}"
+VM_IP="${VM_IP:-192.168.122.252}"
 NETMASK="${NETMASK:-255.255.255.0}"
 GATEWAY="${GATEWAY:-192.168.122.1}"
 DNS_SERVERS="${DNS_SERVERS:-8.8.8.8 1.1.1.1}"
@@ -28,8 +36,8 @@ CPUS="${CPUS:-2}"
 
 # Disks/paths
 IMAGES_DIR="${IMAGES_DIR:-/var/lib/libvirt/images}"
-BASE_IMG_URL="${BASE_IMG_URL:-https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img}"
-BASE_IMG="${BASE_IMG:-${IMAGES_DIR}/resolute-server-cloudimg-amd64.img}"
+BASE_IMG_URL="${BASE_IMG_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}"
+BASE_IMG="${BASE_IMG:-${IMAGES_DIR}/noble-server-cloudimg-amd64.img}"
 VM_DISK="${VM_DISK:-${IMAGES_DIR}/${VM_NAME}.qcow2}"
 VM_DISK_SIZE="${VM_DISK_SIZE:-16G}"
 SEED_ISO="${SEED_ISO:-${IMAGES_DIR}/${VM_NAME}-seed.iso}"
@@ -41,7 +49,9 @@ USERNAME="${USERNAME:-compartment}"
 SSH_AUTH_KEYS_FILE="${SSH_AUTH_KEYS_FILE:-}"
 
 # Stable local MAC so repeated rebuilds keep the same guest identity.
-MAC_ADDR="${MAC_ADDR:-52:54:00:7a:11:43}"
+# Differs from the Resolute VM's MAC (…:7a:11:43) by the last octet so both
+# VMs can be defined simultaneously.
+MAC_ADDR="${MAC_ADDR:-52:54:00:7a:11:41}"
 
 # LSM list to bake into the kernel cmdline. Ordering does not matter for
 # correctness — every LSM sees every hook and earlier denies are preserved
@@ -129,7 +139,7 @@ sudo mkdir -p "$IMAGES_DIR"
 
 # Download base image once
 if [[ ! -f "$BASE_IMG" ]]; then
-  echo "Downloading Ubuntu Resolute (26.04 LTS) cloud image..."
+  echo "Downloading Ubuntu Noble (24.04 LTS) cloud image..."
   sudo curl -L "$BASE_IMG_URL" -o "$BASE_IMG".tmp
   sudo qemu-img convert -O qcow2 "$BASE_IMG".tmp "$BASE_IMG"
   sudo rm -f "$BASE_IMG".tmp
@@ -245,7 +255,7 @@ write_files:
     permissions: "0644"
     owner: root:root
     content: |
-      # Set by ubuntu-resolute.sh — activates BPF LSM for compartment-bpf.
+      # Set by ubuntu-noble.sh — activates BPF LSM for compartment-bpf.
       GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} lsm=${LSM_LIST}"
 
   - path: /etc/profile.d/compartment-bpf.sh
@@ -300,12 +310,11 @@ EOF
 echo "Building NoCloud seed ISO..."
 sudo cloud-localds -v --network-config="$SEED_DIR/network-config" "$SEED_ISO" "$SEED_DIR/user-data" "$SEED_DIR/meta-data"
 
-# os-variant: libosinfo on the host may not yet know ubuntu26.04. Pick the
-# closest known value; this only affects performance/feature hints, not
-# correctness, since we're using virtio everywhere.
+# os-variant: Noble (ubuntu24.04) is well-known to libosinfo. Fall back to a
+# generic value if this host's osinfo db predates it.
 OS_VARIANT="ubuntu24.04"
-if osinfo-query os 2>/dev/null | awk '{print $1}' | grep -qx ubuntu26.04; then
-  OS_VARIANT="ubuntu26.04"
+if ! osinfo-query os 2>/dev/null | awk '{print $1}' | grep -qx ubuntu24.04; then
+  OS_VARIANT="ubuntu22.04"
 fi
 echo "Using --os-variant ${OS_VARIANT}"
 
@@ -328,7 +337,7 @@ sudo virt-install \
 
 cat <<EOF
 
-VM ${VM_NAME} is booting. cloud-init will:
+VM ${VM_NAME} is booting (Noble 24.04, kernel 6.8). cloud-init will:
   1. install clang / libbpf-dev / libsodium-dev / linux-tools / kernel headers
   2. add 'bpf' to the active LSM list via /etc/default/grub.d/
   3. update-grub

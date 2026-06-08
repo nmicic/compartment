@@ -1,0 +1,44 @@
+# compartment-bpf coverage manifest — accepted coverage gaps (exemptions).
+# SPDX-License-Identifier: Apache-2.0
+#
+# Format (tab-separated):  kind <TAB> name <TAB> reason
+#   kind  ∈ enforce-hook | observe-hook | action | counter | observe-counter
+#   name  = exact surface name as it appears in source
+#   reason = why this surface has no test witness yet, with a tracking ref
+#
+# This file is the AUTHORITATIVE list of code surfaces deliberately left
+# without a test witness. `tools/coverage-map.py` (make check-coverage-static)
+# fails the build if:
+#   - a code surface has neither a test reference nor a row here, OR
+#   - a row here names a surface that is now witnessed (ratchet down — remove
+#     the row in the same commit that adds the witness), OR
+#   - a row here names a surface that no longer exists.
+#
+# Every row is acknowledged debt. The row count is the ratchet: it must only
+# go DOWN. Adding a new uncovered surface requires a visible row here, which
+# shows up in review. See TODO.md "full test-coverage-vs-code audit".
+#
+# ---------------------------------------------------------------------------
+# Action tokens whose enforcement PATH is exercised but whose audit-line token
+# is not yet grepped by a witness. Tracked Phase 3 (P1) of the coverage plan.
+action	DENY_CHMOD_PARENT_DIR	Path exercised via dir-matrix chmod-on-sealed-dir; audit-token witness pending Phase 3 (upgrade me25_trial / tests/coverage/parent-dir-actions.sh).
+action	DENY_STRICT_LAUNCH_MISSING	Path exercised via strict_launch_missing_total (strict-launch/run.sh); audit-token grep pending Phase 3 SL-6.
+#
+# Enforce task_alloc is the fork-time exec-marker copy hook. It fires on every
+# fork in every test but has no fs-op token of its own; its effect is asserted
+# via marker_copy_fork_total (strict-launch/run.sh, counter-longevity.sh).
+enforce-hook	task_alloc	Fork marker-copy hook; no op token. Witnessed indirectly by marker_copy_fork_total (strict-launch/run.sh + stability/counter-longevity.sh).
+#
+# Observe counters: the observe ringbuf EVENTS are witnessed (tests/observe/
+# run.sh T6/T13), but the per-slot C_* counters are not yet asserted by name —
+# observe.c has no --debug-counters surface to read them back. Tracked Phase 3
+# (Codex: tests/observe/event-matrix.sh + observe counter readout).
+observe-counter	C_EVENTS_SEEN_TOTAL	Observe counter has no userspace readout yet; events witnessed, counter not. Phase 3 event-matrix.sh.
+observe-counter	C_EVENTS_SAMPLED_TOTAL	Sampling path not driven by a witness (sampling disabled in test profiles). Phase 3 event-matrix.sh.
+observe-counter	C_EVENTS_RINGBUF_DROP_TOTAL	Ringbuf-drop only under overload; deterministic fault witness pending Phase 4 (tests/fault/ringbuf).
+observe-counter	C_OBSERVED_FILES_TOTAL	No userspace counter readout; observed-files surfaced via JSONL only. Phase 3 event-matrix.sh.
+observe-counter	C_OBSERVED_FILES_OVERFLOW_TOTAL	Overflow only at map-capacity; deterministic witness pending Phase 4 fault injection.
+observe-counter	C_CURRENT_ACTOR_COPY_FORK_TOTAL	Fork-copy path observed via events; counter readout pending Phase 3 event-matrix.sh.
+observe-counter	C_LINEAGE_COPY_FORK_TOTAL	Lineage fork-copy counter readout pending Phase 3 event-matrix.sh.
+observe-counter	C_LINEAGE_EXEC_HELPER_TOTAL	Helper-exec event witnessed (T6); counter readout pending Phase 3 event-matrix.sh.
+observe-counter	C_PATH_RESOLVE_FAIL_TOTAL	Resolve-fail surfaced via JSONL warning; counter readout pending Phase 3 event-matrix.sh.

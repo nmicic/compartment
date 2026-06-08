@@ -29,6 +29,7 @@
 #include <termios.h>   /* interactive passphrase prompt (no echo) */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <bpf/btf.h>   /* vmlinux BTF probe: inode_setattr hook arg-count */
 #include <sodium.h>    /* Argon2id passphrase hashing */
 
 #ifndef BPF_FS_MAGIC
@@ -75,13 +76,22 @@ static int pin_window_aborted(const char *site)
 	return 1;
 }
 
-// Held O_PATH fds across map-populate -> attach. Each successful
-// seal_path() pushes its fd here; main() releases them only AFTER
-// compartment_bpf__attach() returns. Holding the inode reference for
-// the duration prevents inum reuse during the load window: an attacker
-// who unlinks the path and creates a new file at the same name will
-// not be able to alias onto our (dev, ino) map key, because the
-// kernel cannot reuse the inum while our fd pins the inode struct.
+// Held O_PATH fds, opened during map-populate and kept for the DAEMON'S
+// WHOLE LIFETIME. Each successful seal_path() pushes its fd here; these
+// fds are NOT released after attach — they are held until the daemon
+// exits. Holding the inode reference for the entire run prevents inum
+// reuse for as long as the seal is enforced: an attacker who unlinks the
+// path and creates a new file at the same name cannot alias onto our
+// (dev, ino) map key, because the kernel cannot reuse the inum while our
+// fd pins the inode struct.
+//
+// DO NOT add a held_fds_release() after compartment_bpf__attach() (or at
+// any point during the load window). An earlier version released these
+// fds once attach returned; that reopened the inode-reuse window — after
+// release, the kernel is free to recycle the inum behind a sealed
+// (dev, ino) key while enforcement is still live. The fds are
+// intentionally leaked for the process lifetime and reclaimed by the
+// kernel only on daemon exit.
 struct held_fds {
 	int *buf;
 	size_t cap;
@@ -806,16 +816,17 @@ static int anon_bdev_refuse(int pfd, const char *path, const char *ctx)
  *   - 0-byte file rejected (a freshly-truncated actor binary cannot be
  *     the actor; refuse rather than locking in a placeholder).
  *
- * The O_PATH fd is retained in `held` for the
- * same lifetime as seal-target fds (released only after
- * compartment_bpf__attach() returns). This closes the resolve→seal
- * TOCTOU window that the original close-after-fstat path opened: an
- * attacker who could swap the actor binary between fstat() here and
- * load-time seal could otherwise present a different inode to E-6's
- * strict-mode check than what runtime hooks observe via
- * bpf_get_current_task_btf->exe. Pinning the inode through attach
- * forces the kernel to keep the same inode struct alive across the
- * window. `held` may be NULL in parse-only mode (no fds retained).
+ * The O_PATH fd is retained in `held` for the same lifetime as
+ * seal-target fds: the DAEMON'S WHOLE LIFETIME (NOT released after
+ * compartment_bpf__attach(); see the held_fds struct comment). This
+ * closes the resolve→seal TOCTOU window that the original
+ * close-after-fstat path opened: an attacker who could swap the actor
+ * binary between fstat() here and load-time seal could otherwise present
+ * a different inode to E-6's strict-mode check than what runtime hooks
+ * observe via bpf_get_current_task_btf->exe. Pinning the inode for the
+ * whole run forces the kernel to keep the same inode struct alive while
+ * the seal is enforced. `held` may be NULL in parse-only mode (no fds
+ * retained).
  */
 // Partial-resolve diagnostic semantics. On ANY failure the function
 // returns -1 with `ag->bin` reset to NULL — never partly-filled. This
@@ -851,6 +862,12 @@ static int actor_resolve_paths(struct actor_group *ag, struct held_fds *held)
 			fprintf(stderr,
 				"actor %s: open %s: %s\n",
 				ag->name, path, strerror(errno));
+			if (errno == EMFILE || errno == ENFILE)
+				fprintf(stderr,
+					"  hint: compartment holds one O_PATH fd per sealed inode for the\n"
+					"  daemon's lifetime (inode-reuse safety); a large policy can exceed\n"
+					"  RLIMIT_NOFILE. Raise the fd limit (e.g. `ulimit -n` / systemd\n"
+					"  LimitNOFILE=) above the seal count and retry.\n");
 			goto fail_partial;
 		}
 		if (fstat(pfd, &st) < 0) {
@@ -1137,6 +1154,12 @@ static int strict_validate_launchers(struct profile_state *ps,
 			fprintf(stderr,
 				"actor-strict %s: open launcher %s: %s\n",
 				ag->name, ag->launcher_path, strerror(errno));
+			if (errno == EMFILE || errno == ENFILE)
+				fprintf(stderr,
+					"  hint: compartment holds one O_PATH fd per sealed inode for the\n"
+					"  daemon's lifetime (inode-reuse safety); a large policy can exceed\n"
+					"  RLIMIT_NOFILE. Raise the fd limit (e.g. `ulimit -n` / systemd\n"
+					"  LimitNOFILE=) above the seal count and retry.\n");
 			errs++;
 			continue;
 		}
@@ -1800,7 +1823,10 @@ static int validate_recursive_dir_seal(const char *path)
 // load. There is still a residual window between the last
 // bpf_map_update_elem and compartment_bpf__attach during which the kernel
 // is not yet enforcing; the `held` fd buffer narrows that window further
-// by holding O_PATH fds open through attach (preventing inum reuse).
+// by holding O_PATH fds open. Those fds are then kept for the DAEMON'S
+// WHOLE LIFETIME (NOT released after attach), so the inum-reuse
+// protection persists for as long as the seal is enforced (see the
+// held_fds struct comment — do not add a release-after-attach).
 // Run early, before protected services, for the strongest guarantee.
 //
 //   1. open(path, O_PATH | O_NOFOLLOW) -- pins an fd on the named entry.
@@ -1810,8 +1836,10 @@ static int validate_recursive_dir_seal(const char *path)
 //      in the path resolve normally; the hardening is at the seal target.
 //   2. fstat(fd) -- read dev/ino/mode through the anchored fd.
 //   3. bpf_map_update_elem -- (dev, ino) -> flags into sealed_{inodes,dirs}.
-//   4. Push pfd onto `held` (transferring ownership). main() releases
-//      these fds only after compartment_bpf__attach() returns.
+//   4. Push pfd onto `held` (transferring ownership). main() keeps
+//      these fds open for the daemon's whole lifetime — they are NOT
+//      released after compartment_bpf__attach() returns (releasing them
+//      would reopen the inode-reuse window; see the held_fds comment).
 //
 // On any error path we close pfd here. On dry-run we close pfd here.
 //
@@ -1856,6 +1884,12 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 	if (pfd < 0) {
 		fprintf(stderr, "seal %s: open: %s\n",
 			path, strerror(errno));
+		if (errno == EMFILE || errno == ENFILE)
+			fprintf(stderr,
+				"  hint: compartment holds one O_PATH fd per sealed inode for the\n"
+				"  daemon's lifetime (inode-reuse safety); a large policy can exceed\n"
+				"  RLIMIT_NOFILE. Raise the fd limit (e.g. `ulimit -n` / systemd\n"
+				"  LimitNOFILE=) above the seal count and retry.\n");
 		return -1;
 	}
 
@@ -2107,7 +2141,8 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 		return -1;
 	}
 
-	// Transfer pfd ownership to held; main() releases after attach.
+	// Transfer pfd ownership to held; main() holds these O_PATH fds for the
+	// daemon's whole lifetime (inode-reuse pin), NOT just across attach.
 	if (held_fds_push(held, pfd) < 0) {
 		close(pfd);
 		return -1;
@@ -2135,8 +2170,9 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 // drive deterministic parser fixtures without requiring real paths to
 // exist or have specific modes).
 //
-// `held` collects the O_PATH fds opened by seal_path; the caller must
-// release them after compartment_bpf__attach() returns. May be NULL in
+// `held` collects the O_PATH fds opened by seal_path; the caller (main)
+// holds them for the daemon's whole lifetime to pin sealed inodes against
+// number reuse (NOT just across attach). May be NULL in
 // dry-run / parse-only modes (seal_path closes its fd locally in that
 // path).
 //
@@ -2671,11 +2707,12 @@ static void usage(const char *p)
 		"                 location inside " PIN_ROOT " or it is refused.\n"
 		"                 Mutually exclusive with --pin/--dry-run and a\n"
 		"                 profile argument. " PIN_ROOT " itself is preserved.\n"
-		"  --stats        open the pinned deny_total / audit_drop_total /\n"
-		"                 actor_mismatch_total maps under " PIN_ROOT "/maps,\n"
-		"                 sum per-CPU values, and print '[stats]\n"
-		"                 deny_total=<N> audit_drop_total=<M>\n"
-		"                 actor_mismatch_total=<P>'. Exit 2 with\n"
+		"  --stats        open the pinned per-CPU counter maps under " PIN_ROOT "/maps\n"
+		"                 (all 12: deny_total, audit_drop_total, actor_mismatch_total,\n"
+		"                 strict_launch_{missing,allowed}_total, marker_{set,clear_foreign_exec,\n"
+		"                 copy_fork,stale_generation}_total, prctl_set_mm_exe_file_denied_total,\n"
+		"                 ptrace_{access,traceme}_denied_total — see COUNTERS.md), sum\n"
+		"                 per-CPU values, and print one '[stats] <name>=<N> ...' line. Exit 2 with\n"
 		"                 '[stats] no pinned counters found' if no pin\n"
 		"                 exists. Read-only.\n",
 		p, p, p);
@@ -2919,8 +2956,8 @@ static void pin_lifecycle_unlock(int fd)
 static int pin_links(struct compartment_bpf *skel)
 {
 	// pin_one_link writes into pinned[*pinned_count] without an
-	// explicit bound. We currently make 16 PIN_LINK invocations and have
-	// 32 slots. The assert hard-codes the current count (16) because
+	// explicit bound. We currently make 21 PIN_LINK invocations and have
+	// 32 slots. The assert hard-codes the current count (21) because
 	// KNOWN_LINK_NAMES is declared later in the file; if the PIN_LINK
 	// invocation count below grows, bump the literal here in lockstep.
 	char pinned[32][PATH_MAX];
@@ -2949,7 +2986,15 @@ static int pin_links(struct compartment_bpf *skel)
 	PIN_LINK(comp_file_open);
 	PIN_LINK(comp_file_permission);
 	PIN_LINK(comp_file_truncate);
-	PIN_LINK(comp_inode_setattr);
+	// inode_setattr ships two kernel-signature wrappers (modern/legacy);
+	// exactly one is autoloaded+attached (select_inode_setattr_variant). Pin
+	// whichever is live under the CANONICAL name so the bpffs pin path and the
+	// KNOWN_LINK_NAMES unpin/drain sweep stay kernel-independent.
+	if (pin_one_link(skel->links.comp_inode_setattr
+	                 ? skel->links.comp_inode_setattr
+	                 : skel->links.comp_inode_setattr_legacy,
+	                 "comp_inode_setattr", pinned, &pinned_count) < 0)
+		goto err;
 	PIN_LINK(comp_mmap_file);
 	PIN_LINK(comp_file_mprotect);
 	PIN_LINK(comp_inode_setxattr);
@@ -4141,8 +4186,8 @@ static int unpin_action(const char *requested)
 	// hard upper bound — one prog per link pin. Stack-sized array keeps
 	// the drain path allocation-free.
 	__u32 link_prog_ids[64];
-	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 16,
-		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id (currently 16)");
+	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 21,
+		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id (currently 21)");
 	size_t n_link_prog_ids;
 
 	if (strcmp(cand, root) == 0) {
@@ -4330,6 +4375,70 @@ static int unpin_action(const char *requested)
 
 /* Implemented in compartment-observe.c */
 extern int observe_main(int argc, char **argv);
+
+// The inode_setattr LSM hook gained a leading `struct mnt_idmap *idmap` after
+// kernel 6.8 (BTF func-proto vlen 2 -> 3). compartment.bpf.c ships two
+// SEC("lsm/inode_setattr") wrappers (modern 3-arg + legacy 2-arg) over one
+// shared body; exactly one matches the running kernel. Probe vmlinux BTF for
+// the hook's arg count and autoload ONLY the matching wrapper, so the verifier
+// never sees the wrong-shaped wrapper (which would fail with "func
+// 'bpf_lsm_inode_setattr' doesn't have N-th argument"). Must run after
+// __open() and before __load(). If BTF can't be read we fall back to the
+// kernel version (uname) rather than blind-defaulting to modern — blind-modern
+// would self-DoS exactly on the legacy target (Noble 6.8) this code exists for.
+static int select_inode_setattr_variant(struct compartment_bpf *skel)
+{
+	bool modern;
+	int decided = 0;
+	struct btf *btf = btf__load_vmlinux_btf();
+	if (btf) {
+		__s32 id = btf__find_by_name_kind(btf, "bpf_lsm_inode_setattr",
+		                                  BTF_KIND_FUNC);
+		if (id >= 0) {
+			const struct btf_type *fn = btf__type_by_id(btf, id);
+			const struct btf_type *proto =
+				fn ? btf__type_by_id(btf, fn->type) : NULL;
+			// Guard the kind: btf_vlen is only meaningful on a FUNC_PROTO.
+			if (proto && btf_kind(proto) == BTF_KIND_FUNC_PROTO) {
+				modern = (btf_vlen(proto) >= 3);
+				decided = 1;
+			}
+		}
+		btf__free(btf);
+	}
+	if (!decided) {
+		// BTF absent/unexpected: discriminate by kernel version. The
+		// mnt_idmap arg was added to inode_setattr AFTER 6.8, so treat
+		// <= 6.8 as legacy (2-arg). This is a best-effort fallback for the
+		// rare BTF-less host; on a wrong guess the load fails the verifier
+		// (fail-closed, clear message), never a silent mis-attach.
+		struct utsname u;
+		unsigned kmaj = 0, kmin = 0;
+		if (uname(&u) == 0)
+			sscanf(u.release, "%u.%u", &kmaj, &kmin);
+		modern = !(kmaj < 6 || (kmaj == 6 && kmin <= 8));
+		fprintf(stderr,
+			"[probe] warn: vmlinux BTF unavailable; picked inode_setattr "
+			"variant from uname %u.%u (%s).\n",
+			kmaj, kmin, modern ? "modern" : "legacy");
+	}
+
+	int r1 = bpf_program__set_autoload(skel->progs.comp_inode_setattr, modern);
+	int r2 = bpf_program__set_autoload(skel->progs.comp_inode_setattr_legacy,
+	                                   !modern);
+	if (r1 || r2) {
+		// Abort HERE with the precise cause rather than letting both wrappers
+		// stay enabled and surface later as a cryptic verifier reject.
+		fprintf(stderr,
+			"[probe] error: set_autoload(inode_setattr) failed (%d/%d); "
+			"refusing to load.\n", r1, r2);
+		return -1;
+	}
+	fprintf(stderr, "[probe] inode_setattr hook: %s signature (%s wrapper).\n",
+		modern ? "modern/idmap" : "legacy/no-idmap",
+		modern ? "3-arg" : "2-arg");
+	return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -4561,6 +4670,14 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	// Pick the inode_setattr wrapper matching this kernel's hook signature
+	// (6.8 has no mnt_idmap; 7.0+ does) before load, so the verifier only
+	// sees the correctly-shaped program.
+	if (select_inode_setattr_variant(skel) < 0) {
+		compartment_bpf__destroy(skel);
+		return 1;
+	}
+
 	// Optional test-only override for the audit ringbuf size,
 	// so counter-smoke.sh can deterministically induce ringbuf drops with
 	// a small burst of denies. Value is bytes; libbpf will reject anything
@@ -4612,9 +4729,12 @@ int main(int argc, char **argv)
 	}
 
 	// Populate seal maps BEFORE attach so policy is live the instant the
-	// hooks become reachable. seal_path() also fills `held` with O_PATH
-	// fds anchored on each sealed inode; we keep them open across the
-	// attach call to prevent inum reuse during the load window.
+	// hooks become reachable. seal_path() fills `held` with one O_PATH fd per
+	// sealed inode; these are held for the daemon's WHOLE LIFETIME (NOT just
+	// the load window) to pin each inode against number reuse — see the
+	// "KEEP the held O_PATH fds" note after attach. Cost: one fd per seal, so
+	// the fd footprint is O(policy size) for the daemon's life (RLIMIT_NOFILE
+	// was raised to the hard limit above).
 	struct held_fds held = {0};
 	if (load_conf(skel, conf, &held, allow_empty, /*parse_only*/0,
 	              /*pin_enforce_path*/pin, allow_candidate) < 0) {
@@ -4622,6 +4742,10 @@ int main(int argc, char **argv)
 		compartment_bpf__destroy(skel);
 		return 1;
 	}
+	fprintf(stderr,
+		"[seal] holding %zu O_PATH fd(s) (sealed inodes + actor/launcher "
+		"binaries) for the daemon lifetime to prevent inode-number reuse.\n",
+		held.n);
 
 	// Freeze seal maps before attach so once enforcement is live a task
 	// with CAP_BPF cannot enumerate map IDs and weaken policy by
@@ -4646,9 +4770,33 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	// Enforcement is now live. Release the held fds; the BPF map keys
-	// already reference inode numbers that the kernel hooks will check.
-	held_fds_release(&held);
+	// Enforcement is now live. KEEP the held O_PATH fds open for the
+	// daemon's whole lifetime — do NOT release them here.
+	//
+	// Seals are keyed by (dev, ino). A `no-write` seal permits unlink
+	// (no-write != no-unlink), so a sealed file can be removed, its inode
+	// freed, and that inode number REUSED by an unrelated new file — which
+	// then inherits the stale (dev, ino) seal and gets a spurious deny
+	// (fail-closed, but a real correctness bug; reproduced on kernels whose
+	// inode allocator recycles immediately, e.g. Noble 6.8). Holding an
+	// O_PATH fd per sealed inode pins the inode struct so the kernel cannot
+	// reuse its number while this daemon runs. RLIMIT_NOFILE was already
+	// raised to the hard limit above to afford one fd per seal.
+	//
+	// Intended side-effect: an O_PATH fd on a sealed file pins its
+	// filesystem, so a fs containing seals cannot be unmounted or
+	// remounted-ro while this daemon runs (umount/mount -o remount return
+	// EBUSY); --unpin first. This is security-positive — it blocks a
+	// remount/umount-to-bypass vector — but operators relocating a sealed
+	// fs must tear the daemon down first.
+	//
+	// LIMITATION (tracked follow-up): in --pin persistent mode the fds die
+	// when this process exits while pinned enforcement lives on, so a
+	// pinned-but-daemonless tree retains the reuse window. The complete fix
+	// is nlink-aware seal eviction when the inode is actually freed (must be
+	// nlink-aware: dropping a seal while a hardlink still exists would be
+	// fail-OPEN). `held` is intentionally not freed; the OS reclaims it at
+	// process exit.
 
 	// Order matters: set up the audit ringbuf BEFORE
 	// pinning links. If ring_buffer__new() fails after pin, the daemon

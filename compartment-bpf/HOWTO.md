@@ -37,6 +37,17 @@ Load policy *before* the protected service starts. There is a
 narrow window between map update and BPF attach during which
 enforcement is not yet live.
 
+**Recommended pairing — `no-write` + `no-unlink`.** For any file that
+must not be replaced, seal it with both `no-write` and `no-unlink`
+(not `no-write` alone). `no-write` permits `unlink`, so a `no-write`-only
+file can be removed, its inode freed, and its inode number reused by an
+unrelated new file that then inherits the stale `(dev, ino)` seal
+(a spurious fail-closed deny — see the inode-reuse row in
+`LIMITATIONS.md`). Adding `no-unlink` makes the sealed inode
+unremovable, so its number can never be recycled and the reuse window
+is inert by policy. This matters most in `--pin` daemonless mode, where
+the daemon's inode-pinning fds do not survive process exit.
+
 ### Preflight: kernel sysctls
 
 Before deploying actor-bound profiles to production, set
@@ -268,38 +279,38 @@ of v0.x protection (R2-F5):**
   is sealed `no-write,no-unlink,no-rename actor=postgres`, so
   its contents are immutable to non-actor callers.
 
-**What dir-destination seals DO cover (v0.5):** the dir seal
-gates writes AND metadata changes (`no-write`, `no-chmod`) on
-**immediate children** of the sealed directory in addition to
+**What directory seals cover (v0.6+):** the dir seal gates
+writes AND metadata changes (`no-write`, `no-chmod`) on the
+**entire subtree** beneath the sealed directory in addition to
 the structural mutation set (create/link/unlink/rename/mkdir/
 rmdir/mknod/symlink). `deny_file_write()` calls both
-`deny_inode_action()` and `deny_file_parent_dir_action()`, so a
-non-actor `cat > /var/lib/postgresql/<v>/main/PG_VERSION` is
-blocked even without an explicit per-file seal on PG_VERSION
-(per LIMITATIONS.md:116).
+`deny_inode_action()` and `deny_file_parent_dir_action()`; the
+latter walks ancestor dentries at runtime, so a non-actor
+`cat > /var/lib/postgresql/<v>/main/PG_VERSION` and a non-actor
+write to a nested heap file at `base/<oid>/<relfilenode>` are
+both blocked by the single seal on `main/`, with no per-file
+seal required. (Under the original v0.5 dir-destination model
+the gate was only one level deep — immediate children — and
+grandchildren were not covered; v0.6 supersedes that.)
 
-**What dir-destination seals do NOT cover:** the parent-dir
-check is one level deep. Grandchildren and deeper paths
-(e.g. heap files at `base/<oid>/<relfilenode>` or WAL segments
-at `pg_wal/<segment>`) are NOT covered by a single seal on the
-data dir — their parent inode is `base/<oid>` or `pg_wal/`, not
-`main/`. Per-file seals (or seals on the intermediate
-subdirectories) remain the v0.x answer for those paths.
+**The remaining limit is the depth cap, not one level.** The
+ancestor walk is bounded to `COMPARTMENT_MAX_DIR_ANCESTORS`
+(default 8) levels of nesting. A descendant deeper than the
+compiled cap from its covering sealed directory is not reached
+by the runtime walk. To keep this fail-closed, the loader
+refuses to attach a recursive directory seal whose live subtree
+already exceeds the compiled budget. Keep sealed subtrees within
+the depth budget, or rebuild with a larger cap
+(`make COMPARTMENT_MAX_DIR_ANCESTORS=32`). See the
+recursive-subtree ancestor-walk depth-cap row in LIMITATIONS.md.
 
-**Per-file is still the v0.x answer for grandchildren.** To
-freeze a specific heap or WAL file's content, add a per-file
-seal for that path:
+**Per-file seals** remain the precise tool when you want to
+freeze one specific file's content (e.g. the `PG_VERSION`
+sentinel) independent of any directory seal:
 
 ```
 seal /var/lib/postgresql/18/main/<file> no-write,no-unlink,no-rename actor=postgres
 ```
-
-**v1.x scope:** recursive-subtree-seal — a single declaration
-covering the entire subtree (the missing primitive that would
-make a directory seal imply "no one but the actor writes any
-file inside it, recursively"). Recursive directory seals (v0.6+) cover
-this at the directory level; per-file actor seals remain the precise
-tool for individual file-write control.
 
 Regression witness: `tests/profile-e2e/postgres.sh`. The witness
 discovers the installed PostgreSQL major via `pg_lsclusters`, sed-
@@ -307,8 +318,9 @@ substitutes the profile to match the deployment, loads
 compartment-bpf, asserts `sealprobe open-write PG_VERSION` denies
 (the per-file sentinel write-protection), and confirms
 `pg_isready` against the live cluster succeeds. The witness is
-intentionally narrow: it asserts the surface that IS protected,
-not the heap-file surface that v0.x does not protect.
+intentionally narrow: it asserts the per-file sentinel surface
+directly rather than enumerating every file in the recursively
+sealed subtree.
 
 ### 2.6 Multi-binary actor groups
 
@@ -338,6 +350,15 @@ Pinning the BPF links (`--pin`) makes seals survive loader exit;
 unpinning (`--unpin`) takes them off. The unpin passphrase is a
 **credential gate** that the `--unpin` path must clear before it
 will tear down a passphrase-protected pin tree.
+
+**Filesystem maintenance — run `--unpin` first.** While the daemon
+runs it holds an `O_PATH` fd per sealed inode (to prevent inode-number
+reuse), which pins every filesystem containing seals. `umount` and
+`mount -o remount,ro` on such a filesystem therefore return **EBUSY**.
+Run `compartment-bpf --unpin` before unmounting or remounting-ro any
+filesystem that holds seals (LVM snapshot, volume detach, `fsck`, etc.).
+See the EBUSY row in `LIMITATIONS.md` for the security rationale and the
+`umount -l` caveat.
 
 **R2-F6 honest framing (post-Review-2, 2026-05-14):** the
 implementation is libsodium Argon2id (`crypto_pwhash_str`,
@@ -497,7 +518,7 @@ ABI v0.4) the strict-launch-marker counters:
 | `marker_clear_foreign_exec_total`    | tasks whose marker was cleared on a foreign exec (chain break — visibility signal)            |
 | `marker_copy_fork_total`             | child tasks that inherited a parent marker via `task_alloc` (G6 Outcome B)                    |
 | `marker_stale_generation_total`      | denies whose root cause was generation mismatch (always 0 in v0.4 fresh-load-only; see §3a)  |
-| `prctl_set_mm_exe_file_denied_total` | `PR_SET_MM_EXE_FILE` denies emitted by `task_prctl` while strict mode is loaded               |
+| `prctl_set_mm_exe_file_denied_total` | `PR_SET_MM` denies emitted by `task_prctl` while strict mode is loaded (gates ALL `PR_SET_MM` sub-ops — see note below)               |
 | `ptrace_access_denied_total`         | denies emitted by `ptrace_access_check` (strace, process_vm_writev, pidfd_getfd, /proc/mem)   |
 | `ptrace_traceme_denied_total`        | denies emitted by `ptrace_traceme` (a marked actor calling PTRACE_TRACEME)                    |
 
@@ -510,6 +531,14 @@ LD_PRELOAD-safe protection class; SIEM integrations that scrape
 `--stats` should treat any of the `strict_launch_missing_total` /
 `prctl_set_mm_exe_file_denied_total` / `ptrace_*_denied_total`
 non-zero as a strict-mode enforcement event.
+
+Despite its name, `prctl_set_mm_exe_file_denied_total` counts denies of
+**every** `PR_SET_MM` sub-operation, not just `PR_SET_MM_EXE_FILE`. The
+`task_prctl` hook was broadened to gate the whole `PR_SET_MM` family —
+`PR_SET_MM_MAP` (sub-op 14) accepts a `struct prctl_mm_map` whose `exe_fd`
+field overwrites `mm->exe_file` exactly like `PR_SET_MM_EXE_FILE`, so the
+narrow per-sub-op gate left a direct actor-identity-swap bypass. The
+counter name is retained for operator continuity.
 
 ---
 
@@ -599,7 +628,8 @@ stdout:
 # target: aide
 actor aide = /usr/sbin/aide
 seal /usr/sbin/aide full
-# directory destination rule; one-level child protection, not recursive.
+# directory seal; recursive subtree protection bounded to
+# COMPARTMENT_MAX_DIR_ANCESTORS (default 8) levels.
 seal /var/lib/aide no-write no-unlink no-rename no-chmod actor=aide
 ```
 
@@ -677,8 +707,16 @@ ABI v0.5 (DD-1) extends seal semantics so that `no-write` and
 directory's **immediate children** in addition to the existing
 structural mutation set (`no-unlink`, `no-rename`, etc.). The
 goal is to cover an entire data dir's contents in one declaration
-without enumerating every file, while keeping the model fail-closed
-and one-level-deep.
+without enumerating every file, while keeping the model fail-closed.
+
+> **v0.6+ supersedes the one-level limit.** The text below describes the
+> original v0.5 immediate-child behaviour. As of ABI v0.6 the enforcement
+> hooks walk ancestor dentries at runtime, so a directory seal applies
+> **recursively to the whole subtree**, bounded to
+> `COMPARTMENT_MAX_DIR_ANCESTORS` (default 8) levels of nesting — a write
+> to `<dir>/sub/file` is denied by the seal on `<dir>`. See §7.3 and the
+> recursive-subtree row in LIMITATIONS.md for the current behaviour and
+> the depth cap.
 
 ### 7.1 What a dir-destination seal does
 
@@ -731,12 +769,19 @@ at load time.
 
 ### 7.3 What a dir-destination seal does NOT cover
 
-* **Grandchildren and deeper paths.** The parent-dir gate is one
-  level deep. A write to `<dir>/sub/file` is checked against
-  `sub/`'s inode, not `<dir>/`'s. Per-file seals (or seals on the
-  intermediate subdirectories) are required to extend protection
-  recursively. See LIMITATIONS.md:116 for the canonical
-  description of the grandchild caveat.
+* **Paths deeper than the depth cap.** As of v0.6 the gate is no
+  longer one level deep: the enforcement hooks walk ancestor dentries,
+  so `<dir>/sub/file` *is* checked against `<dir>/`'s seal. The walk is
+  bounded to `COMPARTMENT_MAX_DIR_ANCESTORS` (default 8) levels — a
+  descendant nested deeper than the compiled cap from its covering
+  sealed directory is not reached by the runtime walk. To keep this
+  fail-closed, the loader refuses to attach a recursive directory seal
+  whose live subtree already exceeds the compiled budget. Keep sealed
+  subtrees within the depth budget, or rebuild with a larger
+  `COMPARTMENT_MAX_DIR_ANCESTORS`. See the recursive-subtree
+  ancestor-walk depth-cap row in LIMITATIONS.md for the canonical
+  description. (Under the original v0.5 one-level model, grandchildren
+  were not covered at all; v0.6 supersedes that.)
 * **Symlinks crossing into the dir from outside** the kernel
   hooks see only the inode at the resolved leaf; a symlink under
   `/tmp/foo → /var/lib/postgresql/18/main/PG_VERSION` is rejected
@@ -757,9 +802,11 @@ writes `COMPARTMENT_ABI_VERSION` to cell 0 when it pins). If the
 returned value is in the supported range (`0x0004` ≤ abi ≤ the
 compile-time `COMPARTMENT_ABI_VERSION`), it is used verbatim.
 
-`seal_value` is **88 bytes** in v0.5 and remains 88 bytes through
+`seal_value` is **96 bytes** in v0.5 and remains 96 bytes through
 v0.7 (ABI v0.6 and v0.7 introduce new behaviour and new audit
-actions without changing the on-wire struct layout). The earlier
+actions without changing the on-wire struct layout; the ABI header's
+`_Static_assert(sizeof(struct seal_value) == 96, ...)` is the
+authoritative size). The earlier
 `seal_value` size probe (96-byte v0.4/v0.5 vs newer) is no longer
 used: legacy pre-v0.6 pins that lack `abi_version_map` cannot be
 disambiguated from map shape alone, so `detect_runtime_abi()`

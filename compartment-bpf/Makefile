@@ -112,10 +112,48 @@ smoke-actor: compartment-bpf test-tools
 smoke-pin: compartment-bpf test-tools
 	@bash tests/pin-regression.sh
 
+# Deterministic regression witnesses for the two load-bearing security fixes
+# (held-O_PATH-fd inode-reuse pin + dual inode_setattr wrapper). Asserts the
+# probe variant matches the kernel, no-chmod enforcement fires (the legacy 6.8
+# inode_setattr path that `smoke` never exercised), the held-fd count, and the
+# EBUSY-while-live proof. Root + BPF LSM; SKIPs cleanly otherwise.
+check-inode-seal-witness: compartment-bpf
+	@bash tests/inode-seal-witness.sh
+
+# Negative tests for the open-concurrency bench's own gates (Codex minimal-witness
+# item 8): the C parse-gate (no root) rejects bad nthreads/iters; the shell guard
+# skips non-numeric OC_THREADS; the over-threshold/missing-row path FAILs. The
+# root-gated portions SKIP cleanly on a dev host.
+check-bench-negtest: compartment-bpf
+	@bash tests/bench/open-concurrency-negtest.sh
+
 # V-4b counter smoke. Three sub-tests (T4b.1..T4b.3): deny_total
 # exactness, audit_drop_total under pressure, --stats idempotence.
 smoke-counters: compartment-bpf
 	@bash tests/counter-smoke.sh
+
+# Telemetry surface bulletproofing: --stats <-> pinned-counter parity (drift
+# guard), PERCPU type, at-rest stability, non-perturbing + minimal-cost polling,
+# and COUNTERS.md catalogue coverage. Read-only; no data-plane change.
+#
+# P2-9: requires root + BPF LSM (the script attaches a live daemon). On a dev
+# host without root the harness can't run, so SKIP cleanly here rather than
+# hard-failing the whole `make check` — same non-hostile convention as
+# check-mesh / check-strict-launch / check-observe. Only a missing-root SKIP
+# or a sub-script rc=77 is a skip; any other non-zero is a real failure.
+smoke-telemetry: compartment-bpf
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "[smoke-telemetry] SKIP (requires root + BPF LSM)"; \
+		exit 0; \
+	fi; \
+	bash tests/telemetry-smoke.sh; rc=$$?; \
+	if [ "$$rc" -eq 77 ]; then \
+		echo "[smoke-telemetry] SKIP (rc=77, env unsupported)"; \
+		exit 0; \
+	elif [ "$$rc" -ne 0 ]; then \
+		echo "[smoke-telemetry] FAIL (rc=$$rc)"; \
+		exit $$rc; \
+	fi
 
 # ED-1 + ED-2 parser/loader fixtures (actor allowlist). Eight grammar
 # fixtures driven via --parse-only and five resolution fixtures driven
@@ -216,7 +254,14 @@ check-actor-hook: compartment.bpf.o
 # wrapper-aide (DEC-WRAP-A) coverage was invisible from CI / default
 # operator gating. The mesh harness still detect-and-SKIPs cleanly on
 # hosts without root or BPF LSM (rc=77), same as smoke-pin.
-check: smoke smoke-pin smoke-counters smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-wrapper check-strict-launch check-observe check-howto-examples
+# 2026-06-08 coverage audit (ours + Codex testing-coverage review): wire the
+# six orphaned-but-passing witnesses into the default gate (check-bypass,
+# check-codex-witnesses, check-dir-matrix) and add the static coverage-
+# accountability gate (check-coverage-static). Pre-audit these existed in-tree
+# but `make check` never invoked them — they gated nothing, which is exactly
+# how OPEN-1 and the recursive dir-seal drift stayed green. All new suites
+# detect-and-SKIP cleanly (rc=77) on a non-root / non-BPF developer host.
+check: check-coverage-static smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-bypass check-codex-witnesses check-dir-matrix check-wrapper check-strict-launch check-observe check-deny-candidate check-howto-examples
 
 # Coverage-gaps 2026-05-16 GAP-H-12: HOWTO §7.2 dir-destination
 # headliner regressed THREE V-6 cycles before this gate landed. Each
@@ -332,6 +377,19 @@ test-tools: tests/sealprobe $(TEST_TOOLS_EXTRA)
 bench: compartment-bpf test-tools
 	sh tests/bench.sh
 
+# Headline enforcement-overhead: representative actor workload (file open/read +
+# exec) timed WITH vs WITHOUT compartment, reported as a single % overhead.
+# Complements bench-runner's per-op MODE-A/B rows. Requires root.
+bench-overhead: compartment-bpf
+	sudo bash tests/bench/actor-overhead.sh
+
+# Concurrency-scaling check: threaded file_open microbenchmark (no shell fork/exec)
+# WITH vs WITHOUT the daemon, thread sweep. Resolves the "concurrency cliff"
+# question (RESULTS-concurrency.md) — flat overhead => no file_open serialization.
+# Env: OC_THREADS, OC_ITERS, OC_MAXPCT. Standalone (not in `make check`).
+bench-concurrency: compartment-bpf
+	sudo OC_THREADS="$(OC_THREADS)" OC_ITERS="$(OC_ITERS)" OC_MAXPCT="$(OC_MAXPCT)" bash tests/bench/open-concurrency.sh
+
 # ----- Phase 2 mesh test infrastructure (ME-1 + ME-2 + ME-3) -----
 #
 # 8 stub binaries (4 actor + 4 outsider) per EXEC-DOMAIN-MESH-DRAFT.md §2.1.
@@ -401,6 +459,28 @@ check-observe: compartment-bpf
 		exit $$rc; \
 	fi
 
+# Deny-first bridge: provoke real denies, translate the daemon's audit stream into
+# a (commented, fail-safe) candidate profile via tools/deny-to-candidate.py.
+#
+# P2-9: requires root + BPF LSM (it pins a live daemon to provoke real denies).
+# SKIP cleanly on a non-root dev host rather than hard-failing `make check` —
+# this is what makes the "SKIPs cleanly" claim above actually true. Only a
+# missing-root SKIP or a sub-script rc=77 is a skip; any other non-zero
+# (e.g. a genuine assertion failure) still fails the gate fail-closed.
+check-deny-candidate: compartment-bpf
+	@if [ "$$(id -u)" -ne 0 ]; then \
+		echo "[check-deny-candidate] SKIP (requires root + BPF LSM)"; \
+		exit 0; \
+	fi; \
+	bash tests/deny-to-candidate.sh; rc=$$?; \
+	if [ "$$rc" -eq 77 ]; then \
+		echo "[check-deny-candidate] SKIP (rc=77, env unsupported)"; \
+		exit 0; \
+	elif [ "$$rc" -ne 0 ]; then \
+		echo "[check-deny-candidate] FAIL (rc=$$rc)"; \
+		exit $$rc; \
+	fi
+
 # Kernel stability stress harness (operator-domain gate alongside V-6).
 # Long-running; NOT wired into default `make check`. Requires root for
 # --pin/--unpin and dmesg access; SKIPs cleanly (rc=77) on a dev host
@@ -418,4 +498,106 @@ check-stability-quick:
 	@echo "Running quick stability test (64 cycles; requires root)..."
 	sudo STAB_CYCLES=64 bash tests/stability/pin-unpin-churn.sh
 
-.PHONY: all check-env clean smoke smoke-pin smoke-counters smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-stability check-stability-quick check-howto-examples
+# Counter longevity: sustained provocation of every counter (one long-lived
+# daemon + repeated provoker suites) asserting no always-0/dead, stuck, or
+# wrapped counter and no daemon leak (RSS flat, dmesg/taint clean). Crank
+# COUNTER_LONGEVITY_ITERS (and COUNTER_LONGEVITY_SL_RUNS) for a real soak.
+check-counter-longevity: compartment-bpf
+	@echo "Running counter longevity ($${COUNTER_LONGEVITY_ITERS:-30} iters; requires root)..."
+	sudo COUNTER_LONGEVITY_ITERS=$${COUNTER_LONGEVITY_ITERS:-30} \
+	     COUNTER_LONGEVITY_SL_RUNS=$${COUNTER_LONGEVITY_SL_RUNS:-3} \
+	     bash tests/stability/counter-longevity.sh
+
+# ----- Phase 1/2 coverage-accountability gates (2026-06-08 audit) -----
+#
+# Static code-surface vs. test-witness gate. Pure source scan: NO root, NO
+# kernel, NO build. Asserts every LSM hook / ACTION_DENY_* action / *_total
+# counter is referenced by a test under tests/ OR carries an explicit
+# exemption (with reason) in tests/coverage/coverage-manifest.tsv. Adding a
+# new surface with no witness now FAILS the build (the OPEN-1 / dir-seal-drift
+# class). Regenerates tests/coverage/COVERAGE-MATRIX.md as a side effect.
+check-coverage-static:
+	@python3 tools/coverage-map.py --write-matrix tests/coverage/COVERAGE-MATRIX.md
+
+# In-place bypass aggregator. tests/bypass/run-all.sh is a HOST-side driver
+# that rsyncs to a VM and ssh-runs each witness; run-local.sh runs the same
+# witnesses on THIS machine so the suite is gated by `make check`. rc=77 SKIP
+# on a non-root / non-BPF host.
+check-bypass: compartment-bpf test-tools
+	@bash tests/bypass/run-local.sh; rc=$$?; \
+	if [ "$$rc" -eq 77 ]; then \
+		echo "[check-bypass] SKIP (rc=77, env unsupported)"; \
+		exit 0; \
+	elif [ "$$rc" -ne 0 ]; then \
+		echo "[check-bypass] FAIL (rc=$$rc)"; \
+		exit $$rc; \
+	fi
+
+# Four Codex regression witnesses that existed in-tree but were never wired
+# into a gate (coverage audit 2026-06-08): map-freeze (maps EPERM after
+# freeze), pin-ringbuf-failure (no leaked pinned link on ringbuf failure),
+# duplicate-seal-merge (both flags survive a repeated path), empty-profile
+# (fail-closed on zero rules). Each defaults REPO=/root/compartment-bpf; we
+# point it at the working tree. Per sub-script: rc=0 PASS, rc=77 SKIP.
+check-codex-witnesses: compartment-bpf test-tools
+	@rc=0; \
+	for s in tests/map-freeze-witness.sh tests/pin-ringbuf-failure.sh \
+	         tests/duplicate-seal-merge.sh tests/empty-profile-witness.sh; do \
+	  echo "[check-codex-witnesses] $$s"; \
+	  REPO="$(CURDIR)" bash "$$s"; srrc=$$?; \
+	  if [ "$$srrc" -eq 77 ]; then \
+	    echo "[check-codex-witnesses] $$s SKIP (env unsupported)"; \
+	  elif [ "$$srrc" -ne 0 ]; then \
+	    echo "[check-codex-witnesses] $$s FAIL (rc=$$srrc)"; rc=1; \
+	  fi; \
+	done; \
+	exit $$rc
+
+# Directory functional matrix (40 cells: 10 dir ops × 4 primitive flags) run
+# in place. The host-side dir-matrix.sh drives the runner over ssh; here we
+# run it locally and assert 40/40. Runner exits 2 when the env is unsupported
+# → SKIP; any other non-zero is a real failure.
+check-dir-matrix: compartment-bpf test-tools
+	@csv=$$(mktemp); \
+	REPO="$(CURDIR)" sh tests/dir-matrix-runner.sh >"$$csv" 2>/dev/null; rc=$$?; \
+	if [ "$$rc" -eq 2 ]; then \
+	  echo "[check-dir-matrix] SKIP (env unsupported)"; rm -f "$$csv"; exit 0; \
+	fi; \
+	if [ "$$rc" -ne 0 ]; then \
+	  echo "[check-dir-matrix] FAIL (runner rc=$$rc)"; cat "$$csv"; rm -f "$$csv"; exit 1; \
+	fi; \
+	total=$$(awk -F, 'NR>1{n++}END{print n+0}' "$$csv"); \
+	pass=$$(awk -F, 'NR>1&&$$6=="PASS"{n++}END{print n+0}' "$$csv"); \
+	echo "[check-dir-matrix] $$pass/$$total PASS"; \
+	if [ "$$total" -ne 40 ] || [ "$$pass" -ne 40 ]; then \
+	  echo "[check-dir-matrix] FAIL — expected 40/40"; cat "$$csv"; rm -f "$$csv"; exit 1; \
+	fi; \
+	rm -f "$$csv"
+
+# Public-release / VM gate (Codex P1 "default make check is not a hard release
+# gate" + coverage audit Phase 5). Unlike `make check` — developer-friendly,
+# SKIPs root/BPF suites on a dev host — this FAILS if the host cannot actually
+# exercise enforcement, so a skipped VM can never read as green. Strict
+# preflight on every prerequisite, then the full check, then a scan that fails
+# if any core suite SKIPPED for an env reason that preflight should have
+# guaranteed away (missing root / BPF LSM / built daemon / sealprobe).
+check-release: check-env
+	@echo "[check-release] strict preflight — no critical skips permitted"
+	@[ "$$(id -u)" -eq 0 ] || { echo "[check-release] FAIL: must run as root"; exit 1; }
+	@grep -qw bpf /sys/kernel/security/lsm 2>/dev/null || { echo "[check-release] FAIL: bpf not in active LSM (boot with lsm=...,bpf)"; exit 1; }
+	@test -d /sys/fs/bpf || { echo "[check-release] FAIL: bpffs not present at /sys/fs/bpf"; exit 1; }
+	@test -r /sys/kernel/btf/vmlinux || { echo "[check-release] FAIL: kernel BTF not readable"; exit 1; }
+	@command -v bpftool >/dev/null || { echo "[check-release] FAIL: bpftool missing"; exit 1; }
+	@command -v clang >/dev/null || { echo "[check-release] FAIL: clang missing"; exit 1; }
+	@echo "[check-release] preflight OK — running full suite"
+	@log=$$(mktemp); ok=1; \
+	$(MAKE) check 2>&1 | tee "$$log" || ok=0; \
+	if [ "$$ok" -ne 1 ]; then echo "[check-release] FAIL: make check returned non-zero"; rm -f "$$log"; exit 1; fi; \
+	if grep -nEi 'SKIP.*(needs root|requires root|bpf not in active LSM|daemon not built|sealprobe not built|bpftool not available)' "$$log"; then \
+	  echo "[check-release] FAIL: a core suite SKIPPED for an env reason preflight should have guaranteed away (above)"; \
+	  rm -f "$$log"; exit 1; \
+	fi; \
+	rm -f "$$log"; \
+	echo "[check-release] PASS — full suite ran with no critical env skips"
+
+.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-release

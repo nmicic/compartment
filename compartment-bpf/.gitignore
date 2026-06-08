@@ -32,3 +32,13 @@ tests/mesh-results-*.txt
 # kvm/ recreate-trigger files (signed scripts and ubuntu-resolute.sh
 # itself stay tracked; recreate.txt is operator-side, never committed)
 kvm/*_recreate.txt
+
+# per-host operational artifacts — never commit (esp. for public release)
+kvm/*_authorized_keys.pub
+*~
+
+# Python bytecode (CPython compiles tools/*.py on import — must never ship
+# into the public security tool) and the built concurrency-bench ELF.
+tools/__pycache__/
+*.pyc
+tests/bench/open-concurrency

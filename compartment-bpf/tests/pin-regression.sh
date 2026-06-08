@@ -461,15 +461,24 @@ test_t45()
 "${BIN}" --unpin >/dev/null 2>&1 || true
 rm -f "${SENTINEL}" 2>/dev/null || true
 
-pass=0
-fail=0
-for t in test_t41 test_t42 test_t43 test_t44 test_t45; do
-	if "$t"; then
-		pass=$((pass + 1))
-	else
-		fail=$((fail + 1))
-	fi
+# Derive the expected outcome-row count from the test list itself so adding a
+# T4.6 (or removing one) can't silently drift the recorded-count gate below.
+TESTS=(test_t41 test_t42 test_t43 test_t44 test_t45)
+EXPECTED="${#TESTS[@]}"
+for t in "${TESTS[@]}"; do
+	"$t" || true
 done
+
+# Count from the CSV (the authoritative outcome record), not the function
+# return codes: a SKIP (e.g. an optional fixture like /etc/chrony/chrony.conf
+# absent on a minimal cloud image) must NOT fail the gate. A test that produced
+# no row at all (crashed before record) is caught by the recorded-count check.
+# grep -c prints "0" AND exits 1 on zero matches; `|| true` keeps that single
+# "0" without appending another (|| echo 0 would yield "0\n0").
+pass=$(grep -c ',PASS,' "${CSV}" 2>/dev/null || true)
+fail=$(grep -c ',FAIL,' "${CSV}" 2>/dev/null || true)
+skip=$(grep -c ',SKIP,' "${CSV}" 2>/dev/null || true)
+recorded=$((pass + fail + skip))
 
 # Final bpffs inspection -- record what is left under PIN_ROOT after the
 # suite. A clean run leaves PIN_ROOT present but its subdirectories empty
@@ -484,11 +493,13 @@ done
 } > "${RESULTS}/final-bpffs.txt"
 
 echo
-echo "pin-regression: ${pass} passed, ${fail} failed"
+echo "pin-regression: ${pass} passed, ${fail} failed, ${skip} skipped"
 echo "csv: ${CSV}"
 echo "final-bpffs: ${RESULTS}/final-bpffs.txt"
 
-if [ "${fail}" -ne 0 ]; then
+# Fail on any FAIL, or if a test silently produced no outcome row (expected
+# one row per test in TESTS — derived above, not a literal).
+if [ "${fail}" -ne 0 ] || [ "${recorded}" -ne "${EXPECTED}" ]; then
 	exit 1
 fi
 exit 0

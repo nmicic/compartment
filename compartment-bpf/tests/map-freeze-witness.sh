@@ -66,11 +66,17 @@ if [ -z "$sealed_inodes_id" ] || [ -z "$sealed_dirs_id" ]; then
 	exit 1
 fi
 
-# Try to update each map. Either map type is hash with key=struct
-# inode_key (16 bytes: dev __u64 + ino __u64) and value=__u32. bpftool
-# accepts hex byte strings.
+# Try to update each map. Both maps are hash with key=struct inode_key
+# (16 bytes: dev __u64 + ino __u64) and value=struct seal_value (96 bytes,
+# ABI v0.6). The original draft of this test used a 4-byte value=__u32;
+# because the witness was orphaned (never wired into a gate) that size
+# silently drifted as seal_value grew, and bpftool rejected the update on
+# SIZE ("value expected 96 bytes got 4") BEFORE the kernel freeze check could
+# return EPERM — masking exactly what this test claims to prove. Provide a
+# correctly-sized value so the update reaches the frozen map and the EPERM is
+# the genuine freeze rejection. 2026-06-08 coverage audit.
 key_hex='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
-val_hex='ff ff ff ff'
+val_hex="$(for _ in $(seq 1 96); do printf '0 '; done)"
 
 assert_eperm() {
 	id=$1; name=$2

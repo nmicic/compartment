@@ -5,6 +5,12 @@ root cannot unlink, rename, write, or chmod the sealed inodes. Decisions are
 made in-kernel from in-kernel data — no userspace daemon needs to stay alive
 for enforcement.
 
+> **Scope note on daemonless mode.** In `--pin` (persistent, daemonless) mode
+> the inode-reuse stale-seal window re-opens: the daemon's inode-pinning
+> `O_PATH` fds die when the loader process exits while pinned enforcement
+> lives on. This is fail-closed (a spurious deny, never a bypass) and is made
+> inert by pairing `no-write` with `no-unlink`. See `LIMITATIONS.md`.
+
 This is part of the [Compartment](https://github.com/compartment) toolkit;
 it complements `compartment-user` (Landlock + seccomp) and `compartment-root`
 (namespace containers) with kernel-side inode-level enforcement.
@@ -62,7 +68,11 @@ Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all 
 
 - **Fail-closed lifecycle.** `--pin` persists BPF links to bpffs; the loader
   rejects a new `--pin` if stale pins exist. Maps are frozen after policy load
-  (`bpf_map_freeze`); no root process can weaken a seal in place.
+  (`bpf_map_freeze`), so a non-`CAP_BPF` user cannot mutate seals in place. This
+  is not protection against an in-host privileged attacker: a `CAP_BPF` user can
+  still detach the LSM links or update the maps and disable enforcement, which is
+  out of the v0 threat model (see the `CAP_BPF + direct map mutation` and
+  `Privileged BPF link detach` rows in [LIMITATIONS.md](LIMITATIONS.md)).
 
 ---
 
@@ -74,7 +84,8 @@ Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all 
   cat /sys/kernel/security/lsm   # must include "bpf"
   zgrep BPF_LSM /proc/config.gz  # CONFIG_BPF_LSM=y
   ```
-  Tested on Ubuntu 26.04 LTS (kernel `7.0.0-15-generic`).
+  Tested on Ubuntu 24.04 LTS (Noble, kernel `6.8`) and Ubuntu 26.04 LTS
+  (kernel `7.0.0-15-generic`).
 
 - Toolchain: `clang` ≥ 12, `libbpf-dev`, `bpftool`, `libsodium-dev`.
   `make check-env` verifies presence.
