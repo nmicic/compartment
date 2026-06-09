@@ -8,6 +8,25 @@ operator-facing summary intended to be read alongside the README's
 Limitations section before deploying actor-bound profiles in
 production.
 
+## Hard caveat — built for small high-value targets, not whole trees like `/usr`
+
+compartment-bpf is designed to seal a **small set of high-value targets** — a
+credential or config file, or an actor binary such as AIDE — making them immutable
+even to root, with audit. It is **not** a whole-system read-only tool. Sealing a
+large tree such as `/usr` is impractical and is refused at load, for two reasons:
+
+- **Scale.** Seals are per-inode; the seal map caps at 65,536 entries, which a
+  tree like `/usr` blows past.
+- **Symlinks / hardlinks.** A recursive directory seal fails closed on any symlink
+  or hardlink in the subtree, and `/usr/lib` is full of both — so the seal will
+  not load. (This is a current limitation, not a permanent one.)
+
+For whole-tree read-only, use an OS facility instead (read-only mount, overlayfs,
+`systemd ProtectSystem=strict`, dm-verity, or `chattr -R +i` with
+`CAP_LINUX_IMMUTABLE` dropped from the system bounding set). Use compartment-bpf
+for the specific high-value files those mechanisms don't individually protect with
+per-actor exec policy + audit.
+
 ## Hard caveat — `actor=` vs `actor-strict` (ABI v0.4)
 
 ABI v0.4 (2026-05-15) adds `actor-strict NAME = TARGET launcher=PATH`
