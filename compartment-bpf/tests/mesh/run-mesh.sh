@@ -810,8 +810,8 @@ me22_setup_overlay() {
 	# documentation tripwire stays visible.
 	#
 	# We do NOT mount overlay either — there is no enforcement to test.
-	# The copy-up bypass is documented in
-	# experimental/exec-domain-mesh/sidebars/SIDEBAR-overlay-copyup-gap-20260515.md.
+	# The copy-up bypass is documented in LIMITATIONS.md (anon_bdev /
+	# overlay copy-up limitation).
 	printf 'ME22-fs,n/a,n/a,setup,overlay,KNOWN-GAP-anon_bdev,refused-by-HIGH-1-loader-gate,SKIP\n' >> "$CSV"
 	SKIP=$((SKIP+1))
 	echo "[mesh] ME-22 overlay SKIP: anon_bdev (HIGH-1 loader gate refuses; sidebar docs the class)"

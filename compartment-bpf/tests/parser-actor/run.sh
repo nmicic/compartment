@@ -186,7 +186,7 @@ run_parse_inline "SL-loader-rejects-vacuous" \
 
 # env directives removed from v0.4 grammar.
 # Loader rejects profiles containing `env NAME=VALUE` / `env NAME=*` with
-# a clear pointer at HOWTO.md §6.4. Negative witness for the deletion.
+# a clear pointer at HOWTO.md §4.1. Negative witness for the deletion.
 run_parse_inline "SL-loader-rejects-env-directive" \
     "env. directive removed in v0.4" \
     "actor-strict aide = /usr/sbin/aide launcher=/usr/libexec/compartment-actors/aide" \

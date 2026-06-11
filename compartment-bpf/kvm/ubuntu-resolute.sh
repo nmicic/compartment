@@ -190,6 +190,8 @@ users:
     shell: /bin/bash
     ssh_authorized_keys:
 ${AUTHORIZED_KEYS_YAML}
+    # NOPASSWD sudo is intentional for this disposable test VM (the suite
+    # needs passwordless root). Do NOT expose this VM to untrusted networks.
     sudo: ALL=(ALL) NOPASSWD:ALL
   - name: root
     lock_passwd: true

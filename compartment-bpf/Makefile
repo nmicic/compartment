@@ -261,7 +261,7 @@ check-actor-hook: compartment.bpf.o
 # but `make check` never invoked them — they gated nothing, which is exactly
 # how OPEN-1 and the recursive dir-seal drift stayed green. All new suites
 # detect-and-SKIP cleanly (rc=77) on a non-root / non-BPF developer host.
-check: check-coverage-static smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-bypass check-codex-witnesses check-dir-matrix check-wrapper check-strict-launch check-observe check-deny-candidate check-howto-examples
+check: check-coverage-static smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-wrapper check-strict-launch check-observe check-deny-candidate check-howto-examples
 
 # Coverage-gaps 2026-05-16 GAP-H-12: HOWTO §7.2 dir-destination
 # headliner regressed THREE V-6 cycles before this gate landed. Each
@@ -519,6 +519,25 @@ check-counter-longevity: compartment-bpf
 check-coverage-static:
 	@python3 tools/coverage-map.py --write-matrix tests/coverage/COVERAGE-MATRIX.md
 
+# Loader fail-closed input-validation witnesses (2026-06-09): the recursive
+# directory-seal refusals (symlink / hardlink / over-depth in the subtree) had
+# NO witness — surfaced by the "seal /usr" exercise. Runs entirely via --dry-run
+# (no root, no BPF, no kernel state) so it gates on every developer host; SKIPs
+# only if the daemon binary is not built.
+check-loader-refusal: compartment-bpf
+	@bash tests/loader-refusal-witness.sh; rc=$$?; \
+	if [ "$$rc" -eq 77 ]; then echo "[check-loader-refusal] SKIP"; exit 0; \
+	elif [ "$$rc" -ne 0 ]; then echo "[check-loader-refusal] FAIL (rc=$$rc)"; exit $$rc; fi
+
+# "Test to the failure" scale/limit stress: large fan-out subtree validation
+# (Part A, --dry-run, no root) + over-capacity profile must fail closed
+# (Part B, root + BPF LSM). Part B SKIPs cleanly on a dev host. Crank
+# STRESS_FANOUT / STRESS_DIR_SEALS for a deeper soak.
+check-limit-stress: compartment-bpf
+	@bash tests/limit-stress.sh; rc=$$?; \
+	if [ "$$rc" -eq 77 ]; then echo "[check-limit-stress] SKIP"; exit 0; \
+	elif [ "$$rc" -ne 0 ]; then echo "[check-limit-stress] FAIL (rc=$$rc)"; exit $$rc; fi
+
 # In-place bypass aggregator. tests/bypass/run-all.sh is a HOST-side driver
 # that rsyncs to a VM and ssh-runs each witness; run-local.sh runs the same
 # witnesses on THIS machine so the suite is gated by `make check`. rc=77 SKIP
@@ -600,4 +619,4 @@ check-release: check-env
 	rm -f "$$log"; \
 	echo "[check-release] PASS — full suite ran with no critical env skips"
 
-.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-release
+.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-release

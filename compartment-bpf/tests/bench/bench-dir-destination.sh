@@ -15,7 +15,7 @@
 # Halt/review gate: >5% incremental overhead on scenario 3 vs scenario 2.
 set -euo pipefail
 
-: "${REPO:=/root/compartment_ebpf}"
+: "${REPO:=$(realpath "$(dirname "$0")/../..")}"
 DAEMON="$REPO/compartment-bpf"
 ACTOR="$REPO/tests/mesh/build/mesh_actor_a1"
 OUTSIDER="$REPO/tests/mesh/build/mesh_outsider_b1"

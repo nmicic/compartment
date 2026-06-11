@@ -9,9 +9,9 @@ allowlist (ABI v0.3), strict-launch declarations (ABI v0.4),
 directory-destination seals (ABI v0.5, see §7), and the unpin-passphrase
 credential gate.
 
-For the design rationale see `experimental/EXEC-DOMAIN-SPEC.md`. For
-the limitations envelope see `LIMITATIONS.md`. For the on-ramp to
-build/run see `ON-RAMP.md`.
+For the design rationale see `README.md`. For the limitations
+envelope see `LIMITATIONS.md`. For the on-ramp to build/run see
+`ON-RAMP.md`.
 
 ---
 
@@ -341,6 +341,25 @@ A profile with no `actor=` clauses is byte-for-byte equivalent to
 the same profile under pre-v0.3 compartment-bpf: every caller is
 uniformly denied (`actor_count == 0` path). v0 profiles continue
 to load and enforce identically.
+
+### 2.8 Sealing a binary's dynamic-link closure
+
+Sealing only an executable leaves the shared libraries it loads
+writable — tampering a `.so` reported by `ldd` is as effective as
+tampering the binary. To fully tamper-proof an executable, seal it
+**and** its library closure. `tools/seal-binary-closure.sh` emits the
+seal directives, resolving version symlinks (e.g. `libfoo.so` →
+`libfoo.so.1.2.3`) to their real inodes:
+
+```
+$ tools/seal-binary-closure.sh /usr/sbin/sshd full >> sshd.conf
+# review sshd.conf, then load it
+```
+
+Re-run it after package upgrades: an upgrade replaces files with new
+inodes, so the previous (dev, ino) seals would no longer match. Note
+the libraries live under `/usr/lib`, which is exactly why a recursive
+`seal /usr` is impractical — see `LIMITATIONS.md`.
 
 ---
 
@@ -833,8 +852,7 @@ loader were built from the same checkout (the standard
 
 ## 8. Cross-references
 
-- `experimental/EXEC-DOMAIN-SPEC.md` — design + numbered
-  requirements + bypass surface.
+- `README.md` — design rationale + threat model overview.
 - `LIMITATIONS.md` — threats out of scope, including LD_PRELOAD
   and ptrace.
 - `profiles/README.md` — daemon profile collection + cocktail rule.

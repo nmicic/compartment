@@ -52,8 +52,8 @@
 //    rebuilt — repin via `--unpin` then `--pin` cycle.
 //
 // ABI v0.4 — strict-launch-marker promotion. Adds the LD_PRELOAD-safe
-// actor enforcement primitive described in
-// experimental/STRICT-LAUNCH-MARKER-FEASIBILITY-SPEC.md.
+// actor enforcement primitive (strict-launch markers); see
+// HOWTO.md §2.3.x.
 //  * New seal flag bit: SEAL_STRICT_LAUNCH = 1U << 5. When set, file
 //    operations on the seal require a valid strict-launch marker in
 //    addition to the existing actor= inode check. Closes LD_PRELOAD on

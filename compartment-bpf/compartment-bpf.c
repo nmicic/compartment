@@ -125,10 +125,10 @@ static void held_fds_release(struct held_fds *h)
 }
 
 /*
- * Exec-domain (actor allowlist) profile state — parse + resolution per
- * experimental/EXEC-DOMAIN-SPEC.md §3, §9. The loader plumbs (dev, ino)
- * pairs into the BPF maps via struct seal_value; the BPF side enforces
- * them at hook time.
+ * Exec-domain (actor allowlist) profile state — parse + resolution.
+ * See HOWTO.md §2 (exec-domain actor allowlist). The loader plumbs
+ * (dev, ino) pairs into the BPF maps via struct seal_value; the BPF
+ * side enforces them at hook time.
  *
  * Caps:
  *   actor NAME length ≤ 32 bytes incl. NUL.
@@ -198,7 +198,7 @@ struct actor_group {
 	 * bin[0] is the actor target. Env policy is sourced from the
 	 * wrapper (`tools/compartment-actor-wrapper.c` +
 	 * `compartment-actor-build.sh`); v0.4 does not carry env directives
-	 * on the actor_group. See HOWTO.md §6.4 for the wrapper-as-single-source-
+	 * on the actor_group. See HOWTO.md §4.1 for the wrapper-as-single-source-
 	 * of-env-policy invariant.
 	 */
 	int is_strict;
@@ -689,7 +689,7 @@ static int parse_env_decl(char *rest, int line_no, struct profile_state *ps)
 		"%d: 'env' directive removed in v0.4 (v0.4+); "
 		"env policy is sourced from the wrapper. "
 		"Use `tools/compartment-actor-build.sh --allow-env NAME` to "
-		"customize the wrapper's env allowlist. See HOWTO.md §6.4.\n",
+		"customize the wrapper's env allowlist. See HOWTO.md §4.1.\n",
 		line_no);
 	return -1;
 }
@@ -710,9 +710,8 @@ static int parse_env_decl(char *rest, int line_no, struct profile_state *ps)
  *
  * v0 fix: refuse to seal a path (or resolve an actor binary) that
  * resides on one of these filesystems. Operator-facing diagnostic
- * points at LIMITATIONS.md / SIDEBAR-btrfs-anon_bdev-gap-20260515.md /
- * SIDEBAR-overlay-copyup-gap-20260515.md. v1 will fix the BPF-side
- * resolution instead.
+ * points at LIMITATIONS.md (the anon_bdev / overlay copy-up
+ * limitation). v1 will fix the BPF-side resolution instead.
  */
 #define COMPARTMENT_BTRFS_SUPER_MAGIC      0x9123683eUL
 #define COMPARTMENT_OVERLAYFS_SUPER_MAGIC  0x794c7630UL
@@ -797,9 +796,8 @@ static int anon_bdev_refuse(int pfd, const char *path, const char *ctx)
 		"because the BPF hook reads inode->i_sb->s_dev (real) while "
 		"userspace stat returns the anon_bdev (mismatch → silent "
 		"fail-open). Refusing to load. Move sealed paths and actor "
-		"binaries to ext4 / xfs / tmpfs. See LIMITATIONS.md and "
-		"experimental/exec-domain-mesh/sidebars/SIDEBAR-btrfs-anon_bdev-gap-20260515.md / "
-		"SIDEBAR-overlay-copyup-gap-20260515.md.\n",
+		"binaries to ext4 / xfs / tmpfs. See LIMITATIONS.md "
+		"(the anon_bdev / overlay copy-up limitation).\n",
 		ctx, path, (unsigned long)sfs.f_type, fsname);
 	return -1;
 }
@@ -2078,7 +2076,7 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 		// actor-mismatch path WITHOUT a userspace lookup table. The
 		// ABI slot is 16 bytes; we truncate to 15 + NUL. Names are
 		// already validated by actor_name_valid (parser only accepts
-		// printable [A-Za-z0-9_-] within ACTOR_NAME_MAX=32), so the
+		// printable [A-Za-z0-9_-] within ACTOR_NAME_MAX=16), so the
 		// truncation can only lose trailing characters, never inject
 		// control bytes downstream.
 		if (actor_ref->name) {
@@ -2681,6 +2679,7 @@ static void usage(const char *p)
 		"usage: %s [--pin] [--dry-run] [--parse-only] [--allow-empty] [--allow-candidate] <profile.conf>\n"
 		"       %s --unpin [PATH]\n"
 		"       %s --stats\n"
+		"       %s observe [--help]\n"
 		"  --pin          pin BPF links to " PIN_ROOT "\n"
 		"                 (policy survives loader exit); when used with a\n"
 		"                 profile, deny/audit-drop counter maps are also\n"
@@ -2714,8 +2713,11 @@ static void usage(const char *p)
 		"                 ptrace_{access,traceme}_denied_total — see COUNTERS.md), sum\n"
 		"                 per-CPU values, and print one '[stats] <name>=<N> ...' line. Exit 2 with\n"
 		"                 '[stats] no pinned counters found' if no pin\n"
-		"                 exists. Read-only.\n",
-		p, p, p);
+		"                 exists. Read-only.\n"
+		"  observe        emit a candidate profile from observed actor/file\n"
+		"                 activity; run '%s observe --help' for its options\n"
+		"                 (see HOWTO.md, the observe section).\n",
+		p, p, p, p, p);
 }
 
 // Print kernel version + active LSM list, hard-fail if 'bpf' is not in
@@ -3469,6 +3471,23 @@ static int check_one_pinned_seal_shape(const char *path)
 	if (fd < 0) {
 		if (errno == ENOENT)
 			return 0;
+		// EACCES/EPERM: we cannot READ the pin to verify its shape. This
+		// is the normal case for a non-root `--dry-run`/`--parse-only`
+		// (bpffs is mode 700), and it is NOT a shape mismatch — downgrade
+		// to a warning and continue rather than fail closed. The check
+		// that actually matters runs in the real --pin/load path, which
+		// holds CAP_BPF and can read the pin; there a genuine wrong-shape
+		// pin is still caught below. Treating "can't read" as fatal here
+		// broke non-root profile validation on any host with bpffs
+		// mounted (2026-06-09 loader-refusal-witness finding).
+		if (errno == EACCES || errno == EPERM) {
+			fprintf(stderr,
+				"pin-shape: cannot verify %s (%s); skipping shape "
+				"check — re-run as root to validate against the "
+				"deployed pin tree\n",
+				path, strerror(errno));
+			return 0;
+		}
 		fprintf(stderr,
 			"pin-shape: open %s: %s\n",
 			path, strerror(errno));

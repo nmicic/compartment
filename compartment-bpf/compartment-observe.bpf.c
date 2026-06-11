@@ -3,8 +3,8 @@
 // compartment-bpf observe BPF program — actor marker + lineage
 // and filesystem event aggregation.
 //
-// Production port from experimental/actor-fs-observe/bpf/observe.bpf.c.
-// SPEC: experimental/ACTOR-FS-OBSERVE-SPEC.md
+// Production port of the actor-fs-observe BPF program (observe pipeline).
+// See HOWTO.md §5 — generating candidate profiles with compartment-bpf observe.
 //
 // DEFERRED: global compact mode (--global all-task marker mode with aggressive aggregation).
 // DEFERRED: deny-first bridge / documented handoff to compartment-bpf genprofile.

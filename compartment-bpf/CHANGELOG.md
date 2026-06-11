@@ -3,6 +3,36 @@
 All notable changes to compartment-bpf are documented here.
 Format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.7.3] — 2026-06-11
+
+No ABI change (`0x0007` unchanged). Usability, a non-root validation fix,
+new fail-closed test coverage, and documentation-residue cleanup surfaced
+by an independent multi-angle review of the public tree.
+
+- **Usability:** the `observe` subcommand is now documented in `--help`
+  (synopsis + description). It already worked; it was just undocumented.
+- **Fix (non-root `--dry-run`):** the pinned-seal-shape check treats
+  `EACCES`/`EPERM` from the bpffs pin tree (mode 700) as "cannot verify,
+  warn and continue" instead of fatal, restoring the "safe for non-root"
+  contract for `--dry-run`/`--parse-only`. The real `--pin` path still runs
+  as root and catches a genuine wrong-shape pin.
+- **Tooling:** added `tools/seal-binary-closure.sh`, which emits seal
+  directives for a binary plus its `ldd` shared-library closure (version
+  symlinks resolved to real inodes) — fully tamper-proofing an executable
+  pulls in its library closure. See `HOWTO.md` §2.8.
+- **Testing (test to the failure):** two fail-closed witnesses wired into
+  `make check`: `check-loader-refusal` (the recursive directory-seal
+  refusals — symlink / hardlink / over-depth in the subtree — via
+  `--dry-run`, no root) and `check-limit-stress` (large fan-out validation
+  plus an over-capacity profile that must fail closed, never silently
+  truncating enforcement).
+- **Docs:** removed dangling references to the (unpublished) `experimental/`
+  design specs left by the v0.7.2 sanitization — including a runtime
+  filesystem-refusal error string that pointed at a non-existent path —
+  fixed a stale `HOWTO.md §6.4` → §4.1 cross-reference, corrected the audit
+  ringbuf capacity to 256 KiB and the v0.5 strict-launch hook list, and the
+  `ACTOR_NAME_MAX` comment.
+
 ## [v0.7.2] — 2026-06-09
 
 No ABI change (`0x0007` unchanged). Portability, a correctness fix, and
@@ -192,9 +222,10 @@ strict-launch-marker, the observe pipeline, and directory-destination actor seal
 - **`actor-strict` mode**: launcher-declared actor seals enforce that the process was
   actually launched through the declared launcher binary, defeating LD_PRELOAD and
   binary-swap attacks against the actor identity.
-- **Strict-launch-marker**: five LSM hooks (`task_alloc`, `bprm_check_security`,
-  `bprm_committed_creds`, `bprm_creds_from_file`, `task_free`) track whether each
-  task was launched under a monitored launcher. Processes that reach sealed paths
+- **Strict-launch-marker**: five LSM hooks (`bprm_check_security`, `task_alloc`,
+  `task_prctl`, `ptrace_access_check`, `ptrace_traceme`) set a per-task launch
+  marker (copied across fork via `task_alloc`) and deny the `PR_SET_MM` and ptrace
+  vectors that could forge or escape it. Processes that reach sealed paths
   without a valid marker are denied and audited.
 - **Observe pipeline**: `compartment-bpf observe` records the inode access pattern
   of a running process and emits a candidate profile for review. Candidate profiles

@@ -160,8 +160,8 @@ struct {
 } actor_mismatch_total SEC(".maps");
 
 // ============================================================
-// v0.4 strict-launch-marker (SLM) — production lift of
-// experimental/strict-launch-marker/bpf/slm.bpf.c per SPEC §5/§6.
+// v0.4 strict-launch-marker (SLM) — production lift of the
+// strict-launch-marker spike. See HOWTO.md §2.3.x.
 // ============================================================
 //
 // Maps:

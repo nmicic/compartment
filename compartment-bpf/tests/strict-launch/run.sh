@@ -291,9 +291,8 @@ run_witness "SL-4-fork-write" 0 \
 # ----- Review-1 HIGH-2 (2026-05-15): port SL-5/7/8/9/10 from spike -----
 #
 # Pre-fix, only SL-1..SL-4 and SL-6 were in-tree (5/10). The new five
-# bring the in-tree regression to 10/10 SPEC §9 witnesses against the
-# PRODUCTION daemon (not the spike runner). Sources:
-# experimental/strict-launch-marker/scripts/run_witnesses.sh.
+# bring the in-tree regression to 10/10 strict-launch witnesses against
+# the PRODUCTION daemon (not the spike runner).
 
 # SL-5 foreign-helper chain break: launcher → actor → exec slm-foreign.
 # Counter: marker_set_total + marker_clear_foreign_exec_total. The
