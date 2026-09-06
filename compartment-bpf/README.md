@@ -168,7 +168,7 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 | `make check` | loader negative-path, multi-actor, error-path, regression (24+ checks) |
 | `tests/bypass/run-all.sh` | 44 bypass scenarios (25 seal-class + 19 exec-domain; kernel hook coverage per flag class) |
 | `tests/strict-launch/run.sh` | 17 strict-launch-marker witnesses |
-| `tests/observe/run.sh` | 22 observe pipeline witnesses; 21 pass and 1 skips where AIDE is not installed |
+| `tests/observe/run.sh` | 26 observe pipeline witnesses; all 26 pass where AIDE is installed, and 21 pass with 1 skip where it is not — T12's five sub-witnesses report a single skip |
 | `tests/mesh/run-mesh.sh` | 3284 (actor × operation × flag) enforcement matrix trials |
 | `tests/dir-matrix.sh` | 40-cell directory-destination matrix (`make check-dir-matrix`) |
 | `tests/actor-wrapper/run.sh` | 21 wrapper/actor-identity witnesses (`make check-wrapper`) |

@@ -701,13 +701,17 @@ map fd the kernel hands out, to anything on the box. Measured with
 
 | kernel | no policy | `--pin` | `--pin --self-protect` |
 |---|---|---|---|
-| 6.8.0-139 | 1451–1452 ns | −0.2 % to +0.4 % | **+10 % to +17 %** (+145 to +252 ns) |
-| 7.0.0-31 | 1148–1153 ns | +0.1 % to +0.5 % | **+11 % to +12 %** (+121 to +138 ns) |
+| 6.8.0-139 | 1450–1452 ns | −0.3 % to +0.4 % | **+9 % to +17 %** (+128 to +252 ns) |
+| 7.0.0-31 | 1148–1153 ns | +0.1 % to +0.5 % | **+11 % to +13 %** (+121 to +144 ns) |
 
 Without the flag the cost is nil, because `comp_bpf_map` is not even loaded —
 every run lands within the noise of the no-policy baseline. With it, budget of
 order 100–250 ns per map-fd creation; the range is the guest, not the hook (7.0
-reproduced to within 17 ns across three runs, 6.8 spread between two). If you
+reproduced to within 23 ns across three runs, 6.8 spread across three). The
+percentage is the less stable half of the pair, because it moves with whatever
+else the guest is doing to the baseline: the release-candidate run measured
++127.7 ns on 6.8 against a 1449.6 ns baseline and called it +8.8 %, and
++143.5 ns on 7.0 against 1148.7 ns and called it +12.5 %. Read the nanoseconds. If you
 have a latency budget on `bpf(2)`, measure it on your own hardware. Nothing on
 the file or inode data plane changes either way: the pin-tamper branch costs
 one array lookup and one integer compare on any filesystem that is not the

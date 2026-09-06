@@ -30,12 +30,12 @@ not read `/etc/profile.d`, and `sudo` replaces `PATH` with its
 | bypass (in place) | `sudo tests/bypass/run-local.sh` | `44 PASS / 0 FAIL / 0 SKIP over 44 scripts` |
 | bypass (host driver) | `tests/bypass/run-all.sh` | see below — it is NOT an in-guest command |
 | strict-launch | `sudo tests/strict-launch/run.sh` | `PASS=17 FAIL=0` |
-| observe | `sudo tests/observe/run.sh` | `PASS=21 FAIL=0 SKIP=1` (T12: AIDE absent) |
+| observe | `sudo tests/observe/run.sh` | `PASS=26 FAIL=0 SKIP=0` where AIDE is installed (both guests); `PASS=21 FAIL=0 SKIP=1` where it is not — T12 is a five-part group that reports a single skip |
 | dir matrix | `sudo make check-dir-matrix` | `40/40 PASS` |
 | actor wrapper | `sudo make check-wrapper` | `Total PASS=21 FAIL=0` |
 | stability (quick) | `sudo make check-stability-quick` | `stability summary: pass=8 fail=0 skip=0` |
 | stability (full) | `sudo make check-stability` | 1024 cycles, ~45-60 min |
-| bpf(2) overhead | `sudo make bench-bpf-syscall` | three legs (no policy / `--pin` / `--pin --self-protect`); flag off within ±0.5 % of baseline, flag on +10 % to +17 % (~120-250 ns per `BPF_MAP_GET_FD_BY_ID`, guest-dependent) |
+| bpf(2) overhead | `sudo make bench-bpf-syscall` | three legs (no policy / `--pin` / `--pin --self-protect`); flag off within ±0.5 % of baseline, flag on +9 % to +17 % (~120-250 ns per `BPF_MAP_GET_FD_BY_ID`, guest-dependent; the nanoseconds reproduce, the percentage moves with the baseline) |
 
 ### `tests/bypass/run-all.sh` is a host-side driver
 

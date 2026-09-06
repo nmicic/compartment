@@ -103,7 +103,7 @@ Headline tallies inside `make check`:
 | `check-mesh` | 3284 trials: 3277 PASS / 0 FAIL / 0 KNOWN-GAP / 7 SKIP |
 | `check-bypass` | 44 PASS / 0 FAIL / 0 SKIP over 44 scripts |
 | `check-strict-launch` | PASS=17 FAIL=0 |
-| `check-observe` | PASS=21 FAIL=0 SKIP=1 (T12, AIDE not installed) |
+| `check-observe` | PASS=26 FAIL=0 SKIP=0 with AIDE installed; PASS=21 FAIL=0 SKIP=1 without (T12) |
 | `check-dir-matrix` | 40/40 PASS |
 | `check-wrapper` | PASS=21 FAIL=0 |
 | `check-profiles` | 20/20 profiles parsed cleanly |
