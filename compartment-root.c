@@ -93,6 +93,7 @@ struct child_args {
 static int  child_func(void *arg);
 static void write_uid_gid_map(pid_t pid, const char *map_str,
                                const char *map_file);
+static void deny_setgroups(pid_t pid, Config *config);
 static void drop_privileges(uid_t uid, gid_t gid);
 static void drop_capabilities(Config *config, int cap_last);
 static void apply_kept_caps(Config *config);
@@ -426,7 +427,10 @@ int main(int argc, char *argv[])
         fprintf(stderr, "  rootdir: %s\n", config.rootdir);
         fprintf(stderr, "  username: %s (drop to uid=%u gid=%u)\n",
                 config.username, drop_uid, drop_gid);
-        fprintf(stderr, "  namespace mapping: 0-65535 → 0-65535 (range)\n");
+        fprintf(stderr, "  uid map: %s",
+                config.uid_map ? config.uid_map : "0 0 65536 (identity)\n");
+        fprintf(stderr, "  gid map: %s",
+                config.gid_map ? config.gid_map : "0 0 65536 (identity)\n");
         fprintf(stderr, "  loopback: %s\n", config.loopback ? "yes" : "no");
         if (config.netns)
             fprintf(stderr, "  netns: %s\n", config.netns);
@@ -488,6 +492,16 @@ int main(int argc, char *argv[])
 
     /* ── Clone with new namespaces ─────────────────────────────────── */
 
+    /* Clear supplementary groups here, in the parent: once
+     * /proc/<pid>/setgroups is set to "deny" below, the child can no
+     * longer do it itself, and it would otherwise inherit the invoking
+     * root's groups — which the identity gid map keeps meaningful inside
+     * the container. */
+    if (setgroups(0, NULL) != 0 && errno != EPERM) {
+        perror("compartment-root: setgroups");
+        return 1;
+    }
+
     int flags = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC |
                 CLONE_NEWNET | CLONE_NEWUSER | CLONE_NEWCGROUP | SIGCHLD;
 
@@ -519,12 +533,20 @@ int main(int argc, char *argv[])
 
     close(pipe_fd[0]);  /* parent doesn't read */
 
+    /* Deny setgroups before the gid map is written (standard user-namespace
+     * hardening sequence). */
+    deny_setgroups(child_pid, &config);
+
     /* Write UID/GID maps — parent has root in parent namespace, can
-     * write multi-entry range maps. Maps inside 0-65535 → outside
-     * 0-65535 so the child can operate as root (UID 0) during setup
-     * and later setuid to the service user (drop_uid). */
-    write_uid_gid_map(child_pid, "0 0 65536\n", "uid_map");
-    write_uid_gid_map(child_pid, "0 0 65536\n", "gid_map");
+     * write multi-entry range maps.  The default is the identity map
+     * 0-65535 → 0-65535, so the child can operate as root (UID 0) during
+     * setup and later setuid to the service user (drop_uid); the
+     * `uid-map`/`gid-map` profile directives replace it with an explicit
+     * <container-start> <host-start> <count> range. */
+    write_uid_gid_map(child_pid, config.uid_map ? config.uid_map : "0 0 65536\n",
+                      "uid_map");
+    write_uid_gid_map(child_pid, config.gid_map ? config.gid_map : "0 0 65536\n",
+                      "gid_map");
 
     /* Assign to cgroups — must happen from host filesystem context,
      * before the child does pivot_root. */
@@ -592,8 +614,23 @@ static int child_func(void *arg)
     }
     close(pipe_fd);
 
-    /* Now we're root inside the user namespace (0→0 range mapping).
+    /* Become root *of the new user namespace*.
+     *
+     * The child was cloned from the host's root, so its credentials are
+     * host uid/gid 0.  With the default identity map that is also uid 0
+     * inside the namespace and this is a no-op.  With a shifted
+     * `uid-map`/`gid-map` (say "0 100000 65536") host uid 0 is not mapped
+     * at all, so every file the child creates is owned by an unmapped uid
+     * and a later open() of it fails with EOVERFLOW.  Switching to the
+     * namespace's uid 0 fixes that and keeps the capability set:
+     * cap_emulate_setxuid() only clears capabilities when a process moves
+     * *away* from the namespace's root uid, and this moves towards it.
+     *
      * Parent has also assigned cgroups from the host context. */
+    if (setgid(0) != 0 || setuid(0) != 0) {
+        perror("compartment-root: switch to container root");
+        exit(EXIT_FAILURE);
+    }
 
     /* 2. Join existing network namespace if specified */
     if (config->netns)
@@ -688,8 +725,14 @@ static int child_func(void *arg)
         exit(EXIT_FAILURE);
     }
 
-    /* Create pivot point */
-    (void)mkdir(".pivot_old", 0700);
+    /* Create pivot point.  Fatal on failure: without it pivot_root() fails
+     * with a bare ENOENT.  The usual cause is a non-identity uid-map whose
+     * mapped host uid does not own rootdir. */
+    if (mkdir(".pivot_old", 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "compartment-root: mkdir %s/.pivot_old: %s\n",
+                config->rootdir, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
     /* d) pivot_root — no glibc wrapper, use syscall directly */
     if (syscall(SYS_pivot_root, ".", ".pivot_old") != 0) {
@@ -950,6 +993,53 @@ static int child_func(void *arg)
 
 /* ── UID/GID map writer (called by parent) ──────────────────────────── */
 
+/*
+ * deny_setgroups — write "deny" to /proc/<pid>/setgroups before gid_map
+ *
+ * Standard user-namespace hardening: while setgroups(2) is still allowed
+ * inside the namespace, a process can drop a supplementary group that
+ * carried a *negative* permission (a group named in a deny ACL) and gain
+ * access it did not have.  compartment-root's parent is real root, so the
+ * gid_map write succeeds either way — this is defence in depth, and it has
+ * to happen before the gid map is written.
+ *
+ * Skipped when the policy explicitly keeps CAP_SETGID: a container that is
+ * allowed to change its groups needs setgroups() to work.
+ */
+static void deny_setgroups(pid_t pid, Config *config)
+{
+    for (int i = 0; i < config->cap_allowed_count; i++) {
+        if (resolve_cap(config->cap_allowed_names[i]) == CAP_SETGID) {
+            if (config->verbose)
+                fprintf(stderr, "compartment-root: setgroups left enabled "
+                        "(policy keeps CAP_SETGID)\n");
+            return;
+        }
+    }
+
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%d/setgroups", pid);
+
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd == -1) {
+        /* Kernels before 3.19 have no such file — nothing to deny. */
+        if (errno == ENOENT)
+            return;
+        fprintf(stderr, "compartment-root: open %s: %s\n",
+                path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    if (write(fd, "deny", 4) != 4) {
+        fprintf(stderr, "compartment-root: write %s: %s\n",
+                path, strerror(errno));
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+    close(fd);
+    if (config->verbose)
+        fprintf(stderr, "compartment-root: setgroups denied\n");
+}
+
 static void write_uid_gid_map(pid_t pid, const char *map_str,
                                const char *map_file)
 {
@@ -977,14 +1067,12 @@ static void write_uid_gid_map(pid_t pid, const char *map_str,
 
 static void drop_privileges(uid_t uid, gid_t gid)
 {
-    /* Clear supplementary groups */
-    if (setgroups(0, NULL) != 0) {
-        if (errno != EPERM) {
-            perror("compartment-root: setgroups");
-            exit(EXIT_FAILURE);
-        }
-        /* EPERM can happen if setgroups was denied — non-fatal,
-         * supplementary groups are empty in a new user namespace */
+    /* Clear supplementary groups.  Normally a no-op: the parent already
+     * cleared them before clone() and then wrote "deny" to
+     * /proc/<pid>/setgroups, so this call is expected to return EPERM. */
+    if (setgroups(0, NULL) != 0 && errno != EPERM) {
+        perror("compartment-root: setgroups");
+        exit(EXIT_FAILURE);
     }
     if (setgid(gid) != 0) {
         perror("compartment-root: setgid");

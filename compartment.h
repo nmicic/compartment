@@ -118,6 +118,8 @@ typedef struct {
     int         loopback;
     const char *mount_masks[MAX_PATHS];
     int         mount_mask_count;
+    char       *uid_map;        /* "<inside> <outside> <count>\n", NULL = identity */
+    char       *gid_map;        /* idem for gids */
 } Config;
 
 /* ── Syscall name → number table ────────────────────────────────────
@@ -839,6 +841,40 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             if (parse_bool(val, &cfg->loopback) != 0) {
                 fprintf(stderr, "compartment: %s:%d: invalid value for loopback: '%s' (use on/off)\n", path, lineno, val);
                 fclose(fp); return -1;
+            }
+        } else if (strcmp(directive, "uid-map") == 0 ||
+                   strcmp(directive, "gid-map") == 0) {
+            /* <container-start> <host-start> <count> — the range written to
+             * /proc/<pid>/uid_map (or gid_map) of the container's user
+             * namespace.  Without these directives the map is the identity
+             * map "0 0 65536", which gives a capability boundary but no uid
+             * isolation: container uid 0 is host uid 0 for DAC purposes.
+             * "0 100000 65536" maps the container onto an unprivileged
+             * subuid range instead. */
+            unsigned long inside, outside, count;
+            char extra[2];
+            if (sscanf(val, "%lu %lu %lu %1s",
+                       &inside, &outside, &count, extra) != 3 ||
+                count == 0 ||
+                inside  > (unsigned long)UINT32_MAX ||
+                outside > (unsigned long)UINT32_MAX ||
+                count   > (unsigned long)UINT32_MAX ||
+                inside  + count > (unsigned long)UINT32_MAX + 1UL ||
+                outside + count > (unsigned long)UINT32_MAX + 1UL) {
+                fprintf(stderr, "compartment: %s:%d: invalid %s: '%s' "
+                        "(expected: <container-start> <host-start> <count>)\n",
+                        path, lineno, directive, val);
+                fclose(fp);
+                return -1;
+            }
+            char map[64];
+            snprintf(map, sizeof(map), "%lu %lu %lu\n", inside, outside, count);
+            if (directive[0] == 'u') {
+                free(cfg->uid_map);
+                cfg->uid_map = strdup(map);
+            } else {
+                free(cfg->gid_map);
+                cfg->gid_map = strdup(map);
             }
         } else if (strcmp(directive, "mount-mask") == 0) {
             if (cfg->mount_mask_count < MAX_PATHS)
