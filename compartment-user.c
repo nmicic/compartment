@@ -354,7 +354,7 @@ static void print_usage(void)
         "\n"
         "Filesystem (Landlock):\n"
         "  --ro PATH             Read-only + execute access\n"
-        "  --rw PATH             Read-write + execute access\n"
+        "  --rw PATH             Read-write access (no execute — W^X)\n"
         "  --exec PATH           Read + execute access (alias for --ro)\n"
         "  --workdir PATH        Working directory (added as --rw)\n"
         "  --no-landlock         Disable Landlock\n"

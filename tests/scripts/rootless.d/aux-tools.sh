@@ -2,7 +2,8 @@
 # Copyright (c) 2026 Nenad Mićić <nenad@micic.be>
 # SPDX-License-Identifier: Apache-2.0
 #
-# aux-tools.sh — rootless tests for tools/syscall.py and the extra/ helpers
+# aux-tools.sh — rootless tests for tools/syscall.py, the extra/ helpers,
+#                and the option documentation that describes them
 #
 # Everything here runs as an unprivileged user and starts no daemons.
 # The proxy helpers are exercised through stubs (a fake `crontab`, a fake
@@ -359,6 +360,49 @@ else
     pass "disable.sh fails loudly when stop.sh cannot run"
 fi
 unset CRONTAB_STORE
+
+echo ""
+
+# ── Test group: option docs match enforcement ──────────────────────
+
+echo "--- Test group: option docs match enforcement ---"
+
+# --rw is W^X: read+write, deliberately no execute. Both the usage text and
+# the man page said "read-write + execute". Assert the documentation and the
+# behaviour together, so they cannot drift apart again.
+"${CU}" --help >"${WORK}/help.txt" 2>&1 || true
+RW_HELP=$(grep -E '^[[:space:]]*--rw PATH' "${WORK}/help.txt" || true)
+if echo "${RW_HELP}" | grep -qE '\+[[:space:]]*execute'; then
+    fail "--help still claims --rw grants execute: ${RW_HELP}"
+else
+    pass "--help does not claim --rw grants execute"
+fi
+if echo "${RW_HELP}" | grep -qiE 'no execute|W\^X'; then
+    pass "--help says --rw does not grant execute"
+else
+    fail "--help does not mention that --rw withholds execute: ${RW_HELP}"
+fi
+if grep -qE 'read-write \+ execute' "${REPO_DIR}/man/compartment-user.1"; then
+    fail "man/compartment-user.1 still claims --rw grants execute"
+else
+    pass "man/compartment-user.1 does not claim --rw grants execute"
+fi
+
+RWDIR="${WORK}/rwdir"
+mkdir -p "${RWDIR}"
+cp /bin/true "${RWDIR}/probe"
+if "${CU}" --profile none --no-seccomp --ro /usr --ro /lib --ro /lib64 \
+       --ro /etc --rw "${RWDIR}" -- "${RWDIR}/probe" >/dev/null 2>&1; then
+    fail "a binary in a --rw directory executed — W^X is not enforced"
+else
+    pass "a binary in a --rw directory cannot be executed (W^X holds)"
+fi
+if "${CU}" --profile none --no-seccomp --ro /usr --ro /lib --ro /lib64 \
+       --ro /etc --exec "${RWDIR}" -- "${RWDIR}/probe" >/dev/null 2>&1; then
+    pass "the same binary runs when the directory is granted --exec"
+else
+    fail "--exec does not grant execute"
+fi
 
 echo ""
 
