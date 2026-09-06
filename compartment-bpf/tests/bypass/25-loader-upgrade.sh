@@ -61,12 +61,23 @@ case "$w7" in
 esac
 
 # W6: a group-writable successor must be refused at pin time.
-cp "$SP_OWNER" "$TMP/loader-bad"; chown 0:0 "$TMP/loader-bad"; chmod 0775 "$TMP/loader-bad"
-w6=$(COMPARTMENT_BPF_PASSPHRASE="$SP_PASS" "$SP_OWNER" --pin --self-protect \
-     --authorize-loader "$TMP/loader-bad" "$TMP/policy.conf" 2>&1 | head -20)
+#
+# Run under `timeout`, and never through `| head`. This invocation is expected
+# to fail before it attaches; if the refusal ever regresses, the loader goes
+# LIVE and blocks in its ringbuf poll forever. It prints fewer lines than
+# `head -20` wants, so the pipe never closes and the command substitution never
+# returns — the witness would hang until the runner SIGKILLs it, with a
+# self-protected policy pinned and its teardown never reached.
+sp_install "$TMP/loader-bad"
+chmod 0775 "$TMP/loader-bad" || bypass_die "cannot chmod the group-writable fixture"
+w6=$(COMPARTMENT_BPF_PASSPHRASE="$SP_PASS" timeout 30 "$SP_OWNER" --pin --self-protect \
+     --authorize-loader "$TMP/loader-bad" "$TMP/policy.conf" 2>&1)
+w6rc=$?
+[ "$w6rc" -ne 124 ] \
+	|| bypass_fail "W6 BYPASS: --pin with a group-writable --authorize-loader did not refuse; it went live and had to be killed. A self-protected policy may be pinned — check $SP_PIN"
 case "$w6" in
 	*"group- or world-writable"*) : ;;
-	*) bypass_fail "W6: a group-writable --authorize-loader target was accepted: $(echo "$w6" | tail -2 | tr '\n' ' ')" ;;
+	*) bypass_fail "W6: a group-writable --authorize-loader target was accepted (rc=$w6rc): $(printf '%s' "$w6" | tail -2 | tr '\n' ' ')" ;;
 esac
 sp_drain || bypass_fail "W6: the refused --pin left programs loaded"
 [ "$(sp_npins)" -eq 0 ] || bypass_fail "W6: the refused --pin left $(sp_npins) pins behind"
@@ -79,7 +90,10 @@ sp_kill_daemon
 if sp_unpin "$NEXT" "$TMP/w1.log"; then
 	bypass_fail "W1 BYPASS: an unauthorised image at a different inode removed the policy"
 fi
-for phrase in "self-protect" "authorised loader set" "DENY_PIN_TAMPER" "reboot"; do
+# Single-word tokens only: the refusal is wrapped prose, and a multi-word
+# phrase that happens to sit on one line today breaks on the next rewrap.
+# W3 below learned this the hard way.
+for phrase in "self-protect" "authorize-loader" "DENY_PIN_TAMPER" "reboot"; do
 	grep -qi -- "$phrase" "$TMP/w1.log" \
 		|| { cat "$TMP/w1.log" >&2; bypass_fail "W1: the refusal does not mention '$phrase' — an operator cannot act on it"; }
 done
@@ -92,7 +106,7 @@ if { echo tampered > "$TARGET"; } 2>/dev/null; then
 fi
 
 # W3. Two halves: the refusal itself, and that it is legible. With the flag on,
-# every one of the eighteen counter pins refuses, and eighteen bare errno lines
+# every one of the fifteen counter pins refuses, and fifteen bare errno lines
 # with no explanation would be the worst possible answer to a one-sentence
 # problem.
 w3all=$("$NEXT" --stats 2>&1)

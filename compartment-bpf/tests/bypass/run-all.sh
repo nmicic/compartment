@@ -203,7 +203,14 @@ for script in $scripts; do
 	# run-all run before this. 60s is generous for every shipped
 	# witness; the longest is BX-9-version-mismatch ~3s. SIGTERM
 	# at the cap then SIGKILL 5s later if still alive.
-	vm_run "cd ${VM_WORKDIR} && REPO=${VM_WORKDIR} timeout --kill-after=5s 60s bash tests/bypass/$name 2>&1" \
+	# 180s for the self-protection witnesses: they pin and unpin a real
+	# policy and wait for the drain, and a kill mid-cycle leaves a
+	# self-protected pin tree behind. Same rule as run-local.sh.
+	case "$name" in
+		2[2-6]-*) wcap=180s ;;
+		*)        wcap=60s ;;
+	esac
+	vm_run "cd ${VM_WORKDIR} && REPO=${VM_WORKDIR} timeout --kill-after=5s ${wcap} bash tests/bypass/$name 2>&1" \
 		> "$per_script" 2>&1 || true
 	# Per-script label check.
 	if grep -qE '^(PASS|FAIL|SKIP) ' "$per_script"; then

@@ -26,8 +26,14 @@ sp_npins()  { ls "$SP_PIN/links" 2>/dev/null | wc -l; }
 # Wait for the kernel to free every compartment program. --unpin's own drain
 # proof does this, but a witness that re-pins needs it too: two overlapping
 # instances make every count in the witness ambiguous.
+# The runner caps each witness at 60 s (run-local.sh / run-all.sh,
+# `timeout --kill-after=5s 60s`). Every wait in this file has to fit inside
+# that with room for the rest of the witness, or a slow guest produces a
+# script killed WITHOUT a label — counted FAIL by the runner, and with the
+# teardown never reached, so a self-protected policy is left pinned. 25 s is
+# ample: a drain after --unpin has been under 2 s on both shipped kernels.
 sp_drain() {
-	for _ in $(seq 1 90); do
+	for _ in $(seq 1 25); do
 		[ "$(sp_n_comp)" -eq 0 ] && return 0
 		sleep 1
 	done
@@ -68,7 +74,7 @@ sp_pin() {
 	COMPARTMENT_BPF_PASSPHRASE="$SP_PASS" \
 		"$_img" --pin --self-protect "$@" "$_prof" >"$_log" 2>&1 &
 	SP_PID=$!
-	for _ in $(seq 1 400); do
+	for _ in $(seq 1 150); do   # 15 s; see the note on sp_drain
 		grep -q '\[run\] compartment-bpf live' "$_log" 2>/dev/null && return 0
 		kill -0 "$SP_PID" 2>/dev/null || break
 		sleep 0.1
@@ -102,15 +108,40 @@ sp_audit_wait() {
 	return 1
 }
 
-# Teardown shared by all four: stop the daemon, unpin with the image that
+# Teardown shared by all of them: stop the daemon, unpin with the image that
 # pinned (recorded in $SP_OWNER), drain, then hand back to lib-bypass.
+#
+# The unpin rc is load-bearing, not decoration. $SP_OWNER lives inside $TMP,
+# and lib-bypass's teardown rm -rf's $TMP — so if the unpin failed and we
+# deleted anyway, the box would be left with a self-protected policy whose ONLY
+# authorised image no longer exists, clearable only by rebooting, and every
+# later self-protection witness would SKIP at sp_check_env for the rest of the
+# guest's life. On a failed unpin we keep the image, say where it is, and let
+# lib-bypass's rm -rf be skipped.
 sp_teardown() {
 	sp_kill_daemon
-	[ -n "${SP_OWNER:-}" ] && sp_unpin "$SP_OWNER" >/dev/null 2>&1
-	sp_drain
+	_unpin_ok=1
+	if [ -n "${SP_OWNER:-}" ]; then
+		sp_unpin "$SP_OWNER" >/dev/null 2>&1 || _unpin_ok=0
+	fi
+	sp_drain || _unpin_ok=0
 	for m in ${SP_MOUNTS:-}; do
 		umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
 	done
+	# Also sweep the control pins the witnesses create outside PIN_ROOT:
+	# --unpin never sees them, and a leftover makes the NEXT run's
+	# `bpftool map create` fail EEXIST and report a misleading SKIP.
+	rm -f /sys/fs/bpf/bx22ctl /sys/fs/bpf/bx23ctl 2>/dev/null || true
+	if [ "$_unpin_ok" -eq 0 ] && [ -n "${SP_OWNER:-}" ] && [ -e "$SP_OWNER" ]; then
+		echo "sp_teardown: --unpin did NOT complete and this box may still" >&2
+		echo "  carry a self-protected policy. KEEPING the authorised loader" >&2
+		echo "  image at $SP_OWNER — it is the only thing that can unpin it." >&2
+		echo "  Run: COMPARTMENT_BPF_PASSPHRASE='$SP_PASS' $SP_OWNER --unpin" >&2
+		echo "  If that image is gone, only a reboot clears the pin tree." >&2
+		# Deliberately NOT calling bypass_teardown: it rm -rf's $TMP.
+		[ -n "${BYPASS_WRAPDIR:-}" ] && rm -rf "$BYPASS_WRAPDIR"
+		return 0
+	fi
 	bypass_teardown
 }
 
@@ -127,8 +158,8 @@ sp_expect_links() {
 	grep -q '\[probe\] file_ioctl_compat hook: present' "$1" && _compat=present
 	grep -q 'self-protection ARMED' "$1" \
 		|| bypass_fail "the loader did not report self-protection ARMED; the witness would be measuring the default build"
-	_want=$(mktemp /tmp/sp-links-want.XXXXXX)
-	_got=$(mktemp /tmp/sp-links-got.XXXXXX)
+	_want=$(mktemp "${TMP:-/tmp}/sp-links-want.XXXXXX")
+	_got=$(mktemp "${TMP:-/tmp}/sp-links-got.XXXXXX")
 	awk -v compat="$_compat" '
 		/^[[:space:]]*(#|$)/ { next }
 		{

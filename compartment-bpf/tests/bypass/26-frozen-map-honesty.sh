@@ -36,11 +36,18 @@ BYPASS_NAME="26-frozen-map-honesty"
 bypass_check_env
 command -v bpftool >/dev/null 2>&1 || bypass_skip "bpftool not installed"
 command -v clang   >/dev/null 2>&1 || bypass_skip "clang not installed (needed to build the attacker BPF object)"
+command -v python3 >/dev/null 2>&1 || bypass_skip "python3 not installed (needed to read the map id out of bpftool -j)"
 [ -r "$REPO/vmlinux.h" ] || bypass_skip "vmlinux.h not generated in $REPO"
-echo 'int main(void){return 0;}' > /tmp/bx26-probe.c
-cc -o /tmp/bx26-probe /tmp/bx26-probe.c -lbpf 2>/dev/null \
-	|| { rm -f /tmp/bx26-probe.c; bypass_skip "libbpf development files not available (need -lbpf to build the runner)"; }
-rm -f /tmp/bx26-probe /tmp/bx26-probe.c
+# This witness picks a map by NAME out of a host-wide listing, so a second
+# compartment instance would make it ambiguous which sealed_devs it measured.
+[ "$(bpftool prog show 2>/dev/null | grep -c 'name comp_')" -eq 0 ] \
+	|| bypass_skip "another compartment-bpf instance is loaded; refusing to measure against a dirty box"
+
+PROBE=$(mktemp -d /tmp/bx26-probe.XXXXXX)
+echo 'int main(void){return 0;}' > "$PROBE/p.c"
+cc -o "$PROBE/p" "$PROBE/p.c" -lbpf 2>/dev/null \
+	|| { rm -rf "$PROBE"; bypass_skip "libbpf development files not available (need -lbpf to build the runner)"; }
+rm -rf "$PROBE"
 
 bypass_setup full
 
