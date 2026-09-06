@@ -585,12 +585,16 @@ stay 0.
 
 #### The errno an operator sees
 
+All five lines below are the verbatim text measured on 6.8.0-139 and
+7.0.0-31 with bpftool 7.4 and 7.7.
+
 | operation, refused | errno | what it looks like |
 |---|---|---|
 | any `bpf()` that would hand out a map fd (`BPF_MAP_GET_FD_BY_ID`, `BPF_OBJ_GET` on a pin) | `EPERM` | `Error: can't get map by id (N): Operation not permitted` |
-| `rm` / `mv` / `rmdir` on a pin object or pin directory | `EACCES` | `rm: cannot remove '…': Permission denied` |
-| `umount` / over-mount of the bpffs holding the pins | `EACCES` | `umount: /sys/fs/bpf: … Permission denied` |
-| `--unpin` or `--stats` from an unauthorised image | `EPERM`, then a named remedy | see below |
+| `rm` / `mv` / `rmdir` on a pin object or pin directory | `EACCES` | `rm: cannot remove '/sys/fs/bpf/compartment/links/comp_file_open': Permission denied` |
+| `umount` / over-mount of the bpffs holding the pins | `EACCES` | `umount: /sys/fs/bpf: block devices are not permitted on filesystem.` — util-linux's rendering of `EACCES` from `umount2(2)`, which is unhelpful but is not ours to change; the audit stream carries `DENY_UMOUNT` |
+| `--unpin` from an unauthorised image | `EACCES` on the first pin | `unlinkat /sys/fs/bpf/compartment/links/comp_bpf_map: Permission denied`, then the paragraph below |
+| `--stats` from an unauthorised image | `EPERM` | `open pinned /sys/fs/bpf/compartment/maps/deny_total: Operation not permitted`, then one paragraph naming the remedy — printed once, not once per counter, and never as "no pinned counters found" |
 
 `EPERM` on the `bpf()` side is that syscall's own dialect: `bpf(2)` reports
 every "you do not have the right to this object" as `EPERM`, including
@@ -641,7 +645,7 @@ new binary at pin time; a stranded tree costs a reboot.**
 Running `--unpin` from an unauthorised image fails loudly and tells you so:
 
 ```
-unlinkat /sys/fs/bpf/compartment/links/comp_bpf_map: Operation not permitted
+unlinkat /sys/fs/bpf/compartment/links/comp_bpf_map: Permission denied
 unpin: the running policy was pinned with --self-protect and this
        executable is not in its authorised loader set, so the kernel
        refused to remove the pin (ACTION_DENY_PIN_TAMPER in the audit
