@@ -3,6 +3,212 @@
 All notable changes to compartment-bpf are documented here.
 Format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.8.0] — 2026-09-06
+
+Security review pass over the BPF enforcement surface: four coverage gaps
+closed, one strict-launch design flaw fixed, and one behaviour change (see
+below). No struct layout change.
+
+### Behaviour change — timestamp writes are now `no-chmod`-class
+
+**Read this before upgrading a host with `no-chmod` seals in the field.**
+
+`inode_setattr` now treats `ATTR_ATIME|ATTR_MTIME` without `ATTR_SIZE` as a
+chmod-class operation on a **directly sealed** inode. That is correct
+anti-forensics hardening — rewriting mtime on a sealed file is exactly what an
+attacker does to defeat an integrity baseline, and the v0.5 parent-dir rule
+had classified it this way for DD-sealed children since v0.5 — but it changes
+the meaning of every existing `no-chmod` seal.
+
+Concretely, on a directly `no-chmod`-sealed file a non-actor now gets
+`EACCES` from `touch`, `touch -d`, `touch -a`, `utimensat(2)`, and from the
+timestamp-restoring tail of `cp -p`, `rsync -a`, `tar -x`, `install -p` and
+`unzip`. Any liveness sentinel that `touch`es a sealed file will start
+failing. Truncation is unaffected: `ATTR_SIZE` stays write-class, so a
+`no-chmod`-only seal still permits `truncate` (regression-guarded by
+`tests/bypass/19` R).
+
+If you need the old behaviour for a specific path, add the writer to that
+seal's `actor=` list. A dedicated `no-times` seal flag (SEAL bit 4 is free
+and reserved) is the principled fix and is a follow-up, not part of v0.8.
+
+### ABI bump 0x0007 → 0x0008
+
+- **New action codes** `ACTION_DENY_MOUNT = 14` and
+  `ACTION_DENY_UMOUNT = 15`, each with a value-drift `_Static_assert`;
+  `action_name()` prints `DENY_MOUNT` / `DENY_UMOUNT`.
+- **New map** `sealed_devs` (`__u64 s_dev` → `__u32` refcount), populated by
+  the loader alongside `sealed_inodes` / `sealed_dirs` and frozen with them.
+  Not pinned (like the other seal maps); listed in `KNOWN_MAP_NAMES` for
+  forward compatibility.
+- The bump makes a v0.7 audit consumer reject v0.8 events loud instead of
+  printing `action=?` for code 14.
+
+### Closed: `no-chmod` bypass via POSIX ACLs (`inode_set_acl` / `inode_remove_acl`)
+
+- Since Linux 6.2, `setxattr(2)`/`removexattr(2)` on `system.posix_acl_*` are
+  routed to `vfs_set_acl()`/`vfs_remove_acl()`, which call
+  `security_inode_set_acl()`/`security_inode_remove_acl()` and never the
+  xattr hooks. On the project's ≥ 6.6 floor `setfacl -m/-x/-b` rewrote the
+  effective permission bits of a `no-chmod` sealed file while `chmod` was
+  denied. Two new programs mirror the xattr pair (per-inode `SEAL_NO_CHMOD`
+  + recursive parent-dir rule). Witness: `tests/bypass/16-setfacl-no-chmod.sh`.
+
+### Closed: mount shadowing of sealed paths (`sb_mount` / `move_mount`)
+
+- A new mount whose mountpoint is a sealed inode, or lies inside a
+  recursively sealed subtree, is denied with `ACTION_DENY_MOUNT`. Covers
+  `mount --bind`, `mount --move` / `MS_MOVE`, `move_mount(2)`,
+  `open_tree(OPEN_TREE_CLONE)`+`move_mount`, `fsmount`+`move_mount` and fresh
+  filesystem mounts. `MS_REMOUNT` and propagation-only changes attach nothing
+  and pass. Actor-bound seals keep their allowlist (an actor may mount inside
+  its own tree). Bind-mounting *from* a sealed path elsewhere stays allowed —
+  the alias shares dentries, so every seal still applies through it.
+- The flag exemptions mirror `path_mount()`'s dispatch order exactly. The
+  kernel tests `MS_BIND` **before** the propagation bits, so exempting on any
+  propagation bit would let `MS_BIND|MS_PRIVATE` attach a bind mount inside a
+  sealed subtree — and `do_loopback()` reaches `graft_tree()` without calling
+  `security_move_mount()`, so the second hook would not catch it either.
+  Witnessed by `tests/bypass/17` W5 through a raw `mount(2)`.
+- `mount --move` is dispatched by `sb_mount` and **only** there:
+  `do_move_mount_old()` calls `do_move_mount()` directly and never
+  `security_move_mount()`. `tests/bypass/17` W6 therefore drives
+  `open_tree(OPEN_TREE_CLONE)`+`move_mount(2)`, the only shape that reaches
+  the `move_mount` hook without first passing `sb_mount`.
+- Retires the LIMITATIONS rows "bind-mount-OVER sealed path" and
+  "Mount-inside-sealed-subtree bypass"; a residual row lists what is still
+  open (`pivot_root`, mounts on the root of a pre-existing nested mount,
+  and unmounting a bind mount that was itself the sealed path).
+- `tests/bypass/07-mount-bind-decoy.sh` now asserts the deny (it used to
+  document the gap); new `tests/bypass/17-mount-inside-sealed-dir.sh`; mesh
+  §3.23 row (a) flips from KNOWN-GAP to ENFORCED.
+
+### Closed: path shadowing by detaching the filesystem (`sb_umount`)
+
+- Gating the mount *destination* covers only half the shadowing class. The
+  other half needs no mount to start: `umount -l /data` detaches the
+  filesystem, the sealed path then resolves to the mountpoint dentry in the
+  **parent** filesystem — which carries no seal — and the follow-up
+  `mount -t tmpfs none /data` sails straight through the destination gate.
+  The sealed inodes are untouched and completely unreachable; every sealed
+  path reads attacker content.
+- The loader's held `O_PATH` fds made a plain `umount` return `EBUSY` in
+  daemon mode, but that was an implementation accident, not a control: it
+  never blocked `MNT_DETACH`, and in daemonless `--pin` mode the fds die
+  with the loader.
+- `sb_umount` now denies `umount` and `umount -l` on any filesystem that
+  hosts sealed inodes, and `move_mount`'s new from-side gate denies moving
+  such a filesystem away from its mountpoint, both with a new
+  `ACTION_DENY_UMOUNT = 15`. (Residual: the classic `mount(2)`+`MS_MOVE`
+  spelling of `mount --move` is not gated on the source side — no hook can
+  see it. `do_move_mount_old()` bypasses `security_move_mount()` and
+  `security_sb_mount()` gets the source only as an unresolvable string.
+  Recorded in LIMITATIONS.) The hook is handed a `struct vfsmount`
+  and has no route back to an inode, so it needs its own state: a new
+  `sealed_devs` HASH (`__u64 s_dev` → refcount) that the loader populates as
+  it writes `sealed_inodes` / `sealed_dirs`, frozen with them. The freeze
+  table moves 18 → 19.
+- Precision matters, because `s_dev` alone is far too coarse — seal one file
+  on `/` and every bind mount of a root-filesystem directory would become
+  unmountable. The hook therefore also requires `mnt->mnt_root ==
+  sb->s_root`, i.e. it denies only detaches of the **whole filesystem**.
+  Unmounting a bind mount of a subdirectory detaches nothing and stays
+  allowed; `tests/bypass/20` G is the over-deny guard for exactly that.
+- **Operational consequence:** while a policy is live you cannot unmount a
+  filesystem that holds sealed paths. Run `compartment-bpf --unpin` first.
+  `tests/inode-seal-witness.sh` W4 changes shape accordingly: it used to
+  infer the held-fd pin from `EBUSY`, but `security_sb_umount()` is the
+  opening statement of `do_umount()` and now answers first, so W4 asserts the
+  deny (with the `DENY_UMOUNT` audit line proving it is ours) and W3's direct
+  `/proc/<pid>/fd` read carries the held-fd proof.
+- Witness: `tests/bypass/20-umount-shadow.sh`; mesh §3.23(e) flips from
+  "unmount succeeds, entries orphaned" to "unmount denied, seal still
+  enforced".
+
+### Closed: inode-flag ioctls and timestamp forgery under `no-chmod`
+
+- New `file_ioctl` program gates `FS_IOC_SETFLAGS` / `FS_IOC32_SETFLAGS` /
+  `FS_IOC_FSSETXATTR` / `FS_IOC_SETVERSION` (`chattr +i/+a`, project ids) on
+  `no-chmod` seals; every other ioctl returns after a few compares.
+- A companion `file_ioctl_compat` program covers 32-bit callers. A compat
+  process enters `COMPAT_SYSCALL_DEFINE3(ioctl)`, which calls
+  `security_file_ioctl_compat()` and **never** `security_file_ioctl()`, so
+  without it an i386 `chattr +i` walked past the gate. The hook was
+  backported into stable 6.6.y, so the loader BTF-probes
+  `bpf_lsm_file_ioctl_compat` and autoload-gates the program rather than
+  testing the kernel version. Witness: `tests/bypass/18-chattr-no-chmod.sh`
+  (W1/W2 native, W3 via `gcc -m32`).
+- `inode_setattr` per-inode rule: `ATTR_ATIME|ATTR_MTIME` without
+  `ATTR_SIZE` (`utimensat`, `touch -d`) is now chmod-class, matching the
+  v0.5 parent-dir rule. See the Behaviour change section above.
+  Witness: `tests/bypass/19-utimes-no-chmod.sh`.
+
+### Fixed: strict-launch marker written before the exec point of no return
+
+- The marker was set in `bprm_check_security`, which `search_binary_handler()`
+  calls immediately before `fmt->load_binary()`. Every failure inside
+  `load_elf_binary()` **before** `begin_new_exec()` returns `-errno` to the
+  caller's original image, which keeps running its old code with whatever the
+  check hook already wrote. The most usable of those failures is
+  `open_exec(elf_interpreter)` → `-ENOENT`: an attacker who controls a mount
+  namespace shadows the path in the launcher's `PT_INTERP` and forces it
+  deterministically, with no race. A task already running the actor target
+  under `LD_PRELOAD` could `execve()` the sealed launcher, force that
+  failure, and return to its own code holding a valid marker whose target
+  matched its exe — satisfying every strict-launch condition.
+- (Failures *inside* `begin_new_exec()` and later — `de_thread()`,
+  `unshare_files()`/`dup_fd()`, `exec_mmap()` — are past
+  `bprm->point_of_no_return`, and `bprm_execve()` converts them to a fatal
+  `SIGSEGV`. They never return to the caller and were never the window.)
+- Marker set/keep/clear now lives in `bprm_committed_creds`, which runs only
+  for a committed image; an unresolvable exec target drops any existing
+  marker (fail closed).
+- The hook is attached **sleepable** (`lsm.s/`). `bpf_lsm_bprm_committed_creds`
+  is in the kernel's `sleepable_lsm_hooks` allowlist on both 6.8 and 7.0, and
+  sleepable context is what makes `bpf_task_storage_get(F_CREATE)` a blocking
+  allocation. The residual failure is now counted rather than silent — see
+  the new counter below.
+- Pin link name: `comp_bprm_check_security` → `comp_bprm_committed_creds`.
+  `--unpin` still sweeps the legacy name, so a v0.4..v0.7 pin tree can be
+  torn down before re-pinning.
+- Known and unchanged: a `#!`-script launcher has never worked. `bprm->file`
+  at commit time is the interpreter, and `mm->exe_file` for a script exec is
+  the interpreter too, so `launcher=` must name an ELF binary.
+
+### New counter: `marker_set_fail_total` (13th)
+
+- Bumped when `bprm_committed_creds` cannot allocate the task-storage
+  marker. The behaviour is fail-closed — the actor is denied at its first
+  protected operation — but it was silent. A nonzero value tells an operator
+  the denies came from allocation pressure, not from an attack on the
+  launcher chain. Expected to stay 0; strict-launch SL-11 is the negative
+  witness. `TM_MIN_COUNTERS` floor moves 12 → 13 and the freeze table
+  moves 17 → 18.
+
+### Loader
+
+- `pin_links()` pins 28 links (16 v0.3 + 5 v0.4 + 7 v0.8); `KNOWN_LINK_NAMES`
+  extended; `make check-actor-hook` gains grep gates for every v0.8 hook, its
+  `PIN_LINK`, its unpin-table entry, the `file_ioctl_compat` BTF probe and
+  the `sb_mount` `MS_BIND` dispatch-order guard.
+- `select_file_ioctl_compat()` joins `select_inode_setattr_variant()` as an
+  autoload gate that runs between `__open()` and `__load()`.
+
+### Documentation
+
+- `LIMITATIONS.md` gains rows for ACL/xattr coverage, ioctl/`chattr` (with
+  the compat residual), timestamps (with the behaviour-change warning),
+  pre-existing writable fds, and `mount_setattr(2)`/`open_tree_attr(2)`
+  (unhooked upstream). Three factual corrections: frozen maps are already
+  immune to `BPF_MAP_UPDATE_ELEM`; `bpf(BPF_LINK_DETACH)` returns
+  `-EOPNOTSUPP` for an LSM link (the removal path is `unlink()` of the bpffs
+  pin); `fallocate(2)` is **not** covered by `security_file_permission()`.
+- `README.md` hook table lists the v0.8 hooks explicitly and drops
+  `task_free` (observe-only). `HOWTO.md` §7.1 names the hooks that actually
+  implement `no-chmod` instead of two symbols that never existed.
+
+---
+
 ## [v0.7.3] — 2026-06-11
 
 No ABI change (`0x0007` unchanged). Usability, a non-root validation fix,

@@ -6,6 +6,13 @@
 #   0  — all executed tests PASS
 #   1  — at least one test FAIL
 #   77 — env unsupported (no root / no BPF LSM / not built)
+#
+# Observe-mode exec hook: the observe object attaches
+# SEC("lsm.s/bprm_check_security") (compartment-observe.bpf.c) to resolve the
+# exec'd inode against actor_targets and stamp current_actor / lineage. That is
+# distinct from the enforcement object, whose strict-launch marker moved to
+# lsm/bprm_committed_creds in v0.8; observe keeps bprm_check_security because it
+# only records, never denies, and needs the pre-commit sleepable context.
 
 set -u
 
@@ -392,7 +399,7 @@ if grep -q '\[run\] compartment-bpf live' /tmp/obs_t17b_pin.err 2>/dev/null; the
 	# Observe with the module loaded — the success branch should fire.
 	# V-7 P1-F: emit the candidate-profile JSON provenance so we can
 	# assert the abi_version field carries the kernel-detected value
-	# (0x0007 today; COMPARTMENT_ABI_VERSION in compartment-abi.h). A
+	# (0x0008 today; COMPARTMENT_ABI_VERSION in compartment-abi.h). A
 	# regression that reverts detect_runtime_abi to ABI_FALLBACK or
 	# zero-fills the provenance line would slip past the WARNING-absent
 	# check alone.
@@ -404,18 +411,18 @@ if grep -q '\[run\] compartment-bpf live' /tmp/obs_t17b_pin.err 2>/dev/null; the
 		nok "T17b: WARNING still fires after --pin; success path unreached"
 	else
 		# V-7 P1-F assertion: abi_version field must equal the
-		# compile-time COMPARTMENT_ABI_VERSION (0x0007). The
+		# compile-time COMPARTMENT_ABI_VERSION (0x0008). The
 		# emitter uses "%04x" so the exact JSON shape is
-		# "abi_version":"0x0007".
+		# "abi_version":"0x0008".
 		if [ ! -s "$T17B_PROV" ]; then
 			nok "T17b: --provenance-out produced empty/missing file at $T17B_PROV"
-		elif grep -q '"abi_version":"0x0007"' "$T17B_PROV"; then
-			ok "T17b: success path silent (no WARNING) AND provenance abi_version=0x0007"
+		elif grep -q '"abi_version":"0x0008"' "$T17B_PROV"; then
+			ok "T17b: success path silent (no WARNING) AND provenance abi_version=0x0008"
 		else
 			# Surface what we got for the next reader.
 			say "  T17b: provenance contents:"
 			sed 's/^/    /' < "$T17B_PROV" || true
-			nok "T17b: provenance abi_version != 0x0007 (abi_version_map not honored or fallback path taken)"
+			nok "T17b: provenance abi_version != 0x0008 (abi_version_map not honored or fallback path taken)"
 		fi
 	fi
 	kill -TERM "$T17B_DAEMON" 2>/dev/null || true
