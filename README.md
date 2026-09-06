@@ -30,7 +30,7 @@ core tools, one shared profile format, plus an optional BPF-LSM module.
 |------|---------|-------|------|
 | **compartment-user** | Landlock + seccomp + env sanitize + audit | no | none |
 | **compartment-root** | Full namespace container + seccomp + audit | yes | none |
-| **sandbox.sh** | Network namespace + proxy bridge | no | unshare, socat, newuidmap |
+| **sandbox.sh** | Network namespace + proxy bridge | no | unshare, ip; socat only with an upstream proxy; slirp4netns + nsenter only for the SOFT fallback |
 | **compartment-bpf** | Optional BPF LSM inode sealing (kernel-side deny, even root) | yes (CAP_BPF + CAP_SYS_ADMIN) | clang ≥ 12, libbpf, bpftool, libsodium, BTF, kernel ≥ 6.6 with `lsm=...,bpf` |
 
 `compartment-user` / `compartment-root` use Landlock + seccomp
@@ -247,8 +247,12 @@ Two properties of Landlock decide how a policy has to be written:
 
 **sandbox.sh** wraps the command in a network-isolated user+mount namespace:
 
-1. `unshare --user --mount --net` — HARD mode: loopback-only (no external interfaces);
-   SOFT fallback: slirp4netns with `--disable-host-loopback`
+1. `unshare --user --mount --net --map-root-user --fork` — HARD mode:
+   loopback-only, no external interfaces, no routes. Needs an unprivileged
+   user namespace with a uid map, which some distributions block; run
+   `./sandbox.sh --verify` to see whether this host allows it.
+   SOFT fallback: slirp4netns with `--disable-host-loopback`, which also
+   needs `nsenter`
 2. Unix socket proxy bridge — API traffic routed through corporate proxy
 3. Bind-mount shell replacement — every `/bin/bash` subprocess gets sandboxed
    (requires mount namespace, which sandbox.sh creates)
@@ -278,10 +282,10 @@ compartment-user, so keep the two kinds in separate files.
 | `net-default deny\|ignore` | both | `deny` handles TCP bind and connect and refuses every port not listed. Default `ignore`: the network is not restricted |
 | `block NAME` | both | Deny-list one syscall |
 | `allow NAME` | both | Switch to allow-list mode and permit one syscall |
-| `seccomp-mode allow` | both | Switch to allow-list mode explicitly |
+| `seccomp-mode allow` | both | Switch to allow-list mode explicitly (`allowlist` is accepted as a synonym; any other value means deny-list mode) |
 | `seccomp-default errno\|kill\|log` | both | What a denied syscall does. Default `errno` (EPERM) |
 | `env-deny NAME` / `env-allow NAME` | both | Environment policy; a trailing `*` is a prefix match |
-| `env-mode allow` | both | Switch the environment policy to allow-list mode |
+| `env-mode allow` | both | Switch the environment policy to allow-list mode (`allowlist` is accepted as a synonym; any other value means deny-list mode) |
 | `landlock`/`seccomp`/`no-new-privs`/`env-sanitize` `on` | both | One-way switches: a profile may turn a mechanism on, never off. Landlock defaults to **on** for compartment-user and **off** for compartment-root |
 | `audit on` / `audit-log DIR` | both | Audit trail |
 | `inherit NAME` | both | Load another profile first, then apply these rules on top |
@@ -401,6 +405,14 @@ matches what you're protecting against.
 | `socat-proxy.conf` | Used internally by `paranoid-ssh.sh` | socat having access to your SSH keys |
 | `container.conf` | Full namespace isolation via compartment-root | Process escaping its root directory |
 | `dev.conf` | Development and debugging | Nothing — this is intentionally relaxed |
+| `restricted-root.conf` | A service container with an `exec` binary allow-list and one outbound TCP port | Anything but the named binaries running inside the container; egress to any other port |
+| `curl-wget.conf` | Running `curl`, `wget` or `aria2c` | An HTTP client reading or writing outside its download directory |
+| `dns-client.conf` | Running `dig`, `host`, `nslookup`, `drill`, `kdig` | A resolver tool touching anything but its own configuration |
+| `net-trace.conf` | Running `ping`, `traceroute`, `mtr`, `nmap`, `arping` | A raw-socket diagnostic tool with filesystem access it does not need |
+| `tcpdump.conf` | Running `tcpdump`, `tshark`, `dumpcap` | A capture tool reading the filesystem or writing outside its capture directory |
+| `net-admin-ro.conf` | Read-only network administration: `ip`, `ss`, `nft list`, `iptables -L` | A query command mutating network state or the filesystem |
+| `tcp-udp-relay.conf` | Running `socat`, `nc`, `ncat` as a relay | A relay tool reaching your files |
+| `dhclient.conf` | Running the ISC DHCP client (root) | A DHCP client writing outside `/var/lib/dhcp` |
 
 **Which one should I use?**
 
@@ -543,16 +555,30 @@ compartment-user.c     — Landlock + seccomp + audit (zero deps, rootless)
 compartment-root.c     — Full namespace container (zero deps, requires root)
 sandbox.sh             — Network namespace + proxy bridge
 Makefile               — Build targets
+README.md              — This file
 HOWTO.md               — Detailed setup guide
 DESIGN.md              — Architecture, security review, lineage from shell-guard
 SECURITY.md            — Vulnerability reporting policy
+LICENSE                — Apache-2.0
+.gitignore             — Build products and operational artifacts, never committed
+compartment-bpf/       — Optional BPF-LSM inode-sealing module, its own build,
+                         profiles, tests and documentation (see its README.md,
+                         HOWTO.md, LIMITATIONS.md and CHANGELOG.md)
 examples/
-  ai-agent.conf        — Profile for Claude/Codex/Gemini
+  ai-agent.conf        — Profile for AI coding assistants
   strict.conf          — Locked-down profile (inherits ai-agent)
-  container.conf       — Full namespace isolation profile
+  container.conf       — Full namespace isolation profile (compartment-root)
+  restricted-root.conf — Container with an exec allow-list and one TCP port
   dev.conf             — Relaxed profile for development
   ssh.conf             — Read-only SSH client (no filesystem writes)
   socat-proxy.conf     — Network-only socat bridge (no user file access)
+  curl-wget.conf       — HTTP(S) clients: curl, wget, aria2c
+  dns-client.conf      — DNS clients: dig, host, nslookup, drill, kdig
+  net-trace.conf       — Raw-socket diagnostics: ping, traceroute, mtr, nmap
+  tcpdump.conf         — Packet capture: tcpdump, tshark, dumpcap
+  net-admin-ro.conf    — Read-only network admin: ip, ss, nft list, iptables -L
+  tcp-udp-relay.conf   — Relay tools: socat, nc, ncat
+  dhclient.conf        — ISC DHCP client (root)
   paranoid-ssh.sh      — Privilege-separated SSH (SSH+socat split)
 tools/
   syscall.py           — Profile generator: trace any program, emit .conf

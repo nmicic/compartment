@@ -237,11 +237,11 @@ Used by **both** tools:
 |-----------|-------|---------|
 | `block` | syscall name | `block ptrace` |
 | `allow` | syscall name (switches to allow-list) | `allow read` |
-| `seccomp-mode` | `allow` or `deny` | `seccomp-mode allow` |
+| `seccomp-mode` | `allow` (or `allowlist`) switches to allow-list mode; **any other value, including a typo, means deny-list mode** | `seccomp-mode allow` |
 | `seccomp-default` | `errno`, `kill` or `log` (default `errno`) | `seccomp-default kill` |
 | `env-deny` | variable name or `PREFIX*` | `env-deny LD_*` |
 | `env-allow` | variable name or `PREFIX*` (switches to allow-list) | `env-allow PATH` |
-| `env-mode` | `allow` or `deny` | `env-mode allow` |
+| `env-mode` | `allow` (or `allowlist`) switches to allow-list mode; **any other value, including a typo, means deny-list mode** | `env-mode allow` |
 | `seccomp` | `on` only | `seccomp on` |
 | `no-new-privs` | `on` only | `no-new-privs on` |
 | `env-sanitize` | `on` only | `env-sanitize on` |
@@ -264,7 +264,7 @@ Used by **compartment-root** only:
 | `mount-mask` | path | `mount-mask /proc/keys` | `--mount-mask` |
 | `uid-map` | `<container-start> <host-start> <count>` | `uid-map 0 100000 65536` | — (profile only) |
 | `gid-map` | `<container-start> <host-start> <count>` | `gid-map 0 100000 65536` | — (profile only) |
-| `rootdir-flags` | `ro`, `noexec` (comma-separated) | `rootdir-flags ro,noexec` | — (profile only) |
+| `rootdir-flags` | `ro`, `noexec` (comma-separated; `nosuid` and `nodev` are always applied and cannot be turned off) | `rootdir-flags ro,noexec` | — (profile only) |
 | `mount-ro` | path inside the new root | `mount-ro /usr` | — (profile only) |
 | `mount-noexec` | path inside the new root | `mount-noexec /tmp` | — (profile only) |
 | `mount-nosuid` | path inside the new root | `mount-nosuid /home` | — (profile only) |

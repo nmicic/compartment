@@ -100,11 +100,16 @@ Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all 
 ## Build
 
 ```sh
-make vmlinux.h     # one-time — generates from running kernel BTF
+make vmlinux.h        # one-time — generates from running kernel BTF
 make
-sudo make smoke    # quick enforcement check
-sudo make check    # full unit test suite
+sudo make smoke       # quick enforcement check
+sudo make check       # full unit test suite
+sudo make check-release  # the release gate: check, plus no unexplained SKIP
 ```
+
+`tests/docs/RUNNING.md` documents every suite individually, with the
+tally each one prints on a healthy guest; `ON-RAMP.md` covers getting a
+guest that can run them.
 
 Produces `compartment-bpf` (loader + daemon) and `compartment-bpf-observe`
 (observe pipeline).
@@ -156,13 +161,19 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 |-------|----------|
 | `make check` | loader negative-path, multi-actor, error-path, regression (24+ checks) |
 | `tests/bypass/run-all.sh` | 39 bypass scenarios (20 seal-class + 19 exec-domain; kernel hook coverage per flag class) |
-| `tests/strict-launch/run.sh` | 15 strict-launch-marker witnesses |
-| `tests/observe/run.sh` | 25 observe pipeline witnesses |
-| `tests/mesh/run-mesh.sh` | 3276 (actor × operation × flag) enforcement matrix rows |
+| `tests/strict-launch/run.sh` | 17 strict-launch-marker witnesses |
+| `tests/observe/run.sh` | 21 observe pipeline witnesses (1 skips without AIDE) |
+| `tests/mesh/run-mesh.sh` | 3284 (actor × operation × flag) enforcement matrix trials |
+| `tests/dir-matrix.sh` | 40-cell directory-destination matrix (`make check-dir-matrix`) |
+| `tests/actor-wrapper/run.sh` | 21 wrapper/actor-identity witnesses (`make check-wrapper`) |
 | `tests/matrix.sh` | 24-cell file-flag matrix |
 | `tests/bench-runner.sh` | three-mode performance bench with 2σ confidence intervals |
-| `tests/stability/` | 1024-cycle pin/unpin churn stability |
+| `tests/stability/` | pin/unpin churn stability: 8 witnesses quick, 1024 cycles full |
 | `tests/fuzz.sh` | 10 000-iteration fuzz with reproducible seeds |
+
+The per-suite tallies above are the ones measured on kernel 6.8.0-139 and
+7.0.0-31 for v0.8.0; `tests/docs/RUNNING.md` is the authoritative copy and
+is updated with each release.
 
 ---
 

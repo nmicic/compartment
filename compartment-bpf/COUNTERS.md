@@ -77,7 +77,9 @@ live in `counter-smoke.sh`; the 10 exec-domain counters in `strict-launch/run.sh
 | `ptrace_traceme_denied_total` | strict-launch SL-8c (LSM-direct `+1`) |
 | *(all 13)* | telemetry-smoke TM-1 parity / TM-2 PERCPU type / TM-3 at-rest stability / TM-4 non-perturbing minimal-overhead polling / TM-5 catalogue coverage |
 
-VM-verified 2026-06-06: counter-smoke 4/4, strict-launch 15/15, telemetry-smoke 7/7.
+VM-verified 2026-09-06 (v0.8.0, kernels 6.8.0-139 and 7.0.0-31): counter-smoke
+4/4, strict-launch PASS=17 FAIL=0, telemetry-smoke TM-1..TM-5 with all 13
+counters catalogued.
 
 ## Run
 

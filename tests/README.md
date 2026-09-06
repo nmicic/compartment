@@ -34,10 +34,10 @@ sudo make test-root            # the root-only suites
 reports:
 
 ```
-  Suites run:     9
+  Suites run:     10
   Suites failed:  0
   Suites skipped: 1
-  Assertions:     pass=320 fail=0 skip=2 (reported by 9/9 suites)
+  Assertions:     pass=420 fail=0 skip=3 (reported by 10/10 suites)
 ```
 
 Those numbers move as suites are added — read them from a run rather than

@@ -2034,7 +2034,7 @@ static void print_help(const char *prog_name)
     printf("\nSyscalls (seccomp BPF):\n");
     printf("  -a, --seccomp-allowed <syscall>  Allowed syscall, allow-list mode (repeatable)\n");
     printf("  -B, --block <syscall>            Blocked syscall, deny-list mode (repeatable)\n");
-    printf("      --no-seccomp                 Disable seccomp entirely\n");
+    printf("  -S, --no-seccomp                 Disable seccomp entirely\n");
     printf("                                   With neither -a nor -B and no profile\n");
     printf("                                   list, the built-in deny-list (%d\n",
            builtin_denylist_size());
@@ -2042,16 +2042,18 @@ static void print_help(const char *prog_name)
     printf("\nEnvironment:\n");
     printf("  -E, --env-deny <var>             Strip environment variable (repeatable)\n");
     printf("  -e, --env-allow <var>            Keep only listed env vars (repeatable)\n");
-    printf("      --no-env-sanitize            Don't strip environment variables\n");
+    printf("  -N, --no-env-sanitize            Don't strip environment variables\n");
     printf("\nGeneral:\n");
-    printf("      --dry-run                    Show what would be applied, don't enforce\n");
+    printf("  -d, --dry-run                    Show what would be applied, don't enforce\n");
     printf("  -v, --verbose                    Print actions to stderr; with\n");
     printf("                                   --dry-run, also list the built-in\n");
     printf("                                   masks, devices and blocked syscalls\n");
-    printf("      --audit                      Log events to stderr + file\n");
+    printf("  -D, --audit                      Log events to stderr + file\n");
+    printf("                                   (note: compartment-user spells this -a)\n");
     printf("  -L, --audit-log <dir>            Audit log DIRECTORY (implies --audit);\n");
     printf("                                   the log file is <dir>/YYYY-MM-DD.log\n");
-    printf("      --verify                     Check system support and exit\n");
+    printf("  -V, --verify                     Check system support and exit\n");
+    printf("      --version                    Print the version and exit\n");
     printf("  -h, --help                       This help\n");
     printf("\nHardening (always on):\n");
     printf("  pivot_root (old root unmounted), container root remounted\n");

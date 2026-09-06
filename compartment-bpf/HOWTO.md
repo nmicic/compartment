@@ -976,7 +976,7 @@ nothing to do with enforcement.
 | T-STAB-4 | Mesh trials ≥ 99% pass-rate during churn | FAIL |
 | T-STAB-5 | All 10 corner-case witnesses pass or documented-skip | FAIL on any FAIL |
 | T-STAB-6 | No stuck-state (D-state survivor, mesh outer timeout) | FAIL |
-| T-STAB-7 | BPF prog/map counts return to baseline (±4) | FAIL |
+| T-STAB-7 | BPF prog/map counts return to baseline (±4) — the harness prints this assertion under the `T-STAB-4` label, alongside the mesh aggregate | FAIL |
 | T-STAB-8 | Every churn cycle observed a live pin under `PIN_ROOT/links` | FAIL |
 
 ### 9.4 Failure handling

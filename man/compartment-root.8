@@ -311,6 +311,19 @@ raw
 .BR capset (2),
 and
 .BR PR_CAP_AMBIENT_RAISE .
+.IP
+In a profile the directive is spelled
+.BR cap\-allow ,
+not
+.BR cap\-allowed :
+the profile parser warns about an unknown directive and drops the
+capability, so the misspelling is silent unless
+.B \-\-verbose
+is used. See
+.B "PROFILE FORMAT"
+in
+.BR compartment\-user (1)
+for the shared profile vocabulary.
 .SS "Syscalls (seccomp BPF)"
 .TP
 .BI \-a ", " \-\-seccomp\-allowed " SYSCALL"
@@ -320,7 +333,7 @@ All other syscalls return EPERM.
 .BI \-B ", " \-\-block " SYSCALL"
 Deny-list mode: block this syscall. Repeatable.
 .TP
-.B \-\-no\-seccomp
+.BR \-S ", " \-\-no\-seccomp
 Disable seccomp entirely.
 .PP
 The
@@ -354,11 +367,11 @@ Strip environment variable. Repeatable.
 .BI \-e ", " \-\-env\-allow " VAR"
 Allow-list mode: keep only this variable. Repeatable.
 .TP
-.B \-\-no\-env\-sanitize
+.BR \-N ", " \-\-no\-env\-sanitize
 Do not strip environment variables.
 .SS General
 .TP
-.B \-\-dry\-run
+.BR \-d ", " \-\-dry\-run
 Show what would be applied without executing.
 .TP
 .BR \-v ", " \-\-verbose
@@ -366,14 +379,16 @@ Print actions to stderr. Combined with \fB\-\-dry\-run\fR it also lists
 the built-in parts of the policy: the mount plan, every masked path, the
 device nodes, the init reaper and the blocked syscalls by name.
 .TP
-.B \-\-audit
-Log events to stderr and to a file.
+.BR \-D ", " \-\-audit
+Log events to stderr and to a file. Note the short form:
+\fBcompartment\-user\fR spells this \fB\-a\fR, while \fB\-a\fR here is
+\fB\-\-seccomp\-allowed\fR.
 .TP
 .BI \-L ", " \-\-audit\-log " DIR"
 Audit log \fBdirectory\fR (implies \fB\-\-audit\fR). The log file
 inside it is named \fIYYYY\-MM\-DD.log\fR.
 .TP
-.B \-\-verify
+.BR \-V ", " \-\-verify
 Check system support and exit.
 .TP
 .B \-\-version
