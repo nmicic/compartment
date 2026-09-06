@@ -103,12 +103,16 @@ int main(int argc, char *argv[])
         if ((strcmp(argv[i], "--profile") == 0 || strcmp(argv[i], "-p") == 0)
             && i + 1 < argc) {
             config.profile = argv[i + 1];
-            if (resolve_and_load_profile(&config, config.profile, 0) != 0) {
+            int pr = resolve_and_load_profile(&config, config.profile, 0);
+            if (pr == PROFILE_ERROR) {
+                fprintf(stderr, "compartment-root: profile '%s' was rejected "
+                        "— refusing to run\n", config.profile);
+                return 1;
+            }
+            if (pr == PROFILE_NOT_FOUND) {
                 fprintf(stderr, "compartment-root: unknown profile: %s\n",
                         config.profile);
-                fprintf(stderr, "  searched: ~/.config/compartment/%s.conf, "
-                        "/etc/compartment/%s.conf\n",
-                        config.profile, config.profile);
+                profile_print_search_path(stderr, config.profile);
                 return 1;
             }
             break;

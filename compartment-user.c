@@ -724,8 +724,20 @@ int main(int argc, char *argv[])
             .audit_log_fd     = -1,
             .profile          = "ai-agent",
         };
-        /* Try profile file first, fall back to built-in */
-        if (resolve_and_load_profile(&shell_cfg, "ai-agent", 0) != 0)
+        /* Try profile file first, fall back to built-in.
+         *
+         * A rejected profile falls back to the built-in rather than
+         * aborting: shell-replacement mode must never lock the user out,
+         * and the built-in ai-agent policy is strictly tighter than the
+         * unconfined shell that refusing to run would leave behind. The
+         * transactional loader guarantees the rejected file contributed
+         * nothing. */
+        int shell_pr = resolve_and_load_profile(&shell_cfg, "ai-agent", 0);
+        if (shell_pr == PROFILE_ERROR)
+            syslog(LOG_WARNING, "compartment-user[%s]: ai-agent profile was "
+                   "rejected — falling back to the built-in policy",
+                   invoked_name);
+        if (shell_pr != PROFILE_OK)
             (void)apply_profile_ai_agent(&shell_cfg);
 
         int shell_degraded = 0;
@@ -882,21 +894,32 @@ int main(int argc, char *argv[])
     int cli_disabled_seccomp      = (cfg.use_seccomp == 0);
     int cli_disabled_env_sanitize = (cfg.use_env_sanitize == 0);
 
-    /* Apply profile: try file first, then fall back to built-in */
+    /* Apply profile: try file first, then fall back to built-in.
+     *
+     * A profile that exists but does not parse is fatal: falling back to
+     * the built-in would run a policy the operator never asked for, and
+     * report it as "(built-in)" while the rejected file's already-parsed
+     * rules were still in force. */
     if (strcmp(cfg.profile, "none") != 0) {
-        if (resolve_and_load_profile(&cfg, cfg.profile, 0) == 0) {
-            /* loaded from file */
-        } else if (strcmp(cfg.profile, "ai-agent") == 0) {
-            if (apply_profile_ai_agent(&cfg) != 0) return 1;
-            cfg.profile_source = "built-in";
-        } else if (strcmp(cfg.profile, "strict") == 0) {
-            if (apply_profile_strict(&cfg) != 0) return 1;
-            cfg.profile_source = "built-in";
-        } else {
-            fprintf(stderr, "compartment-user: unknown profile: %s\n", cfg.profile);
-            fprintf(stderr, "  searched: ~/.config/compartment/%s.conf, "
-                    "/etc/compartment/%s.conf\n", cfg.profile, cfg.profile);
+        int pr = resolve_and_load_profile(&cfg, cfg.profile, 0);
+        if (pr == PROFILE_ERROR) {
+            fprintf(stderr, "compartment-user: profile '%s' was rejected — "
+                    "refusing to run\n", cfg.profile);
             return 1;
+        }
+        if (pr == PROFILE_NOT_FOUND) {
+            if (strcmp(cfg.profile, "ai-agent") == 0) {
+                if (apply_profile_ai_agent(&cfg) != 0) return 1;
+                cfg.profile_source = "built-in";
+            } else if (strcmp(cfg.profile, "strict") == 0) {
+                if (apply_profile_strict(&cfg) != 0) return 1;
+                cfg.profile_source = "built-in";
+            } else {
+                fprintf(stderr, "compartment-user: unknown profile: %s\n",
+                        cfg.profile);
+                profile_print_search_path(stderr, cfg.profile);
+                return 1;
+            }
         }
     }
 

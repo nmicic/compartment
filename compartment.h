@@ -693,14 +693,28 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
 
 /* ── Profile file loading ───────────────────────────────────────── */
 
-/* Forward declaration needed because load_profile_file calls
+/* Three-way result. "not found" lets the caller keep searching or fall
+ * back to a built-in; "error" means the file exists but its contents are
+ * not trustworthy, and nothing may run. Collapsing the two was how a
+ * rejected profile still got its already-parsed lines applied. */
+#define PROFILE_OK         0
+#define PROFILE_NOT_FOUND  1
+#define PROFILE_ERROR    (-1)
+
+/* Forward declaration needed because the loader calls
  * resolve_and_load_profile for "inherit" directives. */
 static inline int resolve_and_load_profile(Config *cfg, const char *name, int depth);
+static inline int load_profile_file(Config *cfg, const char *path, int depth);
 
-static inline int load_profile_file(Config *cfg, const char *path, int depth)
+static inline int load_profile_into(Config *cfg, const char *path, int depth)
 {
     FILE *fp = fopen(path, "re");  /* "e" = O_CLOEXEC */
-    if (!fp) return -1;
+    if (!fp) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return PROFILE_NOT_FOUND;
+        fprintf(stderr, "compartment: %s: %s\n", path, strerror(errno));
+        return PROFILE_ERROR;
+    }
 
     char line[MAX_LINE];
     char expanded[PATH_MAX];
@@ -720,7 +734,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             fprintf(stderr, "compartment: %s:%d: error: line too long "
                     "(max %d chars)\n", path, lineno, MAX_LINE - 2);
             fclose(fp);
-            return -1;
+            return PROFILE_ERROR;
         }
 
         /* Strip an inline comment, then right-trim.
@@ -755,7 +769,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             fprintf(stderr, "compartment: %s:%d: path too long after "
                     "variable expansion\n", path, lineno);
             fclose(fp);
-            return -1;
+            return PROFILE_ERROR;
         }
 
         /* Location prefix for policy-limit diagnostics */
@@ -764,25 +778,25 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
 
         if (strcmp(directive, "ro") == 0) {
             if (cfg_add_path(cfg, where, val, PATH_RO, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "rw") == 0) {
             if (cfg_add_path(cfg, where, val, PATH_RW, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "exec") == 0) {
             if (cfg_add_path(cfg, where, val, PATH_EXEC, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "rwx") == 0) {
             if (cfg_add_path(cfg, where, val, PATH_RWX, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "block") == 0) {
             int nr = resolve_syscall(val);
             if (nr >= 0) {
                 if (cfg_add_blocked(cfg, where, val, nr) != 0) {
-                    fclose(fp); return -1;
+                    fclose(fp); return PROFILE_ERROR;
                 }
             } else {
                 /* Cannot distinguish arch-absent syscalls (e.g. ioperm on
@@ -797,7 +811,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             int nr = resolve_syscall(val);
             if (nr >= 0) {
                 if (cfg_add_allowed(cfg, where, val, nr) != 0) {
-                    fclose(fp); return -1;
+                    fclose(fp); return PROFILE_ERROR;
                 }
             } else {
                 fprintf(stderr, "compartment: %s:%d: warning: unknown syscall '%s' "
@@ -811,11 +825,11 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 cfg->seccomp_allow_mode = 0;
         } else if (strcmp(directive, "env-deny") == 0) {
             if (cfg_add_env_deny(cfg, where, val, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "env-allow") == 0) {
             if (cfg_add_env_allow(cfg, where, val, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "env-mode") == 0) {
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
@@ -826,24 +840,24 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             cfg->workdir = xstrdup(val);
         } else if (strcmp(directive, "landlock") == 0) {
             if (profile_switch(where, "landlock", "--no-landlock", val, &cfg->use_landlock) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "seccomp") == 0) {
             if (profile_switch(where, "seccomp", "--no-seccomp", val, &cfg->use_seccomp) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "no-new-privs") == 0) {
             if (profile_switch(where, "no-new-privs", NULL, val, &cfg->use_no_new_privs) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "env-sanitize") == 0) {
             if (profile_switch(where, "env-sanitize", "--no-env-sanitize", val, &cfg->use_env_sanitize) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "audit") == 0) {
             if (parse_bool(val, &cfg->audit) != 0) {
                 fprintf(stderr, "compartment: %s:%d: invalid value for audit: '%s' (use on/off)\n", path, lineno, val);
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "audit-log") == 0) {
             cfg->audit_log_dir = xstrdup(val);
@@ -853,14 +867,14 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 fprintf(stderr, "compartment: %s:%d: inherit depth limit reached\n",
                         path, lineno);
                 fclose(fp);
-                return -1;
+                return PROFILE_ERROR;
             }
             /* Try loading the inherited profile. Search order:
              * 1. Same directory as the current profile file
              * 2. Standard search paths (~/.config/compartment/, /etc/compartment/)
              * This ensures "inherit ai-agent" works when strict.conf and
              * ai-agent.conf sit in the same directory. */
-            int found = -1;
+            int found = PROFILE_NOT_FOUND;
             if (!strchr(val, '/')) {
                 /* Extract directory from current profile path */
                 char dir_copy[PATH_MAX];
@@ -875,17 +889,26 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                         found = load_profile_file(cfg, sibling, depth + 1);
                 }
             }
-            if (found != 0)
+            if (found == PROFILE_NOT_FOUND)
                 found = resolve_and_load_profile(cfg, val, depth + 1);
-            if (found != 0) {
+            if (found == PROFILE_NOT_FOUND) {
                 fprintf(stderr, "compartment: %s:%d: inherited profile '%s' "
                         "not found\n", path, lineno, val);
                 fclose(fp);
-                return -1;
+                return PROFILE_ERROR;
+            }
+            if (found != PROFILE_OK) {
+                /* Diagnostic already printed by the inner load. */
+                fprintf(stderr, "compartment: %s:%d: inherited profile '%s' "
+                        "was rejected\n", path, lineno, val);
+                fclose(fp);
+                return PROFILE_ERROR;
             }
         /* ── Root-specific directives (compartment-root only) ─────── */
         } else if (strcmp(directive, "rootdir") == 0) {
-            free(cfg->rootdir);
+            /* No free(): on a failed transaction the caller still owns
+             * the previous value. A few bytes leak per overridden
+             * directive, which a short-lived launcher can afford. */
             cfg->rootdir = xstrdup(val);
         } else if (strcmp(directive, "uid") == 0) {
             char *endptr;
@@ -896,7 +919,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 fprintf(stderr, "compartment: %s:%d: invalid uid: %s\n",
                         path, lineno, val);
                 fclose(fp);
-                return -1;
+                return PROFILE_ERROR;
             }
             cfg->uid = (uid_t)v;
         } else if (strcmp(directive, "gid") == 0) {
@@ -908,31 +931,35 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 fprintf(stderr, "compartment: %s:%d: invalid gid: %s\n",
                         path, lineno, val);
                 fclose(fp);
-                return -1;
+                return PROFILE_ERROR;
             }
             cfg->gid = (gid_t)v;
         } else if (strcmp(directive, "username") == 0) {
-            free(cfg->username);
+            /* No free(): on a failed transaction the caller still owns
+             * the previous value. A few bytes leak per overridden
+             * directive, which a short-lived launcher can afford. */
             cfg->username = xstrdup(val);
         } else if (strcmp(directive, "netns") == 0) {
-            free(cfg->netns);
+            /* No free(): on a failed transaction the caller still owns
+             * the previous value. A few bytes leak per overridden
+             * directive, which a short-lived launcher can afford. */
             cfg->netns = xstrdup(val);
         } else if (strcmp(directive, "cgroup") == 0) {
             if (cfg_add_str(cfg->cgroups, &cfg->cgroups_count, MAX_PATHS, where, "cgroup", val, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "cap-allow") == 0) {
             if (cfg_add_str(cfg->cap_allowed_names, &cfg->cap_allowed_count, MAX_ENV_VARS, where, "cap-allow", val, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "loopback") == 0) {
             if (parse_bool(val, &cfg->loopback) != 0) {
                 fprintf(stderr, "compartment: %s:%d: invalid value for loopback: '%s' (use on/off)\n", path, lineno, val);
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "mount-mask") == 0) {
             if (cfg_add_str(cfg->mount_masks, &cfg->mount_mask_count, MAX_PATHS, where, "mount-mask", val, 1) != 0) {
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else {
             /* Warn on unknown directives — typos silently weakening
@@ -942,7 +969,36 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         }
     }
     fclose(fp);
-    return 0;
+    return PROFILE_OK;
+}
+
+/* Transactional wrapper: parse into a scratch Config and commit only if
+ * the whole file (including anything it inherits) parsed cleanly.
+ * Without this, a profile rejected on line N had already applied lines
+ * 1..N-1 — and the caller then layered the built-in on top and reported
+ * the result as "(built-in)". */
+static inline int load_profile_file(Config *cfg, const char *path, int depth)
+{
+    Config tmp = *cfg;   /* arrays are by value; strings added to tmp and
+                          * then discarded leak, which is fine because a
+                          * rejected profile always ends the process */
+    int rc = load_profile_into(&tmp, path, depth);
+    if (rc == PROFILE_OK)
+        *cfg = tmp;
+    return rc;
+}
+
+/* Print, for a name that could not be resolved, exactly where we looked.
+ * An explicit path is not a search — say so instead of inventing
+ * "~/.config/compartment//abs/path.conf". */
+static inline void profile_print_search_path(FILE *out, const char *name)
+{
+    if (strchr(name, '/')) {
+        fprintf(out, "  looked for the file: %s\n", name);
+        return;
+    }
+    fprintf(out, "  searched: /etc/compartment/%s.conf, "
+            "~/.config/compartment/%s.conf\n", name, name);
 }
 
 static inline int resolve_and_load_profile(Config *cfg, const char *name, int depth)
@@ -950,32 +1006,36 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name, int de
     /* If it contains a slash, treat as explicit path */
     if (strchr(name, '/')) {
         int r = load_profile_file(cfg, name, depth);
-        if (r == 0) cfg->profile_source = xstrdup(name);
+        if (r == PROFILE_OK) cfg->profile_source = xstrdup(name);
         return r;
     }
 
     /* Search: ~/.config/compartment/<name>.conf, /etc/compartment/<name>.conf */
     const char *home = getenv("HOME");
     char path[PATH_MAX];
+    int r;
 
     if (home) {
         int n = snprintf(path, sizeof(path), "%s/.config/compartment/%s.conf", home, name);
         if (n > 0 && (size_t)n < sizeof(path)) {
-            if (load_profile_file(cfg, path, depth) == 0) {
-                cfg->profile_source = xstrdup(path);
-                return 0;
+            r = load_profile_file(cfg, path, depth);
+            if (r != PROFILE_NOT_FOUND) {
+                if (r == PROFILE_OK) cfg->profile_source = xstrdup(path);
+                return r;
             }
         }
     }
 
     int en = snprintf(path, sizeof(path), "/etc/compartment/%s.conf", name);
-    if (en > 0 && (size_t)en < sizeof(path) &&
-        load_profile_file(cfg, path, depth) == 0) {
-        cfg->profile_source = xstrdup(path);
-        return 0;
+    if (en > 0 && (size_t)en < sizeof(path)) {
+        r = load_profile_file(cfg, path, depth);
+        if (r != PROFILE_NOT_FOUND) {
+            if (r == PROFILE_OK) cfg->profile_source = xstrdup(path);
+            return r;
+        }
     }
 
-    return -1;  /* not found — caller falls back to built-in */
+    return PROFILE_NOT_FOUND;  /* caller falls back to a built-in */
 }
 
 /* ── PPID chain (who launched us?) ─────────────────────────────── */
