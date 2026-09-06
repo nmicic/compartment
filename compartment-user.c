@@ -91,8 +91,18 @@ static int apply_profile_ai_agent(Config *cfg)
 
     /* Add HOME and workdir as RWX (agents write AND execute scripts) */
     const char *home = getenv("HOME");
-    if (home && cfg_add_path(cfg, BUILTIN_WHERE, home, PATH_RWX, 0) != 0)
-        return -1;
+    if (home) {
+        const char *why = NULL;
+        if (!home_dir_usable(home, &why)) {
+            fprintf(stderr, "compartment-user: refusing to use HOME=%s as a "
+                    "sandbox root: %s\n", home, why);
+            fprintf(stderr, "  Set HOME to your own home directory, or use "
+                    "--profile none with explicit --ro/--rw rules.\n");
+            return -1;
+        }
+        if (cfg_add_path(cfg, BUILTIN_WHERE, home, PATH_RWX, 0) != 0)
+            return -1;
+    }
     if (cfg->workdir &&
         cfg_add_path(cfg, BUILTIN_WHERE, cfg->workdir, PATH_RWX, 0) != 0)
         return -1;

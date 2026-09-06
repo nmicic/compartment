@@ -60,6 +60,18 @@ Off by default: the sandboxed process usually has write access to
 so a profile found there could switch its own sandbox off.
 Never honoured in shell-replacement mode.
 .SS "Filesystem (Landlock)"
+.PP
+The built-in profiles add
+.I $HOME
+as a read-write-execute Landlock root.
+.I $HOME
+must therefore be an absolute path, must not be
+.IR / ,
+and must name an existing directory owned by the real uid of the caller;
+compartment-user refuses to start otherwise.
+The same applies to
+.I $HOME
+expanded inside a profile value.
 .TP
 .BI \-\-ro " PATH"
 Grant read-only + execute access to \fIPATH\fR.

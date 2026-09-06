@@ -644,22 +644,41 @@ static inline int profile_switch(const char *where, const char *name,
     return 0;
 }
 
+/* ── $HOME sanity ───────────────────────────────────────────────── */
+
+/* $HOME reaches the policy twice: the built-in ai-agent profile adds it as
+ * a read-write-execute Landlock root, and profiles expand it inside path
+ * values. It is entirely caller-supplied, and Landlock is additive, so
+ * HOME=/ used to grant "rwx /" — every path not named by a narrower rule
+ * became writable, bounded only by DAC.
+ *
+ * Returns home on success, or NULL with *why set to a short reason. */
+static inline const char *home_dir_usable(const char *home, const char **why)
+{
+    struct stat st;
+    if (!home || home[0] == '\0')  { *why = "not set";                 return NULL; }
+    if (home[0] != '/')            { *why = "not an absolute path";    return NULL; }
+    if (strcmp(home, "/") == 0)    { *why = "the filesystem root";     return NULL; }
+    if (stat(home, &st) != 0)      { *why = strerror(errno);           return NULL; }
+    if (!S_ISDIR(st.st_mode))      { *why = "not a directory";         return NULL; }
+    if (st.st_uid != getuid())     { *why = "not owned by you";        return NULL; }
+    return home;
+}
+
 /* ── Variable expansion ($HOME, $USER only) ─────────────────────── */
 
 static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
 {
     if (!strchr(input, '$')) return input;
 
-    const char *home = getenv("HOME");
+    const char *why = NULL;
+    const char *home = home_dir_usable(getenv("HOME"), &why);
     const char *user = getenv("USER");
     if (!user) {
         struct passwd *pw = getpwuid(getuid());
         user = pw ? pw->pw_name : NULL;
     }
 
-    /* Treat empty values same as unset — prevents "$HOME/.ssh"
-     * from resolving to "/.ssh" (filesystem root) when HOME="" */
-    if (home && home[0] == '\0') home = NULL;
     if (user && user[0] == '\0') user = NULL;
 
     size_t pos = 0;
@@ -895,8 +914,9 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
 
         const char *val = expand_var(value, expanded, sizeof(expanded));
         if (!val) {
-            fprintf(stderr, "compartment: %s:%d: path too long after "
-                    "variable expansion\n", path, lineno);
+            fprintf(stderr, "compartment: %s:%d: cannot expand '%s' "
+                    "($HOME or $USER unset or unusable, or the result is "
+                    "too long)\n", path, lineno, value);
             fclose(fp);
             return PROFILE_ERROR;
         }
