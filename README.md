@@ -282,10 +282,10 @@ compartment-user, so keep the two kinds in separate files.
 | `net-default deny\|ignore` | both | `deny` handles TCP bind and connect and refuses every port not listed. Default `ignore`: the network is not restricted |
 | `block NAME` | both | Deny-list one syscall |
 | `allow NAME` | both | Switch to allow-list mode and permit one syscall |
-| `seccomp-mode allow` | both | Switch to allow-list mode explicitly (`allowlist` is accepted as a synonym; any other value means deny-list mode) |
+| `seccomp-mode allow` | both | Switch to allow-list mode explicitly. Accepts `allow`/`allowlist` and `deny`/`denylist`; any other value is a fatal parse error |
 | `seccomp-default errno\|kill\|log` | both | What a denied syscall does. Default `errno` (EPERM) |
 | `env-deny NAME` / `env-allow NAME` | both | Environment policy; a trailing `*` is a prefix match |
-| `env-mode allow` | both | Switch the environment policy to allow-list mode (`allowlist` is accepted as a synonym; any other value means deny-list mode) |
+| `env-mode allow` | both | Switch the environment policy to allow-list mode. Accepts `allow`/`allowlist` and `deny`/`denylist`; any other value is a fatal parse error |
 | `landlock`/`seccomp`/`no-new-privs`/`env-sanitize` `on` | both | One-way switches: a profile may turn a mechanism on, never off. Landlock defaults to **on** for compartment-user and **off** for compartment-root |
 | `audit on` / `audit-log DIR` | both | Audit trail |
 | `inherit NAME` | both | Load another profile first, then apply these rules on top |

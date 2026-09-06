@@ -1041,6 +1041,7 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
  * and who we are willing to accept it from are explicit choices. */
 #define PROFILE_SEARCH_USER  (1u << 0)  /* also search $HOME/.config/compartment */
 #define PROFILE_OWNER_ROOT   (1u << 1)  /* file and directory must be root-owned */
+#define PROFILE_TOOL_ROOT    (1u << 2)  /* the caller is compartment-root */
 
 /* Three-way result. "not found" lets the caller keep searching or fall
  * back to a built-in; "error" means the file exists but its contents are
@@ -1050,6 +1051,39 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
 #define PROFILE_NOT_FOUND  1
 #define PROFILE_ERROR    (-1)
 
+
+/* ── Which tool owns which directive ─────────────────────────────
+ *
+ * Both tools share this parser, so each of them silently accepted — and
+ * ignored — every directive belonging to the other. `cap-allow` in a
+ * compartment-user profile did nothing and said nothing; so did
+ * `workdir` in a compartment-root one. A directive that is simply
+ * misspelled was a warning on stderr and the run continued with weaker
+ * policy than its author wrote.
+ *
+ * From 1.4: an unknown directive is fatal, and a directive that belongs
+ * to the *other* tool is a warning that names the tool, so the message
+ * tells the reader which of the two situations they are in. */
+static inline int directive_is_root_only(const char *d)
+{
+    static const char *const root_only[] = {
+        "rootdir", "uid", "gid", "username", "netns", "cgroup",
+        "cap-allow", "loopback", "uid-map", "gid-map", "mount-mask",
+        "rootdir-flags", NULL
+    };
+    for (int i = 0; root_only[i]; i++)
+        if (strcmp(d, root_only[i]) == 0)
+            return 1;
+    /* mount-ro / mount-rw / mount-noexec / mount-nosuid / mount-nodev */
+    return strncmp(d, "mount-", 6) == 0;
+}
+
+static inline int directive_is_user_only(const char *d)
+{
+    /* compartment-root has no working directory of its own: it pivots
+     * into the container root. */
+    return strcmp(d, "workdir") == 0;
+}
 
 /* ── Profile file trust ─────────────────────────────────────────── */
 
@@ -1273,6 +1307,26 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
         char where[PATH_MAX + 24];
         snprintf(where, sizeof(where), "%s:%d", path, lineno);
 
+        /* A directive meant for the other tool: warn, name the tool, and
+         * carry on. This is the one case where ignoring a line is right —
+         * a profile shared between the two is a legitimate shape — but it
+         * has to say so, because "compartment-user silently ignores every
+         * compartment-root directive" is how a cap-allow line reads as
+         * policy when it is not. */
+        int is_root_tool = (flags & PROFILE_TOOL_ROOT) != 0;
+        if (!is_root_tool && directive_is_root_only(directive)) {
+            fprintf(stderr, "compartment: %s:%d: warning: '%s' is a "
+                    "compartment-root directive; compartment-user ignores it\n",
+                    path, lineno, directive);
+            continue;
+        }
+        if (is_root_tool && directive_is_user_only(directive)) {
+            fprintf(stderr, "compartment: %s:%d: warning: '%s' is a "
+                    "compartment-user directive; compartment-root ignores it\n",
+                    path, lineno, directive);
+            continue;
+        }
+
         if (strcmp(directive, "ro") == 0) {
             if (cfg_add_path(cfg, where, val, PATH_RO, 1) != 0) {
                 fclose(fp); return PROFILE_ERROR;
@@ -1356,10 +1410,21 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "seccomp-mode") == 0) {
+            /* Anything that was not "allow"/"allowlist" used to select
+             * deny-list mode with no diagnostic, so a misspelled mode
+             * line silently swapped a default-deny allow-list for a
+             * default-allow deny-list. Every other value-taking
+             * directive already refuses an unknown value. */
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
                 cfg->seccomp_allow_mode = 1;
-            else
+            else if (strcmp(val, "deny") == 0 || strcmp(val, "denylist") == 0)
                 cfg->seccomp_allow_mode = 0;
+            else {
+                fprintf(stderr, "compartment: %s:%d: invalid value for "
+                        "seccomp-mode: '%s' (use allow/allowlist or "
+                        "deny/denylist)\n", path, lineno, val);
+                fclose(fp); return PROFILE_ERROR;
+            }
         } else if (strcmp(directive, "env-deny") == 0) {
             if (cfg_add_env_deny(cfg, where, val, 1) != 0) {
                 fclose(fp); return PROFILE_ERROR;
@@ -1371,8 +1436,14 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
         } else if (strcmp(directive, "env-mode") == 0) {
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
                 cfg->env_allow_mode = 1;
-            else
+            else if (strcmp(val, "deny") == 0 || strcmp(val, "denylist") == 0)
                 cfg->env_allow_mode = 0;
+            else {
+                fprintf(stderr, "compartment: %s:%d: invalid value for "
+                        "env-mode: '%s' (use allow/allowlist or "
+                        "deny/denylist)\n", path, lineno, val);
+                fclose(fp); return PROFILE_ERROR;
+            }
         } else if (strcmp(directive, "workdir") == 0) {
             free((void *)cfg->workdir);
             cfg->workdir = xstrdup(val);
@@ -1555,10 +1626,17 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 fclose(fp); return PROFILE_ERROR;
             }
         } else {
-            /* Warn on unknown directives — typos silently weakening
-             * policy is a real risk in corporate deployments. */
-            fprintf(stderr, "compartment: %s:%d: warning: unknown directive '%s' (typo?)\n",
+            /* Fatal from 1.4. This was a warning on stderr and the run
+             * continued, so a misspelled security-relevant line — the
+             * one thing this diagnostic exists for — left the process
+             * running with weaker policy than its author wrote, and the
+             * warning scrolled past. A profile is policy: if we cannot
+             * read a line of it, we do not know what the policy is. */
+            fprintf(stderr, "compartment: %s:%d: unknown directive '%s'\n",
                     path, lineno, directive);
+            fprintf(stderr, "  a profile is policy; a line we cannot read "
+                    "means we do not know what the policy is\n");
+            fclose(fp); return PROFILE_ERROR;
         }
     }
     fclose(fp);

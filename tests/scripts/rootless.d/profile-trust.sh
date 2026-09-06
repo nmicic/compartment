@@ -166,6 +166,149 @@ echo ""
 
 # ── Profile file trust ────────────────────────────────────────────────
 
+# ── C3: invalid values, unknown directives, other-tool directives ────
+
+echo "--- Test group: directive and value validation (C3) ---"
+
+mkconf() {
+    local name="$1"; shift
+    printf '%s\n' "$@" > "${WORK}/${name}.conf"
+    chmod go-w "${WORK}/${name}.conf"
+    printf '%s\n' "${WORK}/${name}.conf"
+}
+
+# `seccomp-mode` and `env-mode` used to take any value: anything that was
+# not allow/allowlist selected deny-list mode with no diagnostic, so a
+# misspelled mode line silently swapped a default-deny allow-list for a
+# default-allow deny-list. Every other value-taking directive already
+# refused an unknown value.
+for d in seccomp-mode env-mode; do
+    run "${CU}" --dry-run --profile "$(mkconf "bad-${d}" "ro /usr" "${d} allowlst")" -- /bin/true
+    want_rc_nonzero "C3: '${d} allowlst' is fatal"
+    want_out "C3: the ${d} refusal names the valid values" \
+             "invalid value for ${d}: 'allowlst' (use allow/allowlist or deny/denylist)"
+done
+
+# The explicit deny spellings are accepted, so the check is a whitelist
+# and not "anything but a typo I thought of".
+run "${CU}" --dry-run --profile "$(mkconf "sec-deny" "ro /usr" "seccomp-mode denylist" "block ptrace")" -- /bin/true
+want_rc "C3: 'seccomp-mode denylist' is accepted" 0
+want_out "C3: 'denylist' really selects deny-list mode" "DENY-LIST"
+run "${CU}" --dry-run --profile "$(mkconf "env-deny-mode" "ro /usr" "env-mode deny" "env-deny FOO")" -- /bin/true
+want_rc "C3: 'env-mode deny' is accepted" 0
+want_out "C3: 'deny' really selects deny-list mode" "env: DENY-LIST"
+
+# An unknown directive was a warning on stderr and the run continued, so
+# a misspelled security-relevant line left the process running with
+# weaker policy than its author wrote.
+run "${CU}" --dry-run --profile "$(mkconf "typo" "ro /usr" "blokc ptrace")" -- /bin/true
+want_rc_nonzero "C3: an unknown directive is fatal"
+want_out "C3: the refusal names the directive" "unknown directive 'blokc'"
+want_out "C3: the refusal says why it is fatal" "a profile is policy"
+
+# A directive belonging to the OTHER tool is a different situation and
+# gets a different message: the shared parser recognises it, so ignoring
+# it is right — but silently ignoring it is how a cap-allow line reads as
+# policy when it is not.
+run "${CU}" --dry-run --profile "$(mkconf "otherTool" "ro /usr" "cap-allow sys_admin" "rootdir /srv/x")" -- /bin/true
+want_rc "C3: a compartment-root directive does not stop compartment-user" 0
+want_out "C3: the warning names the owning tool (cap-allow)" \
+         "'cap-allow' is a compartment-root directive; compartment-user ignores it"
+want_out "C3: the warning names the owning tool (rootdir)" \
+         "'rootdir' is a compartment-root directive; compartment-user ignores it"
+
+echo ""
+
+# ── T27-T30: the empty allow-list shapes ─────────────────────────────
+
+echo "--- Test group: empty allow-lists (T27-T30) ---"
+
+# T27/T28: `env-mode allow` with no `env-allow` is a silent clearenv().
+# It is fail-closed, but nothing anywhere recorded that it is what
+# happens, so a change to fail-open would have been invisible.
+ENVOUT_EMPTY="$(env FOO=bar BAZ=qux "${CU}" --no-seccomp \
+    --profile "$(mkconf "envallow-empty" "ro /usr" "ro /bin" "ro /lib" "ro /lib64" \
+                        "ro /etc" "env-mode allow" "landlock on")" \
+    -- /usr/bin/env 2>/dev/null)"
+if [ -z "${ENVOUT_EMPTY}" ]; then
+    pass "T27: 'env-mode allow' with an empty env-allow clears the environment"
+else
+    fail "T27: 'env-mode allow' with an empty env-allow leaked: $(printf '%s' "${ENVOUT_EMPTY}" | tr '\n' ' ' | cut -c1-120)"
+fi
+
+ENVOUT_ONE="$(env FOO=bar BAZ=qux "${CU}" --no-seccomp \
+    --profile "$(mkconf "envallow-one" "ro /usr" "ro /bin" "ro /lib" "ro /lib64" \
+                        "ro /etc" "env-mode allow" "env-allow FOO" "landlock on")" \
+    -- /usr/bin/env 2>/dev/null)"
+if printf '%s\n' "${ENVOUT_ONE}" | grep -q '^FOO=bar$' &&
+   ! printf '%s\n' "${ENVOUT_ONE}" | grep -q '^BAZ='; then
+    pass "T28: a non-empty env-allow keeps exactly what it names"
+else
+    fail "T28: env-allow FOO produced: $(printf '%s' "${ENVOUT_ONE}" | tr '\n' ' ' | cut -c1-120)"
+fi
+
+# T29: `seccomp-mode allow` with no `allow` lines is a filter that denies
+# everything. It must refuse to start rather than install it.
+run "${CU}" --profile "$(mkconf "scallow-empty" "ro /usr" "ro /bin" "ro /lib" \
+                                "ro /lib64" "ro /etc" "seccomp-mode allow" "landlock on")" \
+    -- /bin/true
+want_rc_nonzero "T29: 'seccomp-mode allow' with an empty allow-list refuses to run"
+want_out "T29: the refusal names the empty list" "seccomp allow-mode with empty list"
+
+# T30: the same profile with a real allow-list is reported as allow-list
+# mode (tools/syscall.py's generated profiles are the end-to-end half of
+# this, in aux-tools.sh).
+run "${CU}" --dry-run --profile "$(mkconf "scallow-some" "ro /usr" "seccomp-mode allow" \
+                                          "allow read" "allow write" "allow exit_group")" -- /bin/true
+want_rc "T30: 'seccomp-mode allow' with a list parses" 0
+want_out "T30: it is reported as allow-list mode" "ALLOW-LIST"
+
+echo ""
+
+# ── T36: --insecure, the degraded-enforcement escape hatch ───────────
+
+echo "--- Test group: --insecure (T36) ---"
+
+# The one flag that lets a run continue with enforcement degraded had no
+# test at all.
+run "${CU}" --help
+want_out "T36: --insecure is documented in --help" "--insecure"
+
+# On a host where preflight is clean it must change nothing: the flag
+# permits a degraded run, it does not create one.
+A_PLAIN="$("${CU}" --dry-run -- /bin/true 2>&1)"
+A_INSEC="$("${CU}" --insecure --dry-run -- /bin/true 2>&1)"
+if [ -n "${A_PLAIN}" ] && [ "${A_PLAIN}" = "${A_INSEC}" ]; then
+    pass "T36: --insecure does not change the policy when preflight is clean"
+else
+    fail "T36: --insecure changed the dry-run output on a clean host"
+fi
+
+run "${CU}" --insecure -- /bin/sh -c 'grep -E "^(NoNewPrivs|Seccomp):" /proc/self/status'
+want_out "T36: --insecure still applies no_new_privs" "NoNewPrivs:	1"
+want_out "T36: --insecure still installs the seccomp filter" "Seccomp:	2"
+
+# The degraded half needs a filesystem Landlock cannot enforce (9p, NFS,
+# CIFS or FUSE). Neither the host nor the guests have one, so it is a
+# stated skip rather than an untested claim.
+DEGRADED_MNT=""
+while read -r _dev _mnt _fstype _rest; do
+    case "${_fstype}" in
+        9p|nfs|nfs4|cifs|fuse|fuse.*) DEGRADED_MNT="${_mnt}"; break ;;
+    esac
+done < /proc/mounts
+if [ -z "${DEGRADED_MNT}" ]; then
+    skip_group 3 "T36: the degraded path needs a 9p/NFS/CIFS/FUSE mount; this host has none"
+else
+    run "${CU}" --ro "${DEGRADED_MNT}" -- /bin/true
+    want_rc_nonzero "T36: a path Landlock cannot enforce is refused without --insecure"
+    want_out "T36: the refusal names the preflight failure" "REFUSING to execute"
+    run "${CU}" --insecure --ro "${DEGRADED_MNT}" -- /bin/true
+    want_out "T36: --insecure runs it and says so" "INSECURE mode"
+fi
+
+echo ""
+
 echo "--- Test group: profile file trust (C1/C2) ---"
 
 cp "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${WORK}/ww.conf"
@@ -632,7 +775,7 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 97
+harness_expect_total 124
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

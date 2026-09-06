@@ -570,7 +570,18 @@ Boolean values accept:
 .BR 1 / 0
 (case-insensitive). Unrecognized values are rejected.
 .PP
-Unknown directives produce a warning to help catch typos.
+An unknown directive is a fatal parse error: a profile is policy, and a
+line that cannot be read means the policy is not known. A directive that
+belongs to
+.BR compartment\-root (8)
+is recognised, ignored, and reported with a warning that names the tool.
+An invalid value for a directive that takes one
+.RB ( seccomp\-mode ,
+.BR env\-mode ,
+.BR net\-default ,
+.BR seccomp\-default ,
+.BR audit )
+is also a fatal parse error, naming the accepted values.
 .SH DEFAULT DENY LIST (ai-agent profile)
 The built-in
 .B ai-agent

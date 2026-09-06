@@ -78,10 +78,27 @@ fi
 
 echo "--- Test group: example profiles parse ---"
 
+# A compartment-root profile parsed by compartment-user now warns, once
+# per root-only directive, that the directive belongs to the other tool —
+# which is the point of the 1.4 change and not a defect in the example.
+# Parse each profile with the tool it is written for.
 for conf in "${EXAMPLES}"/*.conf; do
     name="$(basename "${conf}")"
     ERR="${WORK}/${name}.err"
-    if "${CU}" --dry-run --profile "${conf}" -- /bin/true >/dev/null 2>"${ERR}"; then
+    if grep -qE '^[[:space:]]*rootdir[[:space:]]' "${conf}"; then
+        # compartment-root refuses a profile it does not own, so parse a
+        # root-owned copy is not possible here; --dry-run through
+        # compartment-user with the root directives ignored is still the
+        # syntax check this group is for, so filter the expected warnings.
+        "${CU}" --dry-run --profile "${conf}" -- /bin/true >/dev/null 2>"${ERR}.raw"
+        rc=$?
+        grep -vE "warning: '[a-z-]+' is a compartment-root directive" "${ERR}.raw" > "${ERR}"
+        if [ "${rc}" -eq 0 ]; then
+            pass "${name} parses"
+        else
+            fail "${name} does not parse: $(head -1 "${ERR}")"
+        fi
+    elif "${CU}" --dry-run --profile "${conf}" -- /bin/true >/dev/null 2>"${ERR}"; then
         pass "${name} parses"
     else
         fail "${name} does not parse: $(head -1 "${ERR}")"
