@@ -110,7 +110,9 @@ fi
 # Need a real target binary off-overlay so the only overlay-resident
 # path is the launcher. The strict_validate_launchers refuse fires
 # specifically at the launcher resolve step.
-TARGET="$TMP/target-bin"; cp /bin/true "$TARGET"; chmod 0755 "$TARGET"
+# Real regular-file ELF; /bin/true is a symlink under uutils coreutils.
+. "$REPO/tests/lib-realbin.sh"
+TARGET="$TMP/target-bin"; cp "$(realbin_noop)" "$TARGET"; chmod 0755 "$TARGET"
 cat > "$TMP/w3.conf" <<EOF
 actor-strict s = $TARGET launcher=$TMP/merged/file
 

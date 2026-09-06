@@ -36,6 +36,10 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${REPO_ROOT}/compartment-bpf"
+# realbin_noop(): a real regular-file ELF to stand in for the postgres binary.
+# The loader refuses a symlink leaf, and /bin/true is one under uutils.
+# shellcheck source=tests/lib-realbin.sh
+. "${REPO_ROOT}/tests/lib-realbin.sh"
 HOWTO="${REPO_ROOT}/HOWTO.md"
 
 if [ ! -x "$BIN" ]; then
@@ -136,7 +140,7 @@ build_72_dir_destination() {
 	mkdir -p "$fixroot/pg/bin" "$fixroot/pg/data"
 	# Actor binary: must be a regular file, 0755, non-world-writable,
 	# non-empty, no symlink in its path. Parent dir not world-writable.
-	cp /bin/true "$fixroot/pg/bin/postgres"
+	cp "$(realbin_noop)" "$fixroot/pg/bin/postgres"
 	chmod 0755 "$fixroot/pg/bin/postgres"
 	chmod 0755 "$fixroot/pg" "$fixroot/pg/bin" "$fixroot/pg/data"
 

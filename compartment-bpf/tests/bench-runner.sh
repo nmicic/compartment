@@ -449,13 +449,15 @@ chmod 0755 "$BENCH_ACTOR_BIN" || { echo "bench-runner: failed to chmod actor bin
 # pointing at /usr/bin/* directly (whose parents are mode 0755 on
 # Resolute and fine, but symmetric staging keeps the test
 # self-contained and reproducible).
-MISMATCH_SRC=
-for cand in /usr/bin/true /bin/true /usr/bin/cat /bin/cat; do
-	if [ -x "$cand" ]; then
-		MISMATCH_SRC="$cand"
-		break
-	fi
-done
+# realbin_noop() prefers a purpose-built static ELF and, failing that, only
+# accepts a candidate that is a real regular file (not a symlink — uutils
+# coreutils makes /usr/bin/true one) with ELF magic.
+# Self-locating: bench-runner's $REPO points at the deployed tree, which may
+# not be where this script lives when it is invoked out of a working copy.
+# shellcheck source=tests/lib-realbin.sh
+. "$(cd "$(dirname "$0")" && pwd)/lib-realbin.sh"
+MISMATCH_SRC=$(realbin_noop) || MISMATCH_SRC=''
+
 if [ -z "$MISMATCH_SRC" ]; then
 	echo "bench-runner: no candidate mismatch binary; skipping actor-bound rows" >&2
 	exit 0
