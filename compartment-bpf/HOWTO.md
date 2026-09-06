@@ -687,8 +687,23 @@ attack, because a map spliced into a BPF program with `bpf_map__reuse_fd()` is
 writable from program context regardless of `bpf_map_freeze()`. A read-only
 carve-out would have left every seal map mutable and the gate decorative.
 
-See the `LIMITATIONS.md` self-protection section for the measurement and for
-what the flag does **not** close.
+Runtime: the gate sits on `bpf_map_new_fd()`, so it costs something on every
+map fd the kernel hands out, to anything on the box. Measured with
+`make bench-bpf-syscall` (median of seven 200 000-call runs of
+`BPF_MAP_GET_FD_BY_ID` + `close`, the thinnest syscall that reaches the hook):
+
+| kernel | no policy | `--pin` | `--pin --self-protect` |
+|---|---|---|---|
+| 6.8.0-139 | 1451 ns | 1456 ns (+0.4 %) | 1601 ns (**+10.4 %**) |
+| 7.0.0-31 | 1153 ns | 1155 ns (+0.2 %) | 1286 ns (**+11.5 %**) |
+
+Without the flag the cost is nil, because `comp_bpf_map` is not even loaded.
+With it, budget ~130–145 ns per map-fd creation. Nothing on the file or inode
+data plane changes: the pin-tamper branch costs one array lookup and one
+integer compare on any filesystem that is not the bpffs holding the pins.
+
+See the `LIMITATIONS.md` self-protection section for the measurement behind the
+read-only decision and for what the flag does **not** close.
 
 ---
 
