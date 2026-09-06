@@ -7,7 +7,7 @@
 #
 # Targets:
 #   make            - build everything
-#   make vmlinux.h  - regenerate vmlinux.h from running kernel BTF
+#   make regen-vmlinux - re-dump vmlinux.h from the running kernel BTF
 #   make clean      - remove build artifacts
 # Tunables:
 #   make COMPARTMENT_MAX_DIR_ANCESTORS=32   - raise recursive subtree
@@ -67,17 +67,33 @@ check-env:
 	  test -r /usr/include/sodium.h || test -r /usr/local/include/sodium.h || { echo "error: <sodium.h> not found (apt install libsodium-dev)"; exit 1; }; \
 	fi
 
-vmlinux.h: check-env
+# check-env is .PHONY, and a .PHONY prerequisite is always out of date —
+# so vmlinux.h was re-dumped from kernel BTF on EVERY make, which
+# recompiled both BPF objects, regenerated both skeletons, relinked the
+# loader, and under sudo re-chowned the build artefacts to root. `make
+# check-mesh` after `make check-bypass` paid for a full rebuild it did
+# not need. Order-only (`|`) keeps the ordering guarantee — check-env
+# still runs first and still fails with its own diagnostic — without
+# making the target out of date.
+#
+# vmlinux.h is removed by `make clean`, so `make clean && make` re-dumps
+# it; that is the shape the guest validation uses when a tree moves
+# between kernels. `make regen-vmlinux` forces it in place.
+vmlinux.h: | check-env
 	$(BPFTOOL) btf dump file $(BTF) format c > $@.tmp
 	mv $@.tmp $@
 
-compartment.bpf.o: compartment.bpf.c compartment-abi.h vmlinux.h check-env
+regen-vmlinux:
+	rm -f vmlinux.h
+	$(MAKE) vmlinux.h
+
+compartment.bpf.o: compartment.bpf.c compartment-abi.h vmlinux.h | check-env
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 compartment.skel.h: compartment.bpf.o
 	$(BPFTOOL) gen skeleton $< name compartment_bpf > $@
 
-compartment-observe.bpf.o: compartment-observe.bpf.c vmlinux.h check-env
+compartment-observe.bpf.o: compartment-observe.bpf.c vmlinux.h | check-env
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 compartment-observe.skel.h: compartment-observe.bpf.o
@@ -89,7 +105,7 @@ compartment-bpf: compartment-bpf.c compartment-observe.c \
 		$(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f compartment-bpf compartment.bpf.o compartment.skel.h vmlinux.h.tmp
+	rm -f compartment-bpf compartment.bpf.o compartment.skel.h vmlinux.h vmlinux.h.tmp
 	rm -f compartment-observe.bpf.o compartment-observe.skel.h
 	rm -f tests/sealprobe tests/fuzz_oracle
 	rm -rf tests/mesh/build
@@ -709,4 +725,4 @@ check-release: check-env
 	rm -f "$$log"; \
 	echo "[check-release] PASS — full suite ran with no critical env skips"
 
-.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-limitations check-release
+.PHONY: all check-env clean regen-vmlinux smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-limitations check-release

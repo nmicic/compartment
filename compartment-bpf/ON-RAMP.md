@@ -91,8 +91,8 @@ ssh <user>@<vm> "bash -lc 'cd ~/compartment-bpf && sudo make check-stability-qui
 |---|---|---|
 | `make vmlinux.h && make` | ~5 s | exit 0, zero warnings |
 | `sudo make smoke` | ~10 s | `smoke ok` |
-| `sudo make check` | ~10 min | exit 0; see the per-target tallies below |
-| `sudo make check-release` | ~10 min | `[check-release] PASS ...` |
+| `sudo make check` | 3-6 min | exit 0; see the per-target tallies below |
+| `sudo make check-release` | 3-6 min (it re-runs the whole of `make check`) | `[check-release] PASS ...` |
 | `sudo make check-stability-quick` | ~2 min | `stability summary: pass=8 fail=0 skip=0` |
 
 Headline tallies inside `make check`:
