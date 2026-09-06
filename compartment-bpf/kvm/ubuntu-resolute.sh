@@ -102,10 +102,16 @@ mask2cidr() {
 # so a host that happened to have those skipped the whole install and a missing
 # ovmf surfaced much later as an opaque virt-install error. Probe EVERY binary
 # this script executes, plus the UEFI firmware `--boot uefi` needs.
+#
+# Every package HOST_TOOLS names has to appear in HOST_PKGS as well, or the
+# probe reports a package the installer never installs and the run dies on the
+# re-probe with "Still missing after apt-get install". iproute2 (`ip`) did
+# exactly that, and `sysctl` — run unconditionally to set ip_forward — was not
+# probed at all, so a host without procps failed at the call site with 127.
 HOST_PKGS=(
   qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients virtinst
   cloud-image-utils genisoimage bridge-utils iptables curl
-  libosinfo-bin ovmf
+  libosinfo-bin ovmf iproute2 procps
 )
 
 # tool:apt-package pairs for every external command used below.
@@ -120,6 +126,7 @@ HOST_TOOLS=(
   "curl:curl"
   "ip:iproute2"
   "osinfo-query:libosinfo-bin"
+  "sysctl:procps"
 )
 
 # ovmf ships firmware blobs, not a binary; --boot uefi fails without them.
