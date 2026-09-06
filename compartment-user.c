@@ -678,6 +678,19 @@ static void dump_profile(const Config *cfg)
  *    The single exception is the one the operator asked for in writing:
  *    `mask /path?` degrades to a warning when the caller has no
  *    CAP_SYS_ADMIN and therefore cannot make a namespace at all.
+ *
+ * And one property that is easy to misread as a hole and is not.  A
+ * non-directory mask is a /dev/null bind, so it NEUTRALISES a write
+ * rather than refusing one: the open succeeds — Landlock keys on inodes,
+ * and every usable profile grants `rw /dev/null` — and the bytes go
+ * nowhere.  A read-only remount does not change that, because the kernel's
+ * read-only-filesystem check in sb_permission() applies to regular files,
+ * directories and symlinks only, never to device nodes.  Nothing leaks and
+ * nothing reaches the masked target, but the caller sees success.  So mask
+ * is the right tool for a *read* or *connect* surface — /proc/kcore, a
+ * privileged unix socket — and Landlock is the right tool for a write
+ * surface, where a rule refuses the open outright with EACCES.  Do not
+ * reach for a mask to close something a path rule already closes.
  */
 static int mask_one(const char *path, int verbose)
 {
@@ -702,6 +715,7 @@ static int mask_one(const char *path, int verbose)
         fprintf(stderr, TOOL ": mask %s: %s\n", path, strerror(errno));
         return -1;
     }
+
     if (verbose)
         fprintf(stderr, TOOL ": mask %s (%s)\n", path,
                 is_dir ? "empty tmpfs" : "/dev/null");
