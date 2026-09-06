@@ -67,3 +67,22 @@ documented limitations, including:
 - The uid/gid map defaults to the identity map, so the user namespace
   provides a capability boundary but no uid isolation unless `uid-map` /
   `gid-map` are set (see HOWTO.md)
+- `compartment-root --netns NAME` does not work as documented. The container
+  always gets a new user namespace, and `setns(2)` on a network namespace
+  needs `CAP_SYS_ADMIN` in the user namespace that *owns* it — the initial
+  one for anything `ip netns add` created — so the join fails with
+  `Operation not permitted`. Use `--loopback`, or an empty netns, until the
+  namespace is joined in the parent before `clone()`
+- The audit log is a record, not a restriction, and its confidentiality
+  depends on where it is kept. The defaults are outside every path rule the
+  built-in profiles grant, so a sandboxed process can neither read nor
+  rewrite its own trail — except for the admin-provisioned
+  `/var/lib/compartment/audit/<uid>` location, which the built-in `ai-agent`
+  profile covers with `ro /var/lib` and is therefore *readable* (not
+  writable or removable) from inside the sandbox. An operator-chosen
+  `--audit-log` directory inside a granted `rw`/`rwx` path (for example
+  `--audit-log /tmp/x` under `rw /tmp`) is fully reachable by the confined
+  process; compartment-user does not warn about that today
+- Landlock rules are additive and cannot express a per-file rule: a rule
+  naming a regular file is accepted and installs nothing, and a narrower
+  `ro` rule cannot claw back a subtree already granted `rw`
