@@ -289,13 +289,66 @@ echo ""
 
 echo "--- Test group: /proc and /sys masking (M6) ---"
 
+# The mask list is read from compartment-root's own --dry-run --verbose
+# output, so a path added to or removed from default_proc_masks[] is
+# scanned without editing this suite.
+MASK_LIST="$("${CR}" --dry-run --verbose -c "${JAIL}" "${CRUSER[@]}" -- /bin/true 2>&1 |
+             sed -n 's|^    \(/proc/[^ ]*\)$|\1|p')"
+MASK_COUNT="$(printf '%s\n' "${MASK_LIST}" | grep -c '^/proc/')"
+# The container-side scan takes the list as a single-line word list: a raw
+# newline inside a `for f in ...` list is a syntax error in dash/ash.
+MASK_LINE="$(printf '%s ' ${MASK_LIST})"
+
+# The scan proves the masking *mechanism*, not the byte count.  The old
+# predicate was `[ -s "$f" ]`, and procfs reports st_size == 0 for every
+# one of these but /proc/kcore, masked or not — so it could only ever have
+# detected an unmasked /proc/kcore, which the next assertion already
+# covers.  A masked directory is an empty read-only tmpfs mounted over the
+# path; a masked file is a bind of /dev/null.  Both are checked here, and
+# /proc/version — deliberately not in the mask list — is scanned alongside
+# them as a positive control, so a scanner that reports nothing is itself
+# a failure.
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
-    'for f in /proc/keys /proc/timer_list /proc/sched_debug /proc/kallsyms \
-              /proc/modules /proc/kcore /proc/sysrq-trigger; do
-       [ -s "$f" ] && echo "UNMASKED $f"
+    'dn=$(stat -Lc %d:%i /dev/null)
+     for f in '"${MASK_LINE}"' /proc/version; do
+       tag=MASKED
+       [ "$f" = /proc/version ] && tag=CONTROL
+       if [ ! -e "$f" ]; then echo "ABSENT $f"; continue; fi
+       if [ -d "$f" ]; then
+         if grep -q " $f " /proc/self/mountinfo &&
+            [ -z "$(ls -A "$f" 2>/dev/null)" ]; then
+           echo "${tag} $f"
+         else
+           echo "UN${tag} $f"
+         fi
+       elif [ "$(stat -Lc %d:%i "$f" 2>/dev/null)" = "$dn" ]; then
+         echo "${tag} $f"
+       else
+         echo "UN${tag} $f"
+       fi
      done; echo MASKSCAN'
 expect_contains "mask scan ran" "MASKSCAN"
-expect_not_contains "no unmasked /proc entry" "UNMASKED"
+# Positive control: the scanner must be able to say "not masked".  Without
+# this a scanner that silently produced no output would satisfy every
+# negative assertion below.
+expect_contains "mask scan is live (an unmasked path is reported as such)" \
+    "^UNCONTROL /proc/version$"
+expect_not_contains "no unmasked /proc entry" "^UNMASKED "
+
+if [ "${MASK_COUNT}" -ge 15 ]; then
+    pass "mask list has all ${MASK_COUNT} built-in entries"
+else
+    fail "mask list has only ${MASK_COUNT} entries (want >= 15)"
+fi
+
+# One assertion per mask, so an unmasked path names itself.
+for _m in ${MASK_LIST}; do
+    if printf '%s\n' "${RUN_OUT}" | grep -q "^ABSENT ${_m}$"; then
+        skip "/proc mask ${_m}: not present on this kernel"
+    else
+        expect_contains "/proc mask ${_m}" "^MASKED ${_m}$"
+    fi
+done
 
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'wc -c < /proc/kcore'
 expect_contains "/proc/kcore is empty" "^0$"
