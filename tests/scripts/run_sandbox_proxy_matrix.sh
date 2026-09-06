@@ -78,6 +78,7 @@ if [ "${CAN_USERNS}" -eq 0 ]; then
     echo ""
     echo "=== Results ==="
     echo "  PASS: ${PASS}  FAIL: ${FAIL}  SKIP: ${SKIP}"
+    echo "SUMMARY sandbox-proxy-matrix: pass=${PASS} fail=${FAIL} skip=${SKIP}"
     exit 0
 fi
 
@@ -165,6 +166,7 @@ echo "=== Results ==="
 echo "  PASS: ${PASS}"
 echo "  FAIL: ${FAIL}"
 echo "  SKIP: ${SKIP}"
+echo "SUMMARY sandbox-proxy-matrix: pass=${PASS} fail=${FAIL} skip=${SKIP}"
 echo ""
 
 if [ "${FAIL}" -gt 0 ]; then

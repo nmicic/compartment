@@ -42,6 +42,13 @@ SUITES_SKIPPED=0
 FAILED_SUITES=""
 SKIPPED_SUITES=""
 
+# Assertion totals, summed from the "SUMMARY <name>: pass=N fail=N skip=N"
+# line every suite is required to print (tests/scripts/rootless.d/README.md).
+TOTAL_PASS=0
+TOTAL_FAIL=0
+TOTAL_SKIP=0
+SUITES_REPORTING=0
+
 run_suite() {
     local name="$1" script="$2"
     shift 2
@@ -53,7 +60,26 @@ run_suite() {
     echo ""
 
     SUITES_RUN=$((SUITES_RUN + 1))
-    if bash "${script}" "$@" 2>&1; then
+
+    local out rc=0
+    out=$(mktemp)
+    # `|| true` here would reset PIPESTATUS and hide the suite's exit code.
+    set +e
+    bash "${script}" "$@" 2>&1 | tee "${out}"
+    rc=${PIPESTATUS[0]}
+    set -e
+
+    # Sum whatever the suite reported about its own assertions.
+    local p f s
+    while read -r p f s; do
+        TOTAL_PASS=$((TOTAL_PASS + p))
+        TOTAL_FAIL=$((TOTAL_FAIL + f))
+        TOTAL_SKIP=$((TOTAL_SKIP + s))
+        SUITES_REPORTING=$((SUITES_REPORTING + 1))
+    done < <(sed -n 's/^SUMMARY [^:]*: pass=\([0-9]*\) fail=\([0-9]*\) skip=\([0-9]*\).*/\1 \2 \3/p' "${out}")
+    rm -f "${out}"
+
+    if [ "${rc}" -eq 0 ]; then
         echo ""
     else
         SUITES_FAILED=$((SUITES_FAILED + 1))
@@ -162,6 +188,8 @@ echo ""
 echo "  Suites run:     ${SUITES_RUN}"
 echo "  Suites failed:  ${SUITES_FAILED}"
 echo "  Suites skipped: ${SUITES_SKIPPED}"
+echo "  Assertions:     pass=${TOTAL_PASS} fail=${TOTAL_FAIL} skip=${TOTAL_SKIP}" \
+     "(reported by ${SUITES_REPORTING}/${SUITES_RUN} suites)"
 if [ -n "${SKIPPED_SUITES}" ]; then
     echo ""
     printf '%s' "${SKIPPED_SUITES}"
