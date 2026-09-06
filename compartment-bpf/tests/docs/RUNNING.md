@@ -35,6 +35,7 @@ not read `/etc/profile.d`, and `sudo` replaces `PATH` with its
 | actor wrapper | `sudo make check-wrapper` | `Total PASS=21 FAIL=0` |
 | stability (quick) | `sudo make check-stability-quick` | `stability summary: pass=8 fail=0 skip=0` |
 | stability (full) | `sudo make check-stability` | 1024 cycles, ~45-60 min |
+| bpf(2) overhead | `sudo make bench-bpf-syscall` | three legs (no policy / `--pin` / `--pin --self-protect`); flag off within noise of baseline, flag on ~+130-145 ns per `BPF_MAP_GET_FD_BY_ID` |
 
 ### `tests/bypass/run-all.sh` is a host-side driver
 
