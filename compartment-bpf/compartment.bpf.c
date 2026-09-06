@@ -6,7 +6,8 @@
 // exe inodes). Companion to
 // compartment-user (Landlock+seccomp) and compartment-root (namespaces).
 //
-// Hooks (26 total as of ABI v0.8):
+// Hooks (27 attach points as of ABI v0.8; 29 SEC() entries, two of which are
+// the mutually-exclusive inode_setattr signature wrappers):
 //   v0.x file/inode/path (16):
 //     inode_unlink, inode_rename, inode_rmdir, inode_create, inode_mkdir,
 //     inode_mknod, inode_symlink, inode_link, file_open, file_permission,
@@ -23,6 +24,10 @@
 //     FSSETXATTR / SETVERSION, native and 32-bit compat entry points),
 //     sb_mount, move_mount (no new mount on or under a sealed path),
 //     sb_umount (no detaching the filesystem out from under one)
+//   v0.8 self-protection (1, opt-in via --self-protect):
+//     bpf_map (no fd to a compartment map for anything but the loader).
+//     inode_unlink / inode_rename / inode_rmdir / sb_mount / sb_umount also
+//     gain a pin-tamper branch; they are existing hooks, not new links.
 //
 // v0.1 maps:
 //   sealed_inodes : (dev, ino) -> struct seal_value     (per-file)
@@ -356,6 +361,81 @@ struct {
 	__type(value, __u64);
 } ptrace_traceme_denied_total SEC(".maps");
 
+// ============================================================
+// v0.8 self-protection maps.
+// ============================================================
+//
+// Why any of this exists: bpf_map_freeze() is not map integrity. Measured on
+// 6.8.0-139 and 7.0.0-31 — a CAP_BPF caller that gets ANY fd to a frozen
+// compartment map (BPF_F_RDONLY is sufficient) can splice it into its own BPF
+// program via bpf_map__reuse_fd() and write it with bpf_map_update_elem() from
+// program context. freeze only gates map_get_sys_perms() on the syscall path.
+// The single chokepoint that sees every fd handed out for a map is
+// bpf_map_new_fd() -> security_bpf_map(), which is why comp_bpf_map below
+// denies *fd creation* rather than writes.
+//
+//   protected_map_ids : map id -> 1. Every compartment map, including these
+//                       four. Populated after __load() (ids exist then) and
+//                       frozen before attach: it is the root of trust, so it
+//                       must be immutable before the gate goes live.
+//   loader_ids        : (dev, ino) of every binary allowed to maintain this
+//                       policy. Frozen before attach for the same reason. A
+//                       frozen loader_ids is deliberate: "the loader can add
+//                       itself later" would mean anything that can make the
+//                       loader run one more time can widen the allowlist.
+//   protected_pins    : (dev, ino) of every bpffs pin object, the two pin
+//                       directories, PIN_ROOT and the bpffs mount root. These
+//                       inodes do not exist until pin_links() runs, which is
+//                       AFTER attach, so this map is populated late and frozen
+//                       late. It is safe in that window because its id is
+//                       already in protected_map_ids and comp_bpf_map is
+//                       already attached — no non-loader can get an fd to it.
+//   self_protect_cfg  : { pin_dev, enabled }. Same late-write reason (pin_dev
+//                       comes from the bpffs superblock).
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, __u32);
+	__type(value, __u8);
+} protected_map_ids SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, COMPARTMENT_MAX_LOADER_IDS);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} loader_ids SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} protected_pins SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct self_protect_cfg);
+} self_protect_cfg_map SEC(".maps");
+
+// v0.8 counters. Same convention as every other counter: bumped BEFORE the
+// ringbuf reserve so the count survives audit pressure.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} bpf_self_denied_total SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} pin_tamper_denied_total SEC(".maps");
+
 // ---------------- Helpers ----------------
 
 static __always_inline void bump_counter(void *map)
@@ -552,6 +632,82 @@ lookup_inode_seals(struct inode *inode, struct inode_key *k,
 	*dir_sv   = bpf_map_lookup_elem(&sealed_dirs, k);
 
 	return (*inode_sv != NULL) || (*dir_sv != NULL);
+}
+
+// ---------------- v0.8 self-protection helpers ----------------
+
+// One ARRAY[1] lookup. Returns NULL when self-protection is off, so every
+// gate below is a single branch in the default (flag-off) build.
+static __always_inline struct self_protect_cfg *self_protect(void)
+{
+	__u32 z = 0;
+	struct self_protect_cfg *c =
+		bpf_map_lookup_elem(&self_protect_cfg_map, &z);
+	if (!c || !c->enabled)
+		return (struct self_protect_cfg *)0;
+	return c;
+}
+
+// Is the calling task running one of the binaries allowed to maintain this
+// policy?  Identity is the same (dev, ino) of mm->exe_file that the actor
+// allowlist uses, so the two notions of "who is this" cannot drift, and the
+// caller_id cache is shared with the seal path when both run in one hook.
+//
+// A task with no resolvable exe (kernel thread, exiting task) is NOT a
+// loader: fail closed.
+static __always_inline int caller_is_loader(struct caller_id *cid)
+{
+	if (!cid->resolved)
+		caller_id_resolve_locked(cid);
+	if (!cid->valid)
+		return 0;
+	struct inode_key k = { .dev = cid->dev, .ino = cid->ino };
+	return bpf_map_lookup_elem(&loader_ids, &k) != (void *)0;
+}
+
+// Common deny tail for both self-protection actions: count first, then emit with the
+// caller's exe identity so an operator can see WHICH binary tried it. Actor
+// name is empty — these denies are not seal-scoped, they are tool-scoped.
+static __always_inline int
+deny_self_protect(__u32 action, void *counter, __u64 dev, __u64 ino,
+                  struct caller_id *cid)
+{
+	bump_counter(counter);
+	emit_audit_actor(action, dev, ino,
+	                 cid->valid ? cid->dev : 0,
+	                 cid->valid ? cid->ino : 0,
+	                 (const char *)0);
+	return -EACCES;
+}
+
+// Guard the bpffs pin objects. Ordered so the common case (any inode op on any
+// filesystem that is not the bpffs holding PIN_ROOT) costs one ARRAY lookup
+// and one compare, with no hash lookup at all.
+static __always_inline int
+deny_pin_tamper(struct inode *inode, struct caller_id *cid)
+{
+	struct self_protect_cfg *cfg = self_protect();
+	if (!cfg)
+		return 0;
+	if (!inode)
+		return 0;
+	struct inode_key k = inode_key_of(inode);
+	if (k.dev == 0 || k.dev != cfg->pin_dev)
+		return 0;
+	if (!bpf_map_lookup_elem(&protected_pins, &k))
+		return 0;
+	if (caller_is_loader(cid))
+		return 0;
+	return deny_self_protect(ACTION_DENY_PIN_TAMPER,
+	                         &pin_tamper_denied_total, k.dev, k.ino, cid);
+}
+
+static __always_inline int
+deny_pin_tamper_dentry(struct dentry *dentry, struct caller_id *cid)
+{
+	if (!dentry)
+		return 0;
+	return deny_pin_tamper(BPF_CORE_READ(dentry, d_inode), cid);
 }
 
 // v0.4: forward decl + helper. cur_strict_generation reads
@@ -1123,6 +1279,14 @@ int BPF_PROG(comp_inode_unlink, struct inode *dir, struct dentry *dentry, int re
 		return ret;
 
 	struct caller_id cid = {};
+	/* v0.8: `rm /sys/fs/bpf/compartment/links/comp_file_open` is the real
+	 * removal path for a BPF-LSM policy (BPF_LINK_DETACH returns
+	 * -EOPNOTSUPP for LSM links on both 6.8 and 7.0 — measured). Gate it
+	 * before the operator-seal logic so a pin-tamper deny is never
+	 * mis-attributed to a profile seal. */
+	if (deny_pin_tamper_dentry(dentry, &cid))
+		return -EACCES;
+
 	if (deny_dentry_parent_dir_action(dentry, SEAL_NO_UNLINK,
 					  ACTION_DENY_UNLINK, &cid))
 		return -EACCES;
@@ -1161,6 +1325,14 @@ int BPF_PROG(comp_inode_rename,
 	// reflects what was conceptually denied: rename-out vs. write-into.
 	int r;
 	struct caller_id cid = {};
+	/* v0.8: renaming a pin out of the way is unlink-equivalent (the pin
+	 * object survives under the new name, but --unpin sweeps by name and
+	 * would then leave it behind as an orphan). Gate both ends. */
+	if (deny_pin_tamper_dentry(old_dentry, &cid))
+		return -EACCES;
+	if (deny_pin_tamper_dentry(new_dentry, &cid))
+		return -EACCES;
+
 	r = deny_dentry_parent_dir_action(old_dentry,
 					  SEAL_NO_RENAME | SEAL_NO_UNLINK,
 					  ACTION_DENY_RENAME, &cid);
@@ -1212,6 +1384,12 @@ int BPF_PROG(comp_inode_rmdir, struct inode *dir, struct dentry *dentry, int ret
 		return ret;
 
 	struct caller_id cid = {};
+	/* v0.8: `rm -rf /sys/fs/bpf/compartment` finishes with rmdir on
+	 * links/, maps/ and the root. PIN_ROOT and both subdirectories are in
+	 * protected_pins for exactly this. */
+	if (deny_pin_tamper_dentry(dentry, &cid))
+		return -EACCES;
+
 	if (deny_dentry_parent_dir_action(dentry, SEAL_NO_UNLINK,
 					  ACTION_DENY_UNLINK, &cid))
 		return -EACCES;
@@ -2001,6 +2179,13 @@ deny_mount_on_dentry(struct dentry *mp, struct caller_id *cid)
 	if (!mp)
 		return 0;
 	inode = BPF_CORE_READ(mp, d_inode);
+	/* v0.8: `mount -t bpf bpf /sys/fs/bpf` over the live bpffs neither
+	 * detaches anything nor touches a seal, but it hides the pin tree:
+	 * measured, --unpin then reports "does not exist; nothing to do" and
+	 * exits 0 while enforcement stays live and unreachable. Gate the
+	 * bpffs mount root the same way as the pins themselves. */
+	if (deny_pin_tamper(inode, cid))
+		return -EACCES;
 	if (deny_inode_action(inode, SEAL_FULL, ACTION_DENY_MOUNT, cid))
 		return -EACCES;
 	return deny_dentry_parent_dir_action(mp, SEAL_FULL, ACTION_DENY_MOUNT,
@@ -2105,8 +2290,19 @@ deny_umount_of_sealed_dev(struct vfsmount *mnt)
 
 	dev = (__u64)BPF_CORE_READ(sb, s_dev);
 	hit = bpf_map_lookup_elem(&sealed_devs, &dev);
-	if (!hit)
-		return 0;
+	if (!hit) {
+		/* v0.8: the bpffs holding PIN_ROOT is not in sealed_devs (it
+		 * hosts no operator seal) but detaching it is the cheapest way
+		 * to remove enforcement. Measured on 6.8: `umount /sys/fs/bpf`
+		 * and `umount -l /sys/fs/bpf` both drop enforcement within 6s.
+		 * Measured on 7.0 with a service holding a peer bpffs mount
+		 * (polkitd, ProtectSystem): the host umount instead ORPHANS the
+		 * policy — pins invisible, enforcement live, --unpin reports
+		 * "nothing to do" and exits 0. Both outcomes are denied here. */
+		struct self_protect_cfg *cfg = self_protect();
+		if (!cfg || cfg->pin_dev == 0 || cfg->pin_dev != dev)
+			return 0;
+	}
 
 	// (b): whole-filesystem mount only.
 	mnt_root = BPF_CORE_READ(mnt, mnt_root);
@@ -2116,6 +2312,10 @@ deny_umount_of_sealed_dev(struct vfsmount *mnt)
 
 	struct caller_id cid = {};
 	caller_id_resolve_locked(&cid);
+	/* One action for both reasons (a sealed filesystem, or the bpffs that
+	 * holds the pins): the operator-visible fact is the same — this
+	 * filesystem cannot be detached while policy is live — and splitting
+	 * it would add an action code with no distinct response. */
 	emit_audit_actor(ACTION_DENY_UMOUNT, dev, 0,
 	                 cid.valid ? cid.dev : 0,
 	                 cid.valid ? cid.ino : 0,
@@ -2180,4 +2380,58 @@ int BPF_PROG(comp_move_mount, const struct path *from_path,
 	struct dentry *mp = BPF_CORE_READ(to_path, dentry);
 	struct caller_id cid = {};
 	return deny_mount_on_dentry(mp, &cid);
+}
+
+// ---------------- v0.8: lsm/bpf_map — the tool protects its own maps ----
+//
+// LSM_HOOK(int, 0, bpf_map, struct bpf_map *map, fmode_t fmode) is byte
+// identical on 6.8 and 7.0 (vmlinux BTF: bpf_lsm_bpf_map FUNC_PROTO vlen=2 on
+// both), it is in sleepable_lsm_hooks on both, and it is NOT in 7.0's
+// bpf_lsm_disabled_hooks. So, unlike lsm/bpf (vlen 3 on 6.8, 4 on 7.0 — the
+// added `bool kernel` argument), this one needs no dual wrapper. The loader
+// still autoload-gates it on a BTF probe (select_bpf_map_variant) so a kernel
+// that ever drops the hook fails loudly at load rather than silently
+// fail-open at runtime.
+//
+// It is called from bpf_map_new_fd(), which is the single point every map fd
+// passes through: BPF_MAP_GET_FD_BY_ID, BPF_OBJ_GET on a pinned map, and
+// BPF_MAP_CREATE. Denying here denies fd creation, which is the only thing
+// that actually works — see the map-block comment above for why denying
+// writes (or trusting bpf_map_freeze) does not.
+//
+// DELIBERATE: this denies READ-ONLY fds too. A read-only fd is a complete
+// attack: bpf_map__reuse_fd() + a one-instruction BPF program writes the map
+// from program context, measured working on both kernels. The cost is real
+// and is documented: with --self-protect in force, `bpftool map dump` on a
+// compartment map fails with EPERM, and `compartment-bpf --stats` works only
+// when run from an authorised loader binary (it is the same executable, so
+// the normal case is unaffected).
+//
+// BPF_MAP_CREATE is unaffected: a map that has just been created cannot
+// already be in protected_map_ids.
+SEC("lsm/bpf_map")
+int BPF_PROG(comp_bpf_map, struct bpf_map *map, fmode_t fmode, int ret)
+{
+	(void)fmode;   /* both modes are denied — see the DELIBERATE note above */
+	if (ret != 0)
+		return ret;
+
+	struct self_protect_cfg *cfg = self_protect();
+	if (!cfg)
+		return 0;
+	if (!map)
+		return 0;
+
+	__u32 id = BPF_CORE_READ(map, id);
+	if (!bpf_map_lookup_elem(&protected_map_ids, &id))
+		return 0;
+
+	struct caller_id cid = {};
+	if (caller_is_loader(&cid))
+		return 0;
+
+	// dev = 0 signals "this ino is not a filesystem inode"; ino carries the
+	// bpf map id so the audit line names the object. See compartment-abi.h.
+	return deny_self_protect(ACTION_DENY_BPF_SELF, &bpf_self_denied_total,
+	                         0, (__u64)id, &cid);
 }
