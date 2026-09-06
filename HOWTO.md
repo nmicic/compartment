@@ -157,14 +157,45 @@ audit-log /var/tmp/compartment-audit-$USER
 | `exec` | path | `exec /opt/bin` |
 | `block` | syscall name | `block ptrace` |
 | `env-deny` | variable name | `env-deny LD_PRELOAD` |
-| `landlock` | on/off | `landlock on` |
-| `seccomp` | on/off | `seccomp on` |
-| `no-new-privs` | on/off | `no-new-privs on` |
-| `env-sanitize` | on/off | `env-sanitize on` |
+| `landlock` | `on` only | `landlock on` |
+| `seccomp` | `on` only | `seccomp on` |
+| `no-new-privs` | `on` only | `no-new-privs on` |
+| `env-sanitize` | `on` only | `env-sanitize on` |
 | `audit` | on/off | `audit on` |
-| `audit-log` | directory path | `audit-log /var/tmp/my-audit` |
+| `audit-log` | directory path | `audit-log ~/.local/state/compartment` |
 | `workdir` | path | `workdir $HOME/projects` |
 | `inherit` | profile name | `inherit ai-agent` |
+
+### Security switches are one-way
+
+`landlock`, `seccomp`, `no-new-privs` and `env-sanitize` may only be
+turned **on** from a profile. Writing `seccomp off` (or `no`, `false`,
+`0`) in a profile is a fatal parse error and nothing runs:
+
+```
+compartment: /etc/compartment/x.conf:12: 'seccomp off' is not allowed in a
+profile — a profile may only tighten policy.
+  Pass --no-seccomp on the command line if you really need to disable it.
+```
+
+A profile file is data. It may live somewhere the sandboxed process can
+reach, so it must never be able to switch enforcement off. Only the
+invoking user can, with `--no-landlock`, `--no-seccomp` or
+`--no-env-sanitize` on the command line. `no_new_privs` has no
+command-line escape hatch: it is always on.
+
+### Comments
+
+`#` starts a comment when it begins a whitespace-separated token, and
+trailing whitespace is trimmed, so both of these work:
+
+```conf
+# a whole-line comment
+ro /usr           # and a trailing one
+```
+
+A `#` inside a token is literal, so a path such as `rw /srv/build#3`
+still means what it says.
 
 ### Inheritance
 

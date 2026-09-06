@@ -609,6 +609,41 @@ static inline int parse_bool(const char *val, int *out)
     return -1; /* unrecognized value */
 }
 
+/* ── One-way security switches ──────────────────────────────────── */
+
+/* landlock, seccomp, no-new-privs and env-sanitize are one-way: a profile
+ * may turn a mechanism on, never off. A profile file is data — it may sit
+ * in a directory the sandboxed process can reach, and "seccomp off" in it
+ * would be a complete escape. Only the invoking user, on the command line,
+ * may disable enforcement.
+ *
+ * cli_flag names the command-line escape hatch, or is NULL when the
+ * mechanism cannot be disabled at all. */
+static inline int profile_switch(const char *where, const char *name,
+                                 const char *cli_flag, const char *val,
+                                 int *out)
+{
+    int on;
+    if (parse_bool(val, &on) != 0) {
+        fprintf(stderr, "compartment: %s: invalid value for %s: '%s' "
+                "(use on/off)\n", where, name, val);
+        return -1;
+    }
+    if (!on) {
+        fprintf(stderr, "compartment: %s: '%s off' is not allowed in a "
+                "profile — a profile may only tighten policy.\n",
+                where, name);
+        if (cli_flag)
+            fprintf(stderr, "  Pass %s on the command line if you really "
+                    "need to disable it.\n", cli_flag);
+        else
+            fprintf(stderr, "  %s cannot be disabled.\n", name);
+        return -1;
+    }
+    *out = 1;
+    return 0;
+}
+
 /* ── Variable expansion ($HOME, $USER only) ─────────────────────── */
 
 static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
@@ -790,23 +825,19 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         } else if (strcmp(directive, "workdir") == 0) {
             cfg->workdir = xstrdup(val);
         } else if (strcmp(directive, "landlock") == 0) {
-            if (parse_bool(val, &cfg->use_landlock) != 0) {
-                fprintf(stderr, "compartment: %s:%d: invalid value for landlock: '%s' (use on/off)\n", path, lineno, val);
+            if (profile_switch(where, "landlock", "--no-landlock", val, &cfg->use_landlock) != 0) {
                 fclose(fp); return -1;
             }
         } else if (strcmp(directive, "seccomp") == 0) {
-            if (parse_bool(val, &cfg->use_seccomp) != 0) {
-                fprintf(stderr, "compartment: %s:%d: invalid value for seccomp: '%s' (use on/off)\n", path, lineno, val);
+            if (profile_switch(where, "seccomp", "--no-seccomp", val, &cfg->use_seccomp) != 0) {
                 fclose(fp); return -1;
             }
         } else if (strcmp(directive, "no-new-privs") == 0) {
-            if (parse_bool(val, &cfg->use_no_new_privs) != 0) {
-                fprintf(stderr, "compartment: %s:%d: invalid value for no-new-privs: '%s' (use on/off)\n", path, lineno, val);
+            if (profile_switch(where, "no-new-privs", NULL, val, &cfg->use_no_new_privs) != 0) {
                 fclose(fp); return -1;
             }
         } else if (strcmp(directive, "env-sanitize") == 0) {
-            if (parse_bool(val, &cfg->use_env_sanitize) != 0) {
-                fprintf(stderr, "compartment: %s:%d: invalid value for env-sanitize: '%s' (use on/off)\n", path, lineno, val);
+            if (profile_switch(where, "env-sanitize", "--no-env-sanitize", val, &cfg->use_env_sanitize) != 0) {
                 fclose(fp); return -1;
             }
         } else if (strcmp(directive, "audit") == 0) {
