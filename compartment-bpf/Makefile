@@ -303,7 +303,14 @@ check-actor-hook: compartment.bpf.o
 # but `make check` never invoked them — they gated nothing, which is exactly
 # how OPEN-1 and the recursive dir-seal drift stayed green. All new suites
 # detect-and-SKIP cleanly (rc=77) on a non-root / non-BPF developer host.
-check: check-coverage-static smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-limitations check-wrapper check-strict-launch check-observe check-deny-candidate check-howto-examples
+check: check-coverage-static smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-wrapper check-strict-launch check-observe check-deny-candidate check-howto-examples
+
+# Appended as its own line rather than spliced into the 400-character
+# prerequisite list above: one target per line is reviewable, that list is
+# not. GNU make merges prerequisites declared for the same target as long
+# as only one declaration carries a recipe.
+check: check-limitations
+.PHONY: check-limitations regen-vmlinux
 
 # LIMITATIONS.md honest witnesses. Every "not enforced" row in that file
 # was prose with nothing under tests/ recording today's behaviour, so a
@@ -739,4 +746,4 @@ check-release: check-env
 	rm -f "$$log"; \
 	echo "[check-release] PASS — full suite ran with no critical env skips"
 
-.PHONY: all check-env clean regen-vmlinux smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-limitations check-release
+.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-release
