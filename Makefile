@@ -131,7 +131,13 @@ test-root: all tests/probes/deny_probe
 # ownership otherwise so an unprivileged DESTDIR staging build still works.
 INSTALL_OWNER = $(shell [ "$$(id -u)" = "0" ] && echo "-o root -g root")
 
-install: all install-man install-profiles
+# The example profiles are deliberately NOT installed here.  /etc/compartment
+# is searched before the compiled-in defaults, so dropping
+# examples/ai-agent.conf and examples/strict.conf into it silently replaces
+# the built-in policy of every user on the host with a file copy that will
+# not track the binary.  `make install-profiles` still does it for anyone who
+# wants exactly that, and says what it is doing.
+install: all install-man
 	install -d -m 755 $(INSTALL_OWNER) $(DESTDIR)$(BINDIR)
 	install -m 755 $(INSTALL_OWNER) compartment-user $(DESTDIR)$(BINDIR)/
 	install -m 755 $(INSTALL_OWNER) compartment-root $(DESTDIR)$(BINDIR)/
@@ -149,10 +155,13 @@ install-profiles:
 	install -d -m 755 $(INSTALL_OWNER) $(DESTDIR)$(CONFDIR)
 	install -m 644 $(INSTALL_OWNER) examples/*.conf $(DESTDIR)$(CONFDIR)/
 	@echo "Installed profiles in $(DESTDIR)$(CONFDIR)/"
-	@echo "NOTE: ai-agent.conf and strict.conf shadow the built-in profiles of"
+	@echo "NOTE: ai-agent.conf and strict.conf SHADOW the built-in profiles of"
 	@echo "      the same name — /etc/compartment is searched before the"
-	@echo "      built-ins.  Remove them from $(DESTDIR)$(CONFDIR)/ to keep the"
-	@echo "      compiled-in defaults."
+	@echo "      built-ins, so every user on this host now gets these files"
+	@echo "      instead of the compiled-in policy, and they will not change"
+	@echo "      when the binary does.  This is why 'make install' no longer"
+	@echo "      runs this target.  Remove them from $(DESTDIR)$(CONFDIR)/ to"
+	@echo "      go back to the compiled-in defaults."
 
 # ── Repository hygiene checks (also run in CI) ─────────────────────
 

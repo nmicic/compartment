@@ -28,21 +28,23 @@ compartment.h           <- shared code (static inline, zero deps)
   |-- Audit logging (PPID chain, file-per-day, O_CLOEXEC)
   |-- Environment sanitization (deny-list + allow-list)
   |-- Variable expansion ($HOME, $USER)
-  |-- Syscall name->number table (135 entries, __NR_* macros, portable)
+  |-- Syscall name->number table (__NR_* macros, portable)
   |-- Capability name->number table (41 entries)
   |-- seccomp BPF builder (raw, no libseccomp)
+  |-- Built-in seccomp deny-list (one table, used by both tools)
+  |-- Landlock ruleset builder (path rules, TCP port rules, ABI gating)
   +-- Common Config fields and types
 
 compartment-user.c      <- includes compartment.h
-  |-- Landlock enforcement
   |-- Shell-replacement mode (argv[0] detection)
   |-- AI-agent built-in profiles
   +-- main() with rootless CLI
 
 compartment-root.c      <- includes compartment.h
   |-- Namespace creation (clone flags)
-  |-- pivot_root, then /proc + /sys + /dev, then detach the old root
-  |-- Built-in seccomp deny-list + /proc mask table
+  |-- pivot_root, then /proc + /sys + /dev + devpts + shm, then detach
+  |-- rootdir ownership validation and mount-flag hardening
+  |-- /proc mask table
   |-- Container init (PID 1 reaper: signal forwarding + orphan reaping)
   |-- UID/GID mapping (identity by default; uid-map/gid-map to shift)
   |-- Capability drop + preserve (raw prctl + capset, no libcap)
@@ -187,7 +189,8 @@ the HOWTO are generated from the binary rather than transcribed by hand.
 ### seccomp Return Action: EPERM vs KILL
 
 The BPF deny-list returns `SECCOMP_RET_ERRNO | EPERM` rather than
-`SECCOMP_RET_KILL_PROCESS`. This is deliberate:
+`SECCOMP_RET_KILL_PROCESS` **by default**; `seccomp-default kill|log`
+overrides it per policy. The default is deliberate:
 
 - **EPERM** lets well-behaved applications handle blocked syscalls
   gracefully (retry, fallback, log). Most runtimes (Node.js, Python,
@@ -203,6 +206,16 @@ the allow-list mode (`--allow` / `allow` directives) instead, which
 blocks everything not explicitly permitted. For the default deny-list
 use case (AI agents, development tools), EPERM provides the right
 balance of safety and usability.
+
+`seccomp-default` exists because that argument is much weaker for an
+*allow-list*. An allow-list that is one syscall short does not degrade
+gracefully: the observed failure was a `SIGSEGV` from `ld.so` after `mmap`
+returned EPERM, which is both harder to diagnose than a `SIGSYS` and, in a
+security tool, an outcome that looks like a crash rather than a denial.
+`seccomp-default kill` turns those into `SECCOMP_RET_KILL_PROCESS`;
+`seccomp-default log` permits and records, which is the shape you want while
+working out what a policy needs. The default stays `errno` because changing
+it would alter the behaviour of every existing profile.
 
 ### Testing
 
@@ -278,8 +291,92 @@ fully visible mount of the same filesystem already exists in the current
 mount namespace, and detaching `/.pivot_old` removed the last one.
 
 The order is therefore: `pivot_root` → mount `/proc` → mount read-only
-`/sys` → tmpfs `/dev` plus bind-mounts of the old root's device nodes →
-`/proc` masks → `umount2("/.pivot_old", MNT_DETACH)`. Keeping the old root
-attached across those steps is also what makes the device nodes reachable
-at all: `mknod(2)` checks `CAP_MKNOD` against the initial user namespace
-and always fails in a `CLONE_NEWUSER` child.
+`/sys` → tmpfs `/dev` plus bind-mounts of the old root's device nodes, a
+private `devpts` and a tmpfs `/dev/shm` → `/proc` masks →
+`umount2("/.pivot_old", MNT_DETACH)` → the `mount-*` flag passes →
+`rootdir-flags ro`. Keeping the old root attached across the first steps is
+also what makes the device nodes reachable at all: `mknod(2)` checks
+`CAP_MKNOD` against the initial user namespace and always fails in a
+`CLONE_NEWUSER` child.
+
+The two tails matter as much as the head. `mount-ro` and friends have to
+run *after* the detach, because they bind paths inside the new root onto
+themselves and there is nothing to remount until then. `rootdir-flags ro`
+has to run last of all and non-recursively: every mount point above had to
+be created in a writable tree, and a recursive read-only pass would sweep
+`/proc`, `/dev` and `/sys` in with the root filesystem.
+
+### Landlock in compartment-root
+
+The ruleset is applied at step 8b — after all the mounts, before
+`drop_capabilities()`. Both halves of that are load-bearing. After the
+mounts, so the paths in the policy resolve to what the target will actually
+see rather than to whatever the host had at the same path. Before the
+capability drop, because `landlock_restrict_self(2)` requires either
+`no_new_privs` or `CAP_SYS_ADMIN`, and the child still holds the latter in
+its own user namespace at that point; `no_new_privs` is not set until step
+15, after the privilege drop, for reasons of its own. The ruleset survives
+`setuid` and is inherited by everything the container execs.
+
+Landlock is off by default here and on by default in compartment-user. That
+asymmetry is deliberate: compartment-user has always had it, and a
+compartment-root profile written before this release names paths that were
+previously inert. Turning it on silently would confine containers that were
+never tested confined. A policy with path rules and no `landlock on` gets a
+warning instead.
+
+### Why `exec` on a file is a real allow-list
+
+`LANDLOCK_ACCESS_FS_EXECUTE` is a path-subtree right, so Landlock cannot
+express "beneath `/usr/bin`, only these three". But a `path_beneath` rule
+may name a regular file, and a rule on a file carries only file-level
+rights — so granting execute on individual files and on no directory does
+produce "only these binaries run here". Verified on 6.8 and 7.0.
+
+Two kernel details decide whether such a policy works, and both were checked
+against the running kernel rather than inferred from the documentation:
+
+* The **ELF interpreter needs its own execute grant.** Landlock's
+  `file_open` hook maps `FMODE_EXEC` to `LANDLOCK_ACCESS_FS_EXECUTE`, and
+  `execve(2)` opens the interpreter with that flag. A policy that grants
+  execute on `/usr/bin/foo` but not on `/lib64/ld-linux-x86-64.so.2` fails
+  with `EACCES` at exec time.
+* **Shared libraries do not.** `ld.so` opens a `.so` read-only and maps it
+  `PROT_EXEC`; Landlock has no mmap or mprotect hook for this, so read
+  access to the library directory is sufficient. Confirmed by running a
+  dynamically linked binary with `rw` (read + write, no execute) on the
+  library directory.
+
+The limits are worth stating in the same breath. The policy belongs to the
+sandbox and not to a caller, so "root included, but only when launched by
+sshd" is unreachable. It keys on the inode, so a busybox rootdir is
+all-or-nothing. And a shell builtin is not an `execve`, so a shell in the
+allow-list gives away far more than the shell.
+
+### Landlock network rules
+
+`net-bind`/`net-connect` build `struct landlock_net_port_attr` with
+`LANDLOCK_RULE_NET_PORT`. Three traps are handled explicitly:
+
+1. **The port is in host byte order.** Every other port field in this
+   project is network order; this one is not.
+2. **`handled_access_net` denies what it handles.** Setting it with no
+   matching rule refuses all TCP bind and connect, the same trap the
+   filesystem side already guards for an empty ruleset. It is therefore set
+   only when the ABI is ≥ 4 *and* the policy names something — and only for
+   the access types the policy names, so `net-connect 443` does not also
+   forbid every `bind()`.
+3. **`LANDLOCK_RULE_NET_PORT` is an enumerator, not a macro.** `#ifndef`
+   can never see it, so the value is spelled out and used unconditionally,
+   along with a locally declared `struct landlock_net_port_attr` and a
+   locally declared ruleset attribute — the same approach compartment-root
+   already takes for `struct mount_attr`.
+
+The ABI table the code gates on, verified rather than assumed:
+1 = 5.13, 2 = 5.19 (REFER), 3 = 6.2 (TRUNCATE), 4 = 6.7 (TCP bind/connect),
+5 = 6.10 (IOCTL_DEV), 6 = 6.12 (scoping). The previous code gated
+`LANDLOCK_ACCESS_FS_IOCTL_DEV` on ABI ≥ 4, which is wrong by one release;
+it was invisible only because Ubuntu 24.04's `linux-libc-dev` 6.8 does not
+define that constant at all, so the `#ifdef` around it was always false and
+the right was silently unhandled. Adding the fallback `#define` without
+fixing the gate would have made every ABI-4 kernel refuse the ruleset.

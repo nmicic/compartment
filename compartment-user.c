@@ -33,31 +33,14 @@
 #include <syslog.h>
 #include <sys/utsname.h>
 
-#include <linux/landlock.h>
 #include <sys/statfs.h>
 #include <sys/resource.h>
 
-/* Fallback defines for older kernel headers (pre-5.19 / pre-6.2) */
-#ifndef LANDLOCK_ACCESS_FS_REFER
-#define LANDLOCK_ACCESS_FS_REFER       (1ULL << 13)
-#endif
-#ifndef LANDLOCK_ACCESS_FS_TRUNCATE
-#define LANDLOCK_ACCESS_FS_TRUNCATE    (1ULL << 14)
-#endif
-
-/* Shared types, config, syscall table, profile loader, audit,
- * env sanitize, seccomp BPF builder — all static inline. */
+/* Shared types, config, syscall table, profile loader, Landlock ruleset
+ * builder, audit, env sanitize, seccomp BPF builder — all static inline. */
 #include "compartment.h"
 
-/* ── Landlock syscall wrappers ───────────────────────────────────────── */
-
-/* Landlock syscall numbers are architecture-independent (444-446)
- * since Linux 5.13. Provide fallback if kernel headers are too old. */
-#ifndef __NR_landlock_create_ruleset
-#define __NR_landlock_create_ruleset 444
-#define __NR_landlock_add_rule       445
-#define __NR_landlock_restrict_self  446
-#endif
+#define TOOL "compartment-user"
 
 /* ── AI agent profile ────────────────────────────────────────────────
  * Default paths and blocked syscalls for running AI CLI agents. */
@@ -68,9 +51,12 @@
 
 static int apply_profile_ai_agent(Config *cfg)
 {
-    /* Filesystem: read-only system paths */
+    /* Filesystem: read-only system paths.
+     *
+     * '/lib32?' is optional: it is absent on most 64-bit installs, and a
+     * rule for a path that does not exist is a fatal error by default. */
     const char *ro_paths[] = {
-        "/usr", "/lib", "/lib64", "/lib32",
+        "/usr", "/lib", "/lib64", "/lib32?",
         "/etc", "/bin", "/sbin",
         "/proc", "/dev", "/sys",
         "/run",     /* resolv.conf, systemd, dbus */
@@ -86,6 +72,25 @@ static int apply_profile_ai_agent(Config *cfg)
     const char *rw_paths[] = {"/tmp", NULL};
     for (int i = 0; rw_paths[i]; i++) {
         if (cfg_add_path(cfg, BUILTIN_WHERE, rw_paths[i], PATH_RW, 0) != 0)
+            return -1;
+    }
+
+    /* Writable device nodes, one rule each.
+     *
+     * `ro /dev` above makes the directory readable but leaves /dev/null
+     * unwritable, so any command containing `2>/dev/null` failed inside the
+     * flagship profile.  The fix is per-node rules rather than a blanket
+     * `rw /dev`: from ABI 5 a writable rule also carries
+     * LANDLOCK_ACCESS_FS_IOCTL_DEV, and granting that across the whole of
+     * /dev would hand back every device ioctl — including TIOCSTI on
+     * kernels where dev.tty.legacy_tiocsti is enabled. */
+    const char *rw_dev[] = {
+        "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom",
+        "/dev/tty",  "/dev/pts",  "/dev/ptmx",
+        NULL
+    };
+    for (int i = 0; rw_dev[i]; i++) {
+        if (cfg_add_path(cfg, BUILTIN_WHERE, rw_dev[i], PATH_RW, 0) != 0)
             return -1;
     }
 
@@ -107,34 +112,9 @@ static int apply_profile_ai_agent(Config *cfg)
         cfg_add_path(cfg, BUILTIN_WHERE, cfg->workdir, PATH_RWX, 0) != 0)
         return -1;
 
-    /* Syscalls to block */
-    const char *blocked[] = {
-        "ptrace", "mount", "umount2", "reboot",
-        "kexec_load", "kexec_file_load",
-        "init_module", "finit_module", "delete_module",
-        "pivot_root", "chroot", "unshare", "setns",
-        "keyctl", "add_key", "request_key",
-        "bpf", "userfaultfd", "perf_event_open",
-        "process_vm_readv", "process_vm_writev",
-        "acct", "swapon", "swapoff",
-        "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
-        "io_uring_setup", "io_uring_enter", "io_uring_register",
-        /* Container escape vectors: handle-based file access, new mount API */
-        "open_by_handle_at", "name_to_handle_at",
-        "open_tree", "move_mount", "fsopen", "fsmount", "fsconfig", "fspick",
-        "mount_setattr",
-        /* Cross-process FD theft */
-        "pidfd_getfd",
-#ifdef __x86_64__
-        "ioperm", "iopl",
-#endif
-        NULL
-    };
-    for (int i = 0; blocked[i]; i++) {
-        int nr = resolve_syscall(blocked[i]);
-        if (nr >= 0 && cfg_add_blocked(cfg, BUILTIN_WHERE, blocked[i], nr) != 0)
-            return -1;
-    }
+    /* Syscalls to block — the table shared with compartment-root. */
+    if (cfg_add_builtin_denylist(cfg, BUILTIN_WHERE) != 0)
+        return -1;
 
     /* Dangerous env vars to strip.
      *
@@ -215,155 +195,6 @@ static int apply_profile_strict(Config *cfg)
     return 0;
 }
 
-/* ── Landlock enforcement ────────────────────────────────────────── */
-
-static int landlock_add_path(int ruleset_fd, const char *path, uint64_t access)
-{
-    int fd = open(path, O_PATH | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0 && errno == ELOOP) {
-        /* Path is a symlink (e.g. /lib -> /usr/lib). Resolve it and use
-         * the target. This prevents an attacker from creating a symlink
-         * like /tmp/workdir -> / to expand the sandbox to the whole fs. */
-        char resolved[PATH_MAX];
-        if (!realpath(path, resolved)) {
-            fprintf(stderr, "compartment-user: landlock: symlink %s: %s\n",
-                    path, strerror(errno));
-            return 0; /* skip nonexistent symlink target */
-        }
-        fd = open(resolved, O_PATH | O_CLOEXEC | O_NOFOLLOW);
-        if (fd < 0 && errno == ELOOP) {
-            /* Resolved path is still a symlink — give up */
-            fprintf(stderr, "compartment-user: landlock: chained symlink %s -> %s\n",
-                    path, resolved);
-            return 0;
-        }
-    }
-    if (fd < 0) {
-        /* Path doesn't exist — skip silently (e.g. /lib32 on some systems) */
-        return 0;
-    }
-    struct landlock_path_beneath_attr attr = {
-        .allowed_access = access,
-        .parent_fd = fd,
-    };
-    int r = syscall(__NR_landlock_add_rule, ruleset_fd,
-                    LANDLOCK_RULE_PATH_BENEATH, &attr, 0);
-    close(fd);
-    if (r < 0 && errno != EINVAL) {
-        fprintf(stderr, "compartment-user: landlock add_rule %s: %s\n",
-                path, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-static int apply_landlock(Config *cfg)
-{
-    /* Check Landlock ABI version */
-    int abi = syscall(__NR_landlock_create_ruleset, NULL, 0,
-                      LANDLOCK_CREATE_RULESET_VERSION);
-    if (abi < 0) {
-        fprintf(stderr, "compartment-user: Landlock not available (%s)\n",
-                strerror(errno));
-        return -1;
-    }
-
-    /* Access rights we control — must include ALL rights we want to
-     * restrict, otherwise Landlock silently allows them.
-     * ABI v1: base rights (read, write, execute, remove, make_*)
-     * ABI v2: REFER (cross-directory rename/link)
-     * ABI v3: TRUNCATE
-     * ABI v4: IOCTL_DEV (device ioctls — when kernel headers support it) */
-    uint64_t handled =
-        LANDLOCK_ACCESS_FS_READ_FILE   |
-        LANDLOCK_ACCESS_FS_READ_DIR    |
-        LANDLOCK_ACCESS_FS_WRITE_FILE  |
-        LANDLOCK_ACCESS_FS_REMOVE_DIR  |
-        LANDLOCK_ACCESS_FS_REMOVE_FILE |
-        LANDLOCK_ACCESS_FS_MAKE_CHAR   |
-        LANDLOCK_ACCESS_FS_MAKE_REG    |
-        LANDLOCK_ACCESS_FS_MAKE_DIR    |
-        LANDLOCK_ACCESS_FS_MAKE_SYM    |
-        LANDLOCK_ACCESS_FS_MAKE_BLOCK  |
-        LANDLOCK_ACCESS_FS_MAKE_SOCK   |
-        LANDLOCK_ACCESS_FS_MAKE_FIFO   |
-        LANDLOCK_ACCESS_FS_EXECUTE;
-    if (abi >= 2)
-        handled |= LANDLOCK_ACCESS_FS_REFER;
-    if (abi >= 3)
-        handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
-    if (abi >= 4)
-        handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
-#endif
-
-    /* An empty ruleset (0 paths) with a non-zero handled mask would deny
-     * ALL filesystem access — the process couldn't even load libc. */
-    if (cfg->path_count == 0) {
-        fprintf(stderr, "compartment-user: landlock enabled but no paths "
-                "configured — this would deny all filesystem access\n");
-        return -1;
-    }
-
-    struct landlock_ruleset_attr rs_attr = { .handled_access_fs = handled };
-    int ruleset_fd = syscall(__NR_landlock_create_ruleset,
-                             &rs_attr, sizeof(rs_attr), 0);
-    if (ruleset_fd < 0) {
-        fprintf(stderr, "compartment-user: create_ruleset: %s\n", strerror(errno));
-        return -1;
-    }
-
-    /* Define access masks for each mode */
-    uint64_t read_access =
-        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-    uint64_t write_access =
-        LANDLOCK_ACCESS_FS_WRITE_FILE  |
-        LANDLOCK_ACCESS_FS_REMOVE_DIR  |
-        LANDLOCK_ACCESS_FS_REMOVE_FILE |
-        LANDLOCK_ACCESS_FS_MAKE_CHAR   |
-        LANDLOCK_ACCESS_FS_MAKE_REG    |
-        LANDLOCK_ACCESS_FS_MAKE_DIR    |
-        LANDLOCK_ACCESS_FS_MAKE_SYM    |
-        LANDLOCK_ACCESS_FS_MAKE_BLOCK  |
-        LANDLOCK_ACCESS_FS_MAKE_SOCK   |
-        LANDLOCK_ACCESS_FS_MAKE_FIFO;
-    if (abi >= 2) write_access |= LANDLOCK_ACCESS_FS_REFER;
-    if (abi >= 3) write_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
-    if (abi >= 4) write_access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
-#endif
-    uint64_t exec_access = LANDLOCK_ACCESS_FS_EXECUTE;
-
-    for (int i = 0; i < cfg->path_count; i++) {
-        uint64_t access = 0;
-        switch (cfg->paths[i].mode) {
-        case PATH_RO:   access = read_access | exec_access; break;
-        case PATH_RW:   access = read_access | write_access; break; /* W^X: no exec */
-        case PATH_EXEC: access = read_access | exec_access; break;
-        case PATH_RWX:  access = read_access | write_access | exec_access; break;
-        }
-        if (landlock_add_path(ruleset_fd, cfg->paths[i].path, access) != 0) {
-            fprintf(stderr, "compartment-user: landlock: failed to add rule for %s\n",
-                    cfg->paths[i].path);
-            close(ruleset_fd);
-            return -1;
-        }
-    }
-
-    /* Enforce */
-    if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) != 0) {
-        fprintf(stderr, "compartment-user: restrict_self: %s\n", strerror(errno));
-        close(ruleset_fd);
-        return -1;
-    }
-    close(ruleset_fd);
-
-    if (cfg->verbose)
-        fprintf(stderr, "compartment-user: landlock enforced (ABI v%d, %d path rules)\n",
-                abi, cfg->path_count);
-    return 0;
-}
-
 /* ── CLI ─────────────────────────────────────────────────────────── */
 
 static void print_usage(void)
@@ -386,10 +217,20 @@ static void print_usage(void)
         "\n"
         "Filesystem (Landlock):\n"
         "  --ro PATH             Read-only + execute access\n"
+        "                        (append '?' to skip the rule when the path\n"
+        "                        does not exist: --ro /lib32?)\n"
         "  --rw PATH             Read-write access (no execute — W^X)\n"
-        "  --exec PATH           Read + execute access (alias for --ro)\n"
+        "  --exec PATH           Read + execute access (a rule naming a FILE\n"
+        "                        is a per-binary execute grant)\n"
         "  --workdir PATH        Working directory (added as --rw)\n"
         "  --no-landlock         Disable Landlock\n"
+        "\n"
+        "Network (Landlock, ABI v4+ / Linux 6.7+, TCP only):\n"
+        "  --net-bind PORT       Allow bind(2) on this TCP port (repeatable)\n"
+        "  --net-connect PORT    Allow connect(2) to this TCP port (repeatable)\n"
+        "  --net-deny            Handle TCP bind and connect; deny every port\n"
+        "                        not named above.  Without any of these three\n"
+        "                        the network is not restricted at all.\n"
         "\n"
         "Syscalls (seccomp BPF):\n"
         "  --block SYSCALL       Block a syscall (by name)\n"
@@ -733,11 +574,23 @@ static void dump_profile(const Config *cfg)
     printf("# Filesystem (Landlock)\n");
     for (int i = 0; i < cfg->path_count; i++) {
         static const char *modes[] = { "ro", "rw", "exec", "rwx" };
-        printf("%s %s\n", modes[cfg->paths[i].mode], cfg->paths[i].path);
+        printf("%s %s%s\n", modes[cfg->paths[i].mode], cfg->paths[i].path,
+               cfg->paths[i].optional ? "?" : "");
+    }
+    if (cfg->net_bind_count || cfg->net_connect_count || cfg->net_default_deny) {
+        printf("\n# Network (Landlock TCP ports)\n");
+        for (int i = 0; i < cfg->net_bind_count; i++)
+            printf("net-bind %d\n", cfg->net_bind_ports[i]);
+        for (int i = 0; i < cfg->net_connect_count; i++)
+            printf("net-connect %d\n", cfg->net_connect_ports[i]);
+        if (cfg->net_default_deny)
+            printf("net-default deny\n");
     }
     if (cfg->workdir)
         printf("\nworkdir %s\n", cfg->workdir);
 
+    if (cfg->seccomp_default != SECCOMP_DEFAULT_ERRNO)
+        printf("\nseccomp-default %s\n", seccomp_action_name(cfg));
     if (cfg->seccomp_allow_mode) {
         printf("\n# Syscall allow-list (seccomp)\nseccomp-mode allow\n");
         for (int i = 0; i < cfg->allowed_sc_count; i++) {
@@ -940,7 +793,7 @@ int main(int argc, char *argv[])
         if (shell_cfg.use_env_sanitize)
             sanitize_env(&shell_cfg);
         if (shell_cfg.use_landlock) {
-            if (apply_landlock(&shell_cfg) != 0) {
+            if (apply_landlock(&shell_cfg, TOOL) != 0) {
                 syslog(LOG_WARNING, "compartment-user[%s]: "
                        "Landlock failed — running without filesystem restriction",
                        invoked_name);
@@ -1002,6 +855,9 @@ int main(int argc, char *argv[])
         {"insecure",        no_argument,       NULL, 'U'},
         {"unsecure",        no_argument,       NULL, 'U'},  /* alias */
         {"verify",          no_argument,       NULL, 'V'},
+        {"net-bind",        required_argument, NULL, 4},
+        {"net-connect",     required_argument, NULL, 5},
+        {"net-deny",        no_argument,       NULL, 6},
         {"user-profiles",   no_argument,       NULL, 2},
         {"dump-profile",    required_argument, NULL, 3},
         {"version",         no_argument,       NULL, 1},
@@ -1074,6 +930,18 @@ int main(int argc, char *argv[])
         case 'A': cfg.audit_log_dir = optarg; cfg.audit = 1; break;
         case 'U': cfg.allow_insecure = 1; break;
         case 'V': return print_verify();
+        case  4 : /* --net-bind */
+            if (cfg_add_net_port(CLI_WHERE, "net-bind", optarg,
+                                 cfg.net_bind_ports, &cfg.net_bind_count) != 0)
+                return 1;
+            break;
+        case  5 : /* --net-connect */
+            if (cfg_add_net_port(CLI_WHERE, "net-connect", optarg,
+                                 cfg.net_connect_ports,
+                                 &cfg.net_connect_count) != 0)
+                return 1;
+            break;
+        case  6 : cfg.net_default_deny = 1; break;
         case  2 : profile_flags |= PROFILE_SEARCH_USER; break;
         case  3 : cfg.profile = optarg; dump = 1; break;
         case  1 : printf("compartment-user %s\n", COMPARTMENT_VERSION); return 0;
@@ -1151,6 +1019,10 @@ int main(int argc, char *argv[])
             return 1;
     }
 
+    /* ── Reject a policy Landlock cannot express (M9) ───────────── */
+    if (cfg.use_landlock && config_check_additive(&cfg, TOOL) != 0)
+        return 1;
+
     /* ── Dump the resolved policy as .conf and exit ─────────────── */
     if (dump) {
         dump_profile(&cfg);
@@ -1166,12 +1038,36 @@ int main(int argc, char *argv[])
                 cfg.use_no_new_privs ? "yes" : "no");
         fprintf(stderr, "  landlock: %s (%d path rules)\n",
                 cfg.use_landlock ? "yes" : "no", cfg.path_count);
-        for (int i = 0; i < cfg.path_count; i++)
-            fprintf(stderr, "    %s %s\n",
+        for (int i = 0; i < cfg.path_count; i++) {
+            struct stat pst;
+            const char *note = "";
+            if (stat(cfg.paths[i].path, &pst) != 0)
+                note = cfg.paths[i].optional ? "   (absent — optional, skipped)"
+                                             : "   (ABSENT — this run would fail)";
+            fprintf(stderr, "    %s %s%s%s\n",
                     cfg.paths[i].mode == PATH_RO ? "ro" :
                     cfg.paths[i].mode == PATH_RW ? "rw" :
                     cfg.paths[i].mode == PATH_EXEC ? "exec" : "rwx",
-                    cfg.paths[i].path);
+                    cfg.paths[i].path,
+                    cfg.paths[i].optional ? "?" : "", note);
+        }
+        {
+            int abi = landlock_abi();
+            int nrules = cfg.net_bind_count + cfg.net_connect_count;
+            if (nrules > 0 || cfg.net_default_deny) {
+                fprintf(stderr, "  landlock net: %s (%d TCP port rule%s)\n",
+                        (abi >= 4) ? "yes" : "NOT SUPPORTED on this kernel",
+                        nrules, nrules == 1 ? "" : "s");
+                for (int i = 0; i < cfg.net_bind_count; i++)
+                    fprintf(stderr, "    net-bind %d\n", cfg.net_bind_ports[i]);
+                for (int i = 0; i < cfg.net_connect_count; i++)
+                    fprintf(stderr, "    net-connect %d\n",
+                            cfg.net_connect_ports[i]);
+                if (cfg.net_default_deny)
+                    fprintf(stderr, "    net-default deny\n");
+            }
+        }
+        fprintf(stderr, "  seccomp-default: %s\n", seccomp_action_name(&cfg));
         if (cfg.seccomp_allow_mode) {
             fprintf(stderr, "  seccomp: %s ALLOW-LIST (%d allowed, rest denied)\n",
                     cfg.use_seccomp ? "yes" : "no", cfg.allowed_sc_count);
@@ -1263,7 +1159,7 @@ int main(int argc, char *argv[])
 
     /* ── 3. Landlock (filesystem) ──────────────────────────────── */
     if (cfg.use_landlock) {
-        if (apply_landlock(&cfg) != 0) {
+        if (apply_landlock(&cfg, TOOL) != 0) {
             fprintf(stderr, "compartment-user: Landlock failed — aborting. "
                     "Use --no-landlock to run without filesystem restriction.\n");
             return 1;

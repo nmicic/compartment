@@ -80,13 +80,47 @@ if grep -q 'covers most server workloads' "${EXAMPLES}/container.conf"; then
 else
     pass "container.conf no longer claims to cover server workloads"
 fi
-for sc in socket bind listen connect epoll_ctl; do
-    if grep -qE "^# allow ${sc}$" "${EXAMPLES}/container.conf"; then
-        pass "container.conf lists the missing '${sc}' syscall for server use"
+# The network block is live now that syscall_table[] carries these names.
+for sc in socket bind listen connect epoll_ctl eventfd2 timerfd_create \
+          signalfd4 openat2; do
+    if grep -qE "^allow ${sc}$" "${EXAMPLES}/container.conf"; then
+        pass "container.conf allows '${sc}' (network block enabled)"
     else
-        fail "container.conf does not list '${sc}'"
+        fail "container.conf does not allow '${sc}'"
     fi
 done
+
+# Every syscall container.conf names must resolve, or the allow-list is
+# quietly one entry short of what it claims.
+CC_WARN="${WORK}/container-warn.err"
+"${CU}" --dry-run --profile "${EXAMPLES}/container.conf" -- /bin/true \
+    >/dev/null 2>"${CC_WARN}" || true
+if grep -q 'unknown syscall' "${CC_WARN}"; then
+    fail "container.conf names a syscall the table does not know: $(grep -m1 'unknown syscall' "${CC_WARN}")"
+else
+    pass "container.conf names no unknown syscall"
+fi
+
+# restricted-root.conf is the compartment-root demonstration profile: an
+# exec allow-list, mount hardening and a TCP port policy in one file.
+RR="${EXAMPLES}/restricted-root.conf"
+for want in 'landlock on' 'net-default deny' 'rootdir-flags' 'mount-noexec /tmp'; do
+    if grep -qE "^${want}" "${RR}"; then
+        pass "restricted-root.conf sets '${want}'"
+    else
+        fail "restricted-root.conf does not set '${want}'"
+    fi
+done
+if grep -qE '^exec /usr/bin/' "${RR}"; then
+    pass "restricted-root.conf carries a per-binary exec allow-list"
+else
+    fail "restricted-root.conf has no per-file exec rule"
+fi
+if grep -q 'does NOT guarantee' "${RR}"; then
+    pass "restricted-root.conf states its limits"
+else
+    fail "restricted-root.conf does not state what it cannot guarantee"
+fi
 
 echo ""
 

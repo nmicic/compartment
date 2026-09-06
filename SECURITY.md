@@ -67,12 +67,11 @@ documented limitations, including:
 - The uid/gid map defaults to the identity map, so the user namespace
   provides a capability boundary but no uid isolation unless `uid-map` /
   `gid-map` are set (see HOWTO.md)
-- `compartment-root --netns NAME` does not work as documented. The container
-  always gets a new user namespace, and `setns(2)` on a network namespace
-  needs `CAP_SYS_ADMIN` in the user namespace that *owns* it — the initial
-  one for anything `ip netns add` created — so the join fails with
-  `Operation not permitted`. Use `--loopback`, or an empty netns, until the
-  namespace is joined in the parent before `clone()`
+- `compartment-root --netns NAME` joins the target namespace in the parent,
+  before `clone()`, and drops `CLONE_NEWNET` so the container inherits it.
+  One consequence: a network namespace owned by the initial user namespace
+  cannot have a fresh `sysfs` mounted over it from inside the container, so
+  `/sys` falls back to an empty read-only tmpfs. `--verbose` reports that
 - The audit log is a record, not a restriction, and its confidentiality
   depends on where it is kept. The defaults are outside every path rule the
   built-in profiles grant, so a sandboxed process can neither read nor
@@ -82,7 +81,46 @@ documented limitations, including:
   writable or removable) from inside the sandbox. An operator-chosen
   `--audit-log` directory inside a granted `rw`/`rwx` path (for example
   `--audit-log /tmp/x` under `rw /tmp`) is fully reachable by the confined
-  process; compartment-user does not warn about that today
-- Landlock rules are additive and cannot express a per-file rule: a rule
-  naming a regular file is accepted and installs nothing, and a narrower
-  `ro` rule cannot claw back a subtree already granted `rw`
+  process. Both tools now print a warning when the audit directory resolves
+  inside a granted `rw`/`rwx` rule, but it is a warning and not a refusal —
+  the run continues
+- **Landlock is additive.** The rights of every rule matching an ancestor of
+  the path being opened are unioned, so a narrower rule never restricts a
+  wider one. A `ro` rule inside a `rw`/`rwx` rule is now refused outright
+  rather than silently doing nothing, but the underlying limitation stands:
+  there is no way to carve an exception out of a granted subtree. Split the
+  writable rules instead
+- **Landlock network rules are TCP-only and allow-list-only.** `net-bind`,
+  `net-connect` and `net-default deny` cover `bind(2)` and `connect(2)` on
+  TCP and nothing else. UDP, unix sockets, netlink and raw sockets are
+  untouched — a DNS query over UDP/53 works, and so would exfiltration over
+  UDP. There is no `listen`/`accept` granularity and no per-address rule: a
+  rule for port 443 allows port 443 on every address, IPv4 and IPv6 alike.
+  There is no way to express "everything except port N"; a port deny-list,
+  per-address rules and UDP all need a BPF LSM. Below Landlock ABI v4
+  (Linux 6.7) both tools warn loudly and the port policy is **not** active
+  while the filesystem rules still are
+- **Landlock in compartment-root is opt-in.** It is off unless the policy
+  says `landlock on` (or a `--ro`/`--rw`/`--rwx`/`--exec` flag is given), so
+  a profile written for an earlier release keeps its previous behaviour and
+  gets no filesystem confinement inside the container. A policy that carries
+  path rules without turning Landlock on produces a warning, not an error
+- **An `exec` allow-list is a property of the sandbox, not of a caller.**
+  `exec /usr/bin/psql` restricts what may be executed anywhere in the
+  sandbox, including by uid 0 inside it, but it cannot express "the
+  supervisor may run psql and the request handler may not". It also keys on
+  the file rather than the name, so a busybox-style multi-call binary cannot
+  be split into applets, and it says nothing about shell builtins, which are
+  not `execve` at all. The dynamic loader must be listed alongside the
+  binaries — `execve(2)` opens the ELF interpreter with `FMODE_EXEC` —
+  while shared libraries need only read access, because `ld.so` opens them
+  read-only and Landlock has no mmap hook
+- **A Landlock rule for a path that does not exist grants nothing.** That is
+  now a fatal error rather than a silent no-op; a trailing `?` on the path
+  marks a rule optional. `--verbose` reports the number of rules actually
+  installed, and `--dry-run` marks a path that is absent
+- **The seccomp allow-list default action is `ERRNO(EPERM)`.** A denied
+  syscall returns an error the program may mishandle rather than terminating
+  it, and an attacker can probe the filter one call at a time because every
+  denial returns cleanly. `seccomp-default kill` changes that to
+  `SECCOMP_RET_KILL_PROCESS`; the default stays `errno` for compatibility

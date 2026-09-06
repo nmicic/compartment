@@ -100,9 +100,50 @@ compartment-user refuses to start otherwise.
 The same applies to
 .I $HOME
 expanded inside a profile value.
+.PP
+A rule may name a directory or a single file.
+A rule that names a file carries only the file-level rights
+(execute, read, write, truncate, device ioctl); the directory-only rights
+are dropped, which is what makes
+.B \-\-rw
+.I /dev/null
+and
+.B \-\-exec
+.I /usr/bin/psql
+meaningful.
+.PP
+A rule for a path that does not exist is a
+.B fatal error:
+it would grant nothing, and a policy that believes otherwise is worse than
+one that refuses to start.
+Append
+.B ?
+to the path to make the rule optional
+.RI ( "\-\-ro /lib32?" ):
+it is then skipped, with a note under
+.BR \-\-verbose ,
+when the path is absent.
+.PP
+Landlock is
+.B additive:
+the rights of every rule matching an ancestor of the path being opened are
+unioned, so a narrower rule never restricts a wider one.
+A
+.B ro
+rule whose path lies inside a
+.B rw
+or
+.B rwx
+rule cannot take anything away and is refused; split the writable rules
+instead.
+An
+.B exec
+rule inside a
+.B rw
+rule is allowed, because it genuinely adds a right.
 .TP
 .BI \-\-ro " PATH"
-Grant read-only + execute access to \fIPATH\fR.
+Grant read-only + execute access to \fIPATH\fR and everything beneath it.
 .TP
 .BI \-\-rw " PATH"
 Grant read-write access to \fIPATH\fR.
@@ -119,13 +160,79 @@ for execute access, and note that a path listed both \fB\-\-rw\fR and
 additive.
 .TP
 .BI \-\-exec " PATH"
-Grant read + execute access (alias for \fB\-\-ro\fR).
+Grant read + execute access to \fIPATH\fR.
+On a directory this is the same set of rights as
+.BR \-\-ro .
+On a
+.I file
+it is a per-binary execute grant: a policy that names individual files with
+.B \-\-exec
+and grants execute on no directory is an allow-list of binaries.
+Two caveats decide whether that works.
+The dynamic loader must be listed as well, because
+.BR execve (2)
+opens the ELF interpreter with
+.B FMODE_EXEC
+and Landlock checks the execute right on it.
+Shared libraries must
+.I not
+be: the loader opens them read-only and Landlock has no mmap hook, so read
+access to the library directory is enough \(em and
+.B \-\-rw
+is the more precise choice there, since
+.B \-\-ro
+grants execute on everything beneath it.
+The grant keys on the file, so a busybox-style multi-call binary cannot be
+split into applets, and a shell builtin is not an
+.BR execve (2)
+at all.
 .TP
 .BI \-\-workdir " PATH"
 Set working directory (added as \fB\-\-rw\fR).
 .TP
 .B \-\-no\-landlock
 Disable Landlock filesystem restrictions.
+.SS "Network (Landlock, ABI v4 / Linux 6.7+)"
+.PP
+TCP only.
+These rules cover
+.BR bind (2)
+and
+.BR connect (2)
+on TCP and nothing else: no UDP, no unix sockets, no netlink, no raw
+sockets, no
+.BR listen / accept
+granularity, and no per-address rules \(em a rule for port 443 allows port
+443 on every address, IPv4 and IPv6 alike.
+They are an allow-list; there is no way to express \(lqeverything except
+port N\(rq.
+Below Landlock ABI v4 compartment-user prints a warning and the port policy
+is
+.B not
+active, while the filesystem rules still are.
+.TP
+.BI \-\-net\-bind " PORT"
+Allow
+.BR bind (2)
+on TCP \fIPORT\fR. Repeatable.
+.TP
+.BI \-\-net\-connect " PORT"
+Allow
+.BR connect (2)
+to TCP \fIPORT\fR. Repeatable.
+.TP
+.B \-\-net\-deny
+Handle TCP bind and connect and refuse every port not named above.
+Without this flag and without any
+.B \-\-net\-*
+rule the network is not restricted at all, which is the default.
+Note that naming only connect rules still leaves
+.BR bind (2)
+unrestricted, while
+.B \-\-net\-deny
+refuses both \(em including the explicit
+.BR bind (2)
+on port 0 that some clients make before connecting.
 .SS "Syscalls (seccomp BPF)"
 .TP
 .BI \-\-block " SYSCALL"
@@ -148,6 +255,25 @@ Repeatable.
 .TP
 .B \-\-no\-seccomp
 Disable seccomp filtering.
+.PP
+What a denied syscall does is chosen by the
+.B seccomp\-default
+profile directive:
+.B errno
+(the default,
+.BR EPERM ),
+.B kill
+.RB ( SECCOMP_RET_KILL_PROCESS ,
+a
+.B SIGSYS
+the process cannot mishandle) or
+.B log
+(permit and record, for working out what a policy needs).
+.B errno
+remains the default for compatibility; it is the weakest of the three,
+because a program that does not check return values corrupts its own logic
+instead of dying, and every denial returns cleanly enough for an attacker to
+probe the filter one call at a time.
 .SS Environment
 .TP
 .BI \-\-env\-allow " VAR"
@@ -401,13 +527,22 @@ Profiles use a simple line-oriented format shared with
 .PP
 .nf
 .RS
-# Filesystem
+# Filesystem.  A rule may name a directory or a file; a
+# trailing '?' makes the rule optional instead of fatal.
 ro /usr
+ro /lib32?
+rw /dev/null
+exec /usr/bin/psql
 rw $HOME
+
+# Network (TCP only, Landlock ABI v4 / Linux 6.7+)
+net-connect 5432
+net-default deny
 
 # Syscalls
 block ptrace
 block mount
+seccomp-default errno
 
 # Environment
 env-deny LD_*

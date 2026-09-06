@@ -122,22 +122,33 @@ One directive per line. Blank lines and `#` comments are ignored.
 # Inherit another profile (loads it first, then applies these rules on top)
 # inherit ai-agent
 
-# Filesystem (Landlock)
+# Filesystem (Landlock).  A rule may name a directory or a single file;
+# a trailing '?' makes the rule optional instead of fatal when the path
+# does not exist.
 ro /usr
 ro /lib
 ro /lib64
+ro /lib32?
 ro /etc
 ro /bin
 ro /proc
 ro /dev
+rw /dev/null
 rw /tmp
 rwx $HOME
+
+# Network (Landlock ABI v4 / Linux 6.7+, TCP only)
+# net-connect 443
+# net-default deny
 
 # Syscall blocklist (seccomp)
 block ptrace
 block mount
 block unshare
 block bpf
+
+# What a denied syscall does: errno (default), kill or log
+# seccomp-default kill
 
 # Environment deny list ('*' at the end is a prefix match)
 env-deny LD_*
@@ -186,16 +197,39 @@ same way and is equivalent to the built-in.
 
 ### Directives
 
-Used by **compartment-user**:
+Filesystem and network — used by **both** tools (Landlock is on by default
+for compartment-user and opt-in for compartment-root):
 
 | Directive | Value | Example |
 |-----------|-------|---------|
-| `ro` | path | `ro /usr` |
+| `ro` | path (read + execute) | `ro /usr` |
 | `rw` | path (read + write, no execute) | `rw /tmp` |
 | `rwx` | path (read + write + execute) | `rwx $HOME` |
-| `exec` | path (alias for `ro`) | `exec /opt/bin` |
-| `workdir` | path | `workdir $HOME/projects` |
+| `exec` | path (read + execute; on a **file**, a per-binary grant) | `exec /usr/bin/psql` |
+| *(any of the above)* | a trailing `?` makes the rule optional | `ro /lib32?` |
+| `workdir` | path (compartment-user; added as `rw`) | `workdir $HOME/projects` |
 | `landlock` | `on` only | `landlock on` |
+| `net-bind` | TCP port 0-65535 (repeatable) | `net-bind 8080` |
+| `net-connect` | TCP port 0-65535 (repeatable) | `net-connect 5432` |
+| `net-default` | `deny` or `ignore` (default `ignore`) | `net-default deny` |
+
+Three things about these rules are not obvious and will bite:
+
+* **A rule may name a single file.** `rw /dev/null`, `ro /etc/resolv.conf`
+  and `exec /usr/bin/psql` all work. Only the file-level rights apply to
+  such a rule (execute, read, write, truncate, ioctl-dev); the
+  directory-only rights are dropped.
+* **A rule for a path that does not exist is fatal.** It would grant
+  nothing, and a policy that believes it granted something is worse than one
+  that refuses to start. Append `?` to the path for the entries that are
+  genuinely conditional (`ro /lib32?`), and check with `--dry-run`, which
+  marks a path that is not there.
+* **Landlock is additive.** The rights of every rule matching an ancestor of
+  the path being opened are unioned, so a narrower rule never restricts a
+  wider one. `rw /work` together with `ro /work/secrets` leaves the secrets
+  writable; both tools refuse that policy outright. Split the writable rules
+  instead. (`exec` inside `rw` is allowed, because that one genuinely adds a
+  right rather than pretending to remove one.)
 
 Used by **both** tools:
 
@@ -204,6 +238,7 @@ Used by **both** tools:
 | `block` | syscall name | `block ptrace` |
 | `allow` | syscall name (switches to allow-list) | `allow read` |
 | `seccomp-mode` | `allow` or `deny` | `seccomp-mode allow` |
+| `seccomp-default` | `errno`, `kill` or `log` (default `errno`) | `seccomp-default kill` |
 | `env-deny` | variable name or `PREFIX*` | `env-deny LD_*` |
 | `env-allow` | variable name or `PREFIX*` (switches to allow-list) | `env-allow PATH` |
 | `env-mode` | `allow` or `deny` | `env-mode allow` |
@@ -229,6 +264,15 @@ Used by **compartment-root** only:
 | `mount-mask` | path | `mount-mask /proc/keys` | `--mount-mask` |
 | `uid-map` | `<container-start> <host-start> <count>` | `uid-map 0 100000 65536` | — (profile only) |
 | `gid-map` | `<container-start> <host-start> <count>` | `gid-map 0 100000 65536` | — (profile only) |
+| `rootdir-flags` | `ro`, `noexec` (comma-separated) | `rootdir-flags ro,noexec` | — (profile only) |
+| `mount-ro` | path inside the new root | `mount-ro /usr` | — (profile only) |
+| `mount-noexec` | path inside the new root | `mount-noexec /tmp` | — (profile only) |
+| `mount-nosuid` | path inside the new root | `mount-nosuid /home` | — (profile only) |
+| `mount-nodev` | path inside the new root | `mount-nodev /home` | — (profile only) |
+
+compartment-root also accepts `--landlock`, `--ro`, `--rw`, `--rwx` and
+`--exec` on the command line; any of the four path options turns Landlock on
+by itself.
 
 `uid-map` and `gid-map` have no command-line equivalent; both default to
 the identity map `0 0 65536`, which gives a capability boundary and no uid
@@ -239,9 +283,85 @@ directive is `cap-allow`, the command-line flag is `--cap-allowed`.
 Writing `cap-allowed` in a profile produces only an "unknown directive"
 warning and the capability is dropped.
 
-Each tool silently ignores the other's directives — they are recognised
-by the shared parser, so no "unknown directive" warning appears. Keep
-compartment-user and compartment-root policy in separate files.
+compartment-user silently ignores the compartment-root-only directives —
+they are recognised by the shared parser, so no "unknown directive" warning
+appears. Keep compartment-user and compartment-root policy in separate
+files.
+
+### `exec` on a file: a binary allow-list
+
+A Landlock rule on a regular file grants `LANDLOCK_ACCESS_FS_EXECUTE` on
+that one file. A policy that grants execute on individual files and on no
+directory is therefore an allow-list of binaries:
+
+```conf
+landlock on
+exec /usr/bin/exampled
+exec /usr/bin/psql
+ro   /usr/lib          # libraries: read is enough, see below
+rw   /srv/exampled/data
+```
+
+Four facts decide whether this works for you, all verified against the
+running kernel rather than inferred:
+
+1. **The dynamic loader must be listed too.** `execve(2)` opens the ELF
+   interpreter with `FMODE_EXEC`, and Landlock's `file_open` hook maps that
+   to the execute right. Without `exec /lib64/ld-linux-x86-64.so.2` every
+   dynamically linked binary fails with `EACCES` no matter what else is
+   granted.
+2. **Shared libraries do not.** `ld.so` opens a `.so` read-only and maps it
+   `PROT_EXEC`; Landlock has no mmap hook, so `READ_FILE` on the library
+   directory is all a library needs. `ro` or `rw` on `/usr/lib` is enough —
+   and `rw` is the more honest choice in an allow-list, because `ro` grants
+   execute on everything beneath it.
+3. **`ro` on a directory grants execute.** No directory containing binaries
+   may appear as `ro` in an allow-list policy, or the allow-list is a
+   no-op. This is the single easiest way to get it wrong.
+4. **The rule keys on the file, not on the name.** A busybox-style
+   multi-call binary cannot be split into applets: allowing `/bin/sh`
+   allows every applet, because they are all the same inode. Likewise a
+   shell builtin is not an `execve` at all, so listing a shell in the
+   allow-list gives away far more than the shell.
+
+The allow-list is a property of the whole sandbox and not of a caller: it
+cannot express "the supervisor may run psql but the request handler may
+not", and it can only ever be narrowed by a child. That needs a BPF LSM.
+
+### Landlock network rules
+
+`net-bind PORT`, `net-connect PORT` and `net-default deny` build
+`LANDLOCK_RULE_NET_PORT` rules. They need Landlock ABI v4 (Linux 6.7);
+below that both tools print a loud warning and the port policy is **not**
+active — the filesystem rules still are.
+
+```conf
+net-connect 443
+net-connect 5432
+net-default deny
+```
+
+`net-default deny` handles both TCP bind and connect, so with only connect
+rules present every `bind(2)` is refused as well — including the explicit
+`bind(port 0)` some clients make before connecting. Add `net-bind 0` if you
+need that. Without `net-default deny`, naming any `net-*` rule still turns
+the corresponding access on: `net-connect 443` alone means "connect to 443
+and nothing else", while `bind` stays unrestricted.
+
+What these rules cannot do, stated plainly:
+
+* **TCP only.** No UDP, no unix sockets, no netlink, no raw sockets. A DNS
+  query over UDP/53 is unaffected, and so is exfiltration over UDP.
+* **Allow-list only.** There is no way to express "everything except port
+  N". The shape available is `net-default deny` plus the ports you need.
+* **Ports only.** No per-address rules: a rule for port 443 allows port 443
+  on every address, IPv4 and IPv6 alike, and there is no way to allow v4
+  while denying v6.
+* **No `listen`/`accept` granularity.** `bind` is the only server-side
+  operation covered.
+
+A port deny-list, per-address rules and UDP all need a BPF LSM; they are
+future work for a sibling tool, not something Landlock can be made to do.
 
 ### Environment name patterns
 
@@ -679,14 +799,28 @@ make compartment-root
    for a user that only exists inside the container, pass `--uid`/`--gid`)
 3. Open audit log (host filesystem, before namespace setup)
 4. `clone()` with new namespaces (UTS, mount, PID, IPC, net, user, cgroup)
+4b. Parent: validate `rootdir` ownership, and — when `netns` names one —
+   join that network namespace *before* `clone()`, dropping `CLONE_NEWNET`
+   so the child inherits it
 5. Parent: clear supplementary groups, write `deny` to
    `/proc/<pid>/setgroups`, write the UID/GID maps (identity `0 0 65536`
    unless `uid-map`/`gid-map` say otherwise), cgroup assignment
-6. Child: become uid 0 *of the new namespace*, `pivot_root`
+6. Child: become uid 0 *of the new namespace*, bind `rootdir` onto itself,
+   remount it `nosuid,nodev` (plus anything `rootdir-flags` adds except
+   `ro`), `pivot_root`
 7. Child: mount `/proc`, mount read-only `/sys`, populate `/dev` with
-   device nodes bind-mounted from the old root, apply the `/proc` masks —
-   **then** detach the old root (see "Why the order matters" below)
+   device nodes bind-mounted from the old root, mount a private `devpts` on
+   `/dev/pts` and bind `/dev/ptmx` to it, mount a tmpfs `/dev/shm`, apply
+   the `/proc` masks — **then** detach the old root (see "Why the order
+   matters" below)
+7b. Child: apply `mount-ro`/`mount-noexec`/`mount-nosuid`/`mount-nodev`,
+   then `rootdir-flags ro` last of all — the tree has to be writable while
+   the mount points above are being created
 8. Child: Hostname isolation, optional loopback
+8b. Child: Landlock, when `landlock on` (or any `--ro`/`--rw`/`--rwx`/
+   `--exec`) is in the policy. Applied here because every mount is in place
+   and the child still holds `CAP_SYS_ADMIN` in its own user namespace,
+   which is what `landlock_restrict_self(2)` needs before `no_new_privs`
 9. Child: Capability bounding-set drop (raw `prctl` — while still root)
 10. Child: `PR_SET_KEEPCAPS` + privilege drop (`setgid`/`setuid`)
 10b. Child: `capset()` — restore effective+permitted caps for service user
@@ -694,7 +828,10 @@ make compartment-root
 12. Child: audit `CONTAINER_EXEC`, close inherited FDs
 13. Child: `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG`, fork under a PID 1
     reaper, seccomp BPF (raw, fatal on failure), resource limits,
-    `exec` the command
+    `exec` the command. The reaper installs the same filter whenever the
+    policy permits `wait4`, `kill`, `rt_sigaction`, `rt_sigprocmask`,
+    `rt_sigreturn`, `exit_group` and `write`; when it does not, PID 1 stays
+    unfiltered and `--verbose` says so
 
 ### Why the order matters
 
@@ -723,8 +860,53 @@ bind-mounting from `/.pivot_old/dev` before the detach.
 | `mount-mask` | `mount-mask /proc/timer_list` | Extra path to mask (repeatable) |
 | `uid-map` | `uid-map 0 100000 65536` | `<container-start> <host-start> <count>`; default is the identity map `0 0 65536` |
 | `gid-map` | `gid-map 0 100000 65536` | Same, for gids |
+| `rootdir-flags` | `rootdir-flags ro,noexec` | Extra mount flags on the rootdir bind. `nosuid` and `nodev` are always applied and cannot be turned off |
+| `mount-ro` | `mount-ro /usr` | Bind a path inside the new root onto itself and remount it read-only (repeatable) |
+| `mount-noexec` | `mount-noexec /tmp` | Same, `noexec` (repeatable) |
+| `mount-nosuid` | `mount-nosuid /home` | Same, `nosuid` (repeatable) |
+| `mount-nodev` | `mount-nodev /home` | Same, `nodev` (repeatable) |
+| `landlock` | `landlock on` | Enforce Landlock inside the container. **Off by default** here, unlike compartment-user |
 
 `cgroup` paths must resolve under `/sys/fs/cgroup/`.
+
+**`rootdir` ownership is checked.** Under the default identity uid map the
+directory must be owned by root; under a shifted `uid-map` it may instead be
+owned by the host uid the container's root maps to. It must never be group-
+or world-writable: whoever can write the container root chooses which
+binaries exist inside it, and `nosuid,nodev` only takes the sharpest edge
+off that. Note that a *root-owned* rootdir under a shifted map passes the
+check but cannot actually be used — the container's root is then an
+unprivileged host uid that cannot create the pivot point.
+
+**Changing mount flags needs two calls.** A bind mount inherits the flags of
+its source, and `mount(2)` ignores `MS_REC` on a remount, so each
+`mount-*` directive does a `MS_BIND|MS_REC` self-bind followed by a
+`MS_REMOUNT|MS_BIND|<flags>` pass — recursive via `mount_setattr(2)` where
+the kernel has it (5.12+), top mount only otherwise. `rootdir-flags ro` is
+deliberately **not** recursive: `/proc`, `/dev` and `/sys` are separate
+mounts on top of the container root and have to stay writable. It is also
+applied last, because those mount points must be created in a writable
+tree first.
+
+**`rootdir-flags noexec` disables the container.** Nothing inside the
+container root can then be executed, including the target command. It is
+only useful when the executables live on a separate mount.
+
+### Landlock inside the container
+
+`landlock on` runs the same ruleset builder compartment-user uses, so
+`ro`/`rw`/`rwx`/`exec` and the `net-*` directives all mean what they mean
+there. Two differences: Landlock is **off** by default (a profile written
+before this release keeps its old behaviour), and a policy that carries path
+rules without `landlock on` gets a warning rather than silence. `landlock on`
+with no path rules is refused, because an empty ruleset with a non-empty
+handled mask denies every filesystem access.
+
+`exec /path/to/binary` is the reason to use it: see "`exec` on a file: a
+binary allow-list" above, and `examples/restricted-root.conf` for a worked
+profile. The one caveat specific to containers is the busybox one — a
+single-binary rootdir cannot be split into applets, because an allow-list
+keys on the inode.
 
 **The default uid map gives no uid isolation.** `0 0 65536` maps container
 uid 0 to host uid 0, so a process that regains uid 0 inside the container
@@ -747,7 +929,11 @@ under `mktemp -d` and asserts against a real container (start-up, `/dev`,
 seccomp, privilege drop, `/proc` and `/sys` masking, namespace isolation
 and escape attempts, the init reaper, networking, uid mapping, cgroup
 confinement, reporting), then removes everything it created on exit —
-including on failure. Green on kernel 6.8 (Ubuntu 24.04) and kernel 7.0
+including on failure.
+`tests/scripts/root.d/compartment-root-landlock.sh` does the same for the
+Landlock exec allow-list, the `mount-*` and `rootdir-flags` hardening, the
+`rootdir` ownership rules, the `--netns` join, devpts and `/dev/shm`, and
+the TCP port rules. Green on kernel 6.8 (Ubuntu 24.04) and kernel 7.0
 (Ubuntu 26.04). The runner prints the assertion totals it measured; they
 move as suites are added, so read them from a run rather than from here.
 

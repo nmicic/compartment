@@ -112,12 +112,12 @@ fi
 KNOWN_HOSTS="${PARANOID_SSH_KNOWN_HOSTS:-${HOME}/.ssh/paranoid/known_hosts}"
 STRICT="${PARANOID_SSH_STRICT:-accept-new}"
 
-# The file and its directory have to exist before compartment-user starts: a
-# Landlock rule for a path that does not exist installs nothing, and ssh
-# could then not record a first-use key.  ssh.conf grants rw on the
-# directory, not the file — compartment-user silently drops rules that name
-# a file (it asks Landlock for READ_DIR, which the kernel refuses on a
-# non-directory).
+# The file and its directory have to exist before compartment-user starts:
+# ssh.conf marks the rule optional so the profile still loads without them,
+# and an optional rule that is skipped grants nothing — ssh could then not
+# record a first-use key.  The rule names the directory rather than the
+# file because accept-new writes a temporary file next to known_hosts and
+# renames it into place.
 KNOWN_HOSTS_DIR="$(dirname "$KNOWN_HOSTS")"
 mkdir -p "$KNOWN_HOSTS_DIR"
 chmod 700 "$KNOWN_HOSTS_DIR"

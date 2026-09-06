@@ -62,11 +62,17 @@
  * <linux/mount.h> so the build stays header-independent (and keeps the
  * zero-dependency promise). Only used to apply nosuid/nodev recursively;
  * the code falls back to MS_REMOUNT|MS_BIND when it is unavailable. */
+#ifndef MOUNT_ATTR_RDONLY
+#define MOUNT_ATTR_RDONLY 0x00000001
+#endif
 #ifndef MOUNT_ATTR_NOSUID
 #define MOUNT_ATTR_NOSUID 0x00000002
 #endif
 #ifndef MOUNT_ATTR_NODEV
 #define MOUNT_ATTR_NODEV  0x00000004
+#endif
+#ifndef MOUNT_ATTR_NOEXEC
+#define MOUNT_ATTR_NOEXEC 0x00000008
 #endif
 #ifndef AT_RECURSIVE
 #define AT_RECURSIVE      0x8000
@@ -102,13 +108,20 @@ static int  assign_to_cgroups(Config *config, pid_t pid);
 static int  path_has_dotdot(const char *path);
 static int  mask_path(Config *config, const char *path);
 static void join_netns(const char *netns_name);
+static int  check_rootdir_ownership(Config *config);
+static int  apply_mount_flags(Config *config);
+static int  remount_with_flags(Config *config, const char *path,
+                               unsigned long flags, const char *what,
+                               int recursive);
 static void set_rlimits(void);
 static void apply_default_seccomp_denylist(Config *config);
-static void container_init(void);
+static void container_init(Config *config);
+static int  policy_covers_reaper(const Config *config);
 static void print_help(const char *prog_name);
 
 /* Location label used by the fail-closed policy-append helpers. */
 #define CLI_WHERE "command line"
+#define TOOL      "compartment-root"
 
 /* ── Built-in container filesystem layout ───────────────────────────── */
 
@@ -156,56 +169,15 @@ static const char *syscall_name(int nr)
  * every container ran with Seccomp: 0 — byte-identical to --no-seccomp —
  * while --help advertised seccomp as one of the things the tool does.
  *
- * The list mirrors compartment-user's built-in ai-agent deny-list.  It is
- * deliberately kept here rather than hoisted into compartment.h: the
- * profile loader in that header is being reworked separately, and keeping
- * the two copies apart keeps this change to compartment-root.c.  Fold them
- * into one shared table once that work lands.
- *
- * Nothing in this list is needed by a container after exec: all mounts,
- * namespace setup and privilege changes happen in the child before the
- * filter is installed.
+ * The table itself lives in compartment.h and is shared with
+ * compartment-user's built-in profiles.  Nothing in it is needed by a
+ * container after exec: all mounts, namespace setup and privilege changes
+ * happen in the child before the filter is installed.
  */
 static void apply_default_seccomp_denylist(Config *config)
 {
-    static const char *blocked[] = {
-        /* Debugging and process memory access */
-        "ptrace", "process_vm_readv", "process_vm_writev",
-        /* Mount / namespace manipulation — nested container escape */
-        "mount", "umount2", "pivot_root", "chroot", "unshare", "setns",
-        "mount_setattr", "open_tree", "move_mount",
-        "fsopen", "fsmount", "fsconfig", "fspick",
-        /* Handle-based file access — reaches outside the mount namespace */
-        "open_by_handle_at", "name_to_handle_at",
-        /* Kernel code loading and reboot */
-        "reboot", "kexec_load", "kexec_file_load",
-        "init_module", "finit_module", "delete_module",
-        /* Kernel keyring */
-        "keyctl", "add_key", "request_key",
-        /* Kernel interfaces with a long CVE history */
-        "bpf", "userfaultfd", "perf_event_open",
-        "io_uring_setup", "io_uring_enter", "io_uring_register",
-        /* Host-wide state */
-        "acct", "swapon", "swapoff",
-        "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
-        /* Cross-process FD theft */
-        "pidfd_getfd",
-#ifdef __x86_64__
-        /* Raw I/O port access */
-        "ioperm", "iopl",
-#endif
-        NULL
-    };
-
-    for (int i = 0; blocked[i]; i++) {
-        int nr = resolve_syscall(blocked[i]);
-        if (nr < 0)
-            continue;   /* syscall does not exist on this architecture */
-        /* cfg_add_blocked refuses rather than truncating; an overflow here
-         * would mean the built-in policy itself was silently cut short. */
-        if (cfg_add_blocked(config, "built-in deny-list", blocked[i], nr) != 0)
-            exit(EXIT_FAILURE);
-    }
+    if (cfg_add_builtin_denylist(config, "built-in deny-list") != 0)
+        exit(EXIT_FAILURE);
 }
 
 /* ── main ────────────────────────────────────────────────────────────── */
@@ -235,6 +207,11 @@ int main(int argc, char *argv[])
         {"env-deny",        required_argument, 0, 'E'},
         {"env-allow",       required_argument, 0, 'e'},
         {"mount-mask",      required_argument, 0, 'M'},
+        {"landlock",        no_argument,       0,  2 },
+        {"ro",              required_argument, 0,  3 },
+        {"rw",              required_argument, 0,  4 },
+        {"rwx",             required_argument, 0,  5 },
+        {"exec",            required_argument, 0,  6 },
         {"audit-log",       required_argument, 0, 'L'},
         {"loopback",        no_argument,       0, 'l'},
         {"no-seccomp",      no_argument,       0, 'S'},
@@ -406,6 +383,27 @@ int main(int argc, char *argv[])
             printf("  Capability table: %d entries\n", cap_count);
             return 0;
         }
+        case  2 : config.use_landlock = 1; break;
+        case  3 :
+            if (cfg_add_path(&config, CLI_WHERE, optarg, PATH_RO, 1) != 0)
+                return 1;
+            config.use_landlock = 1;
+            break;
+        case  4 :
+            if (cfg_add_path(&config, CLI_WHERE, optarg, PATH_RW, 1) != 0)
+                return 1;
+            config.use_landlock = 1;
+            break;
+        case  5 :
+            if (cfg_add_path(&config, CLI_WHERE, optarg, PATH_RWX, 1) != 0)
+                return 1;
+            config.use_landlock = 1;
+            break;
+        case  6 :
+            if (cfg_add_path(&config, CLI_WHERE, optarg, PATH_EXEC, 1) != 0)
+                return 1;
+            config.use_landlock = 1;
+            break;
         case  1 : printf("compartment-root %s\n", COMPARTMENT_VERSION); return 0;
         case 'h': print_help(argv[0]); return 0;
         default:  print_help(argv[0]); return 1;
@@ -463,6 +461,34 @@ int main(int argc, char *argv[])
                 "(or set 'username' in profile)\n");
         return 1;
     }
+    /* Under --dry-run this is reported but not fatal: the rootdir may not
+     * exist yet on the machine where the policy is being checked. */
+    if (check_rootdir_ownership(&config) != 0) {
+        if (!config.dry_run)
+            return 1;
+        fprintf(stderr, "  (--dry-run: reporting only, a real run would "
+                "refuse)\n");
+    }
+
+    /* Landlock is opt-in here (`landlock on`, or any --ro/--rw/--rwx/--exec
+     * on the command line).  Paths that are not reachable inside the
+     * container are a policy the operator does not have, so the additive
+     * check runs before anything else does. */
+    if (config.use_landlock) {
+        if (config.path_count == 0) {
+            fprintf(stderr, "compartment-root: 'landlock on' with no ro/rw/"
+                    "rwx/exec rules would deny all filesystem access inside "
+                    "the container — refusing to run\n");
+            return 1;
+        }
+        if (config_check_additive(&config, TOOL) != 0)
+            return 1;
+    } else if (config.path_count > 0) {
+        fprintf(stderr, "compartment-root: warning: %d path rule%s in the "
+                "policy but Landlock is off — add 'landlock on' to enforce "
+                "them\n", config.path_count,
+                config.path_count == 1 ? "" : "s");
+    }
 
     /* ── Resolve username to numeric UID/GID (host /etc/passwd) ───── */
 
@@ -500,6 +526,46 @@ int main(int argc, char *argv[])
         fprintf(stderr, "  loopback: %s\n", config.loopback ? "yes" : "no");
         if (config.netns)
             fprintf(stderr, "  netns: %s\n", config.netns);
+        fprintf(stderr, "  landlock: %s (%d path rules)\n",
+                config.use_landlock ? "yes" : "no", config.path_count);
+        if (config.use_landlock) {
+            for (int i = 0; i < config.path_count; i++)
+                fprintf(stderr, "    %s %s%s\n",
+                        config.paths[i].mode == PATH_RO   ? "ro" :
+                        config.paths[i].mode == PATH_RW   ? "rw" :
+                        config.paths[i].mode == PATH_EXEC ? "exec" : "rwx",
+                        config.paths[i].path,
+                        config.paths[i].optional ? "?" : "");
+        }
+        {
+            int nrules = config.net_bind_count + config.net_connect_count;
+            if (nrules > 0 || config.net_default_deny) {
+                int abi = landlock_abi();
+                fprintf(stderr, "  landlock net: %s (%d TCP port rule%s)\n",
+                        (abi >= 4) ? "yes" : "NOT SUPPORTED on this kernel",
+                        nrules, nrules == 1 ? "" : "s");
+                for (int i = 0; i < config.net_bind_count; i++)
+                    fprintf(stderr, "    net-bind %d\n", config.net_bind_ports[i]);
+                for (int i = 0; i < config.net_connect_count; i++)
+                    fprintf(stderr, "    net-connect %d\n",
+                            config.net_connect_ports[i]);
+                if (config.net_default_deny)
+                    fprintf(stderr, "    net-default deny\n");
+            }
+        }
+        fprintf(stderr, "  rootdir-flags: nosuid,nodev%s%s\n",
+                (config.rootdir_flags & COMPARTMENT_MS_NOEXEC) ? ",noexec" : "",
+                (config.rootdir_flags & COMPARTMENT_MS_RDONLY) ? ",ro" : "");
+        if (config.mount_flags_count > 0) {
+            fprintf(stderr, "  mount flags: %d\n", config.mount_flags_count);
+            for (int i = 0; i < config.mount_flags_count; i++)
+                fprintf(stderr, "    %s%s%s%s %s\n",
+                        (config.mount_flags[i].flags & COMPARTMENT_MS_RDONLY) ? "ro " : "",
+                        (config.mount_flags[i].flags & COMPARTMENT_MS_NOSUID) ? "nosuid " : "",
+                        (config.mount_flags[i].flags & COMPARTMENT_MS_NODEV)  ? "nodev " : "",
+                        (config.mount_flags[i].flags & COMPARTMENT_MS_NOEXEC) ? "noexec " : "",
+                        config.mount_flags[i].path);
+        }
         fprintf(stderr, "  capabilities kept: %d\n", config.cap_allowed_count);
         for (int i = 0; i < config.cap_allowed_count; i++)
             fprintf(stderr, "    %s\n", config.cap_allowed_names[i]);
@@ -513,6 +579,7 @@ int main(int argc, char *argv[])
                     config.blocked_count,
                     seccomp_builtin ? ", built-in default" : "");
         }
+        fprintf(stderr, "  seccomp-default: %s\n", seccomp_action_name(&config));
         fprintf(stderr, "  env-sanitize: %s\n",
                 config.use_env_sanitize ? "yes" : "no");
         if (config.env_allow_mode)
@@ -548,6 +615,10 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  ── built-in, always applied ──\n");
             fprintf(stderr, "  container root: recursive bind of %s, "
                     "remounted nosuid,nodev\n", config.rootdir);
+            fprintf(stderr, "  /dev/pts: private devpts instance, "
+                    "/dev/ptmx bound to it\n");
+            fprintf(stderr, "  /dev/shm: tmpfs 64m "
+                    "(nosuid,nodev,noexec,mode=1777)\n");
             fprintf(stderr, "  /proc: fresh procfs (nosuid,noexec,nodev)\n");
             fprintf(stderr, "  /sys: read-only sysfs (+ /sys/firmware "
                     "masked), or an empty tmpfs if the kernel refuses\n");
@@ -621,6 +692,22 @@ int main(int argc, char *argv[])
 
     int flags = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC |
                 CLONE_NEWNET | CLONE_NEWUSER | CLONE_NEWCGROUP | SIGCHLD;
+
+    /* --netns / `netns NAME`: join the target namespace here, in the parent,
+     * and let the child inherit it instead of getting a fresh one.
+     *
+     * The child could not do this itself.  setns(2) needs CAP_SYS_ADMIN in
+     * the user namespace that *owns* the target network namespace, and the
+     * child is in a brand-new user namespace that owns nothing — so every
+     * --netns run failed with EPERM.  The parent is real root in the initial
+     * user namespace, where that capability is real. */
+    if (config.netns) {
+        join_netns(config.netns);
+        flags &= ~CLONE_NEWNET;
+        if (config.verbose)
+            fprintf(stderr, "compartment-root: joined netns %s "
+                    "(container inherits it)\n", config.netns);
+    }
 
     const int STACK_SIZE = 1024 * 1024;
     char *child_stack = malloc(STACK_SIZE);
@@ -749,9 +836,8 @@ static int child_func(void *arg)
         exit(EXIT_FAILURE);
     }
 
-    /* 2. Join existing network namespace if specified */
-    if (config->netns)
-        join_netns(config->netns);
+    /* 2. The network namespace, when one was named, was joined by the
+     *    parent before clone() and inherited here — see main(). */
 
     /* 3. pivot_root — stronger than chroot (old root fully unmounted)
      *
@@ -816,24 +902,19 @@ static int child_func(void *arg)
      * AT_RECURSIVE also covers the submounts MS_REC dragged in.  Prefer
      * it, fall back to the plain remount on older kernels. */
     {
-        int r = -1;
-#ifdef __NR_mount_setattr
-        struct compartment_mount_attr ma;
-        memset(&ma, 0, sizeof(ma));
-        ma.attr_set = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
-        r = (int)syscall(__NR_mount_setattr, AT_FDCWD, config->rootdir,
-                         AT_RECURSIVE, &ma, sizeof(ma));
-#endif
-        if (r != 0 && mount(NULL, config->rootdir, NULL,
-                            MS_BIND | MS_REMOUNT | MS_NOSUID | MS_NODEV,
-                            NULL) != 0) {
-            perror("compartment-root: remount rootdir nosuid,nodev");
-            exit(EXIT_FAILURE);
+        /* `rootdir-flags noexec` adds to this set; nosuid and nodev are not
+         * negotiable, so the directive can only ever tighten.  `ro` is
+         * deliberately NOT applied here: /proc, /dev, /sys and the pivot
+         * point still have to be created inside this tree.  It goes on at
+         * the end of the setup instead. */
+        unsigned long f = MS_NOSUID | MS_NODEV;
+        char what[64] = "nosuid,nodev";
+        if (config->rootdir_flags & COMPARTMENT_MS_NOEXEC) {
+            f |= MS_NOEXEC;
+            strncat(what, ",noexec", sizeof(what) - strlen(what) - 1);
         }
-        if (config->verbose)
-            fprintf(stderr, "compartment-root: rootdir remounted "
-                    "nosuid,nodev (%s)\n",
-                    r == 0 ? "recursive" : "top mount only");
+        if (remount_with_flags(config, config->rootdir, f, what, 1) != 0)
+            exit(EXIT_FAILURE);
     }
 
     /* c) Enter new root */
@@ -907,7 +988,7 @@ static int child_func(void *arg)
      */
     (void)mkdir("/dev", 0755);
     if (mount("tmpfs", "/dev", "tmpfs",
-              MS_NOSUID | MS_NOEXEC, "size=64k,mode=0755") != 0) {
+              MS_NOSUID | MS_NOEXEC, "size=1m,mode=0755") != 0) {
         perror("compartment-root: mount /dev tmpfs");
         exit(EXIT_FAILURE);
     }
@@ -928,7 +1009,48 @@ static int child_func(void *arg)
         if (config->verbose)
             fprintf(stderr, "compartment-root: dev %s\n", dst);
     }
+    /* A private devpts instance, so anything needing a pty works.  Without
+     * it /dev/pts was an empty directory and posix_openpt() failed with
+     * ENOENT: script(1), su(1), sudo(8), ssh(1) and every interactive shell
+     * launcher need one.
+     *
+     * gid=5 is the host's tty group.  Under a shifted uid/gid map that gid
+     * is not mapped into the container's user namespace and the kernel
+     * refuses the option, so retry without it: the ptmxmode above is what
+     * actually makes the multiplexer usable. */
     (void)mkdir("/dev/pts", 0755);
+    if (mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC,
+              "newinstance,ptmxmode=0666,mode=0620,gid=5") != 0 &&
+        mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC,
+              "newinstance,ptmxmode=0666,mode=0620") != 0) {
+        perror("compartment-root: mount /dev/pts devpts");
+        exit(EXIT_FAILURE);
+    }
+    /* /dev/ptmx has to be the multiplexer of *this* devpts instance.  Bind
+     * the instance's own node over the placeholder rather than symlinking,
+     * so a container that chroots again still gets the right one. */
+    {
+        int pfd = open("/dev/ptmx", O_CREAT | O_WRONLY | O_CLOEXEC, 0666);
+        if (pfd >= 0)
+            close(pfd);
+        if (mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL) != 0) {
+            perror("compartment-root: bind /dev/pts/ptmx -> /dev/ptmx");
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (config->verbose)
+        fprintf(stderr, "compartment-root: devpts mounted, /dev/ptmx bound\n");
+
+    /* POSIX shared memory.  glibc's shm_open(3), sem_open(3) and anything
+     * built on them need /dev/shm to exist and be writable; a container
+     * without it fails in ways that look like an application bug. */
+    (void)mkdir("/dev/shm", 01777);
+    if (mount("tmpfs", "/dev/shm", "tmpfs",
+              MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=64m,mode=1777") != 0) {
+        perror("compartment-root: mount /dev/shm tmpfs");
+        exit(EXIT_FAILURE);
+    }
+
     if (symlink("/proc/self/fd",   "/dev/fd")     < 0) { /* best-effort */ }
     if (symlink("/proc/self/fd/0", "/dev/stdin")  < 0) { /* best-effort */ }
     if (symlink("/proc/self/fd/1", "/dev/stdout") < 0) { /* best-effort */ }
@@ -997,6 +1119,24 @@ static int child_func(void *arg)
     }
     (void)rmdir("/.pivot_old");
 
+    /* 5c. mount-ro / mount-noexec / mount-nosuid / mount-nodev.  Ordinary
+     *     bind mounts, so they are not subject to mount_too_revealing() and
+     *     can run once the old root is gone. */
+    if (apply_mount_flags(config) != 0)
+        exit(EXIT_FAILURE);
+
+    /* 5d. `rootdir-flags ro` — last, because /proc, /dev, /sys and the
+     *     pivot point all had to be created in this tree first.  Not
+     *     recursive: /proc, /dev, /sys and any tmpfs above it are separate
+     *     mounts and must stay writable. */
+    if (config->rootdir_flags & COMPARTMENT_MS_RDONLY) {
+        unsigned long f = MS_RDONLY | MS_NOSUID | MS_NODEV;
+        if (config->rootdir_flags & COMPARTMENT_MS_NOEXEC)
+            f |= MS_NOEXEC;
+        if (remount_with_flags(config, "/", f, "ro", 0) != 0)
+            exit(EXIT_FAILURE);
+    }
+
     /* 6. Set hostname inside UTS namespace */
     if (sethostname("container", 9) < 0) { /* best-effort in userns */ }
 
@@ -1028,6 +1168,29 @@ static int child_func(void *arg)
     /* 8. Set resource limits — AFTER close_range/FD cleanup below so the
      *    fallback loop can see the original RLIMIT_NOFILE, not the
      *    lowered value. Moved from here to step 19 below. */
+
+    /* 8b. Landlock — opt-in (`landlock on`).
+     *
+     * Applied here: every mount the container needs is in place, so the
+     * paths named by the policy resolve to what the target will actually
+     * see, and we still hold CAP_SYS_ADMIN in the container's user
+     * namespace, which is what lets landlock_restrict_self(2) run before
+     * no_new_privs is set.  The ruleset survives the setuid below and is
+     * inherited by everything the container execs.
+     *
+     * `exec /path/to/binary` grants LANDLOCK_ACCESS_FS_EXECUTE on that one
+     * file, so a policy that lists a few binaries and grants execute on no
+     * directory is a binary allow-list.  The dynamic loader counts as one
+     * of those binaries: execve() opens the ELF interpreter with FMODE_EXEC
+     * and Landlock checks EXECUTE on it.  Shared libraries do not — ld.so
+     * opens them read-only and Landlock has no mmap hook — so the library
+     * directories need READ_FILE and nothing more. */
+    if (config->use_landlock) {
+        if (apply_landlock(config, TOOL) != 0) {
+            fprintf(stderr, "compartment-root: Landlock failed — aborting\n");
+            exit(EXIT_FAILURE);
+        }
+    }
 
     /* 9. Drop bounding-set capabilities BEFORE privilege drop
      *    (PR_CAPBSET_DROP needs CAP_SETPCAP — only available as root) */
@@ -1115,10 +1278,10 @@ static int child_func(void *arg)
 
     /* 17. Fork the target under a minimal init.  Returns only in the
      *     child; this process stays behind as PID 1 of the pid namespace
-     *     (see container_init).  Deliberately before the seccomp filter:
-     *     PID 1 has to keep wait4/kill/rt_sigaction available even under
-     *     an allow-list policy that does not mention them. */
-    container_init();
+     *     (see container_init).  The fork is before the filter because the
+     *     reaper installs its own only when the policy provably permits
+     *     what it needs — see policy_covers_reaper(). */
+    container_init(config);
 
     /* 18. seccomp (last enforcement step before exec) */
     if (config->use_seccomp) {
@@ -1159,14 +1322,50 @@ static void init_forward(int sig)
  * the target, reap everything else, and exit with the target's status
  * (128+n if it was killed).  Returns in the child; never returns in PID 1.
  *
- * PID 1 is deliberately left outside the seccomp filter, which the target
- * installs for itself after the fork: an allow-list policy that does not
- * mention wait4/kill/rt_sigaction would otherwise break the reaper.  It is
- * still inside every namespace and carries the same dropped capabilities,
- * dropped uid and no-new-privs as the target; it execs nothing and does
- * nothing but wait.
+ * PID 1 used to be left outside the seccomp filter unconditionally: an
+ * allow-list policy that did not mention wait4/kill/rt_sigaction would
+ * break the reaper, and there was no way to name those syscalls before
+ * syscall_table[] carried them.  It now installs the same filter as the
+ * target, but only when the policy provably permits everything the loop
+ * below uses.  When it does not, PID 1 stays unfiltered and says so under
+ * --verbose: a reaper that dies on its first waitpid() is a worse failure
+ * than one syscall filter fewer on a process that execs nothing.
+ *
+ * Either way PID 1 is inside every namespace and carries the same dropped
+ * capabilities, dropped uid, Landlock ruleset and no-new-privs as the
+ * target.
  */
-static void container_init(void)
+
+/* Syscalls the reaper loop cannot do without.  rt_sigreturn is what the
+ * kernel invokes to leave the signal handler, and its absence kills the
+ * process the first time a signal is forwarded. */
+static const char *const reaper_syscalls[] = {
+    "wait4", "kill", "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
+    "exit_group", "write", NULL
+};
+
+static int policy_covers_reaper(const Config *config)
+{
+    for (int i = 0; reaper_syscalls[i]; i++) {
+        int nr = resolve_syscall(reaper_syscalls[i]);
+        if (nr < 0)
+            return 0;
+        if (config->seccomp_allow_mode) {
+            int found = 0;
+            for (int j = 0; j < config->allowed_sc_count && !found; j++)
+                found = (config->allowed_syscalls[j] == nr);
+            if (!found)
+                return 0;
+        } else {
+            for (int j = 0; j < config->blocked_count; j++)
+                if (config->blocked_syscalls[j] == nr)
+                    return 0;
+        }
+    }
+    return 1;
+}
+
+static void container_init(Config *config)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -1177,6 +1376,22 @@ static void container_init(void)
         return;                             /* target: caller execs */
 
     init_target = pid;
+
+    if (config->use_seccomp) {
+        if (policy_covers_reaper(config)) {
+            if (apply_seccomp(config) != 0) {
+                fprintf(stderr, "compartment-root: seccomp failed for the "
+                        "container init — aborting\n");
+                kill(pid, SIGKILL);
+                _exit(EXIT_FAILURE);
+            }
+        } else if (config->verbose) {
+            fprintf(stderr, "compartment-root: container init left outside "
+                    "the seccomp filter — the policy does not permit every "
+                    "syscall the reaper needs (wait4, kill, rt_sig*, "
+                    "exit_group, write)\n");
+        }
+    }
 
     static const int fwd[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT };
     struct sigaction sa;
@@ -1540,6 +1755,176 @@ static int assign_to_cgroups(Config *config, pid_t pid)
     return 0;
 }
 
+/* ── rootdir ownership ───────────────────────────────────────────────── */
+
+/*
+ * check_rootdir_ownership — refuse a container root somebody else can fill.
+ *
+ * The rootdir is the whole filesystem the container sees.  Anyone who can
+ * write it chooses which binaries exist inside, and the nosuid/nodev
+ * remount only takes the sharpest edge off that.  The rule depends on the
+ * uid map, which is why it could not be added with the map work:
+ *
+ *   identity map  — the container's uid 0 is the host's uid 0, so the
+ *                   rootdir must be root-owned;
+ *   shifted map   — the container's uid 0 is some unprivileged host uid,
+ *                   and that uid legitimately owns the tree it runs in, so
+ *                   root or that uid is accepted.
+ *
+ * Group- and world-writable is refused either way.
+ */
+static int check_rootdir_ownership(Config *config)
+{
+    struct stat st;
+    if (stat(config->rootdir, &st) != 0) {
+        fprintf(stderr, "compartment-root: rootdir %s: %s\n",
+                config->rootdir, strerror(errno));
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "compartment-root: rootdir %s is not a directory\n",
+                config->rootdir);
+        return -1;
+    }
+
+    /* Host uid the container's root maps to.  The default map is the
+     * identity map, so that is uid 0. */
+    uid_t mapped_root = 0;
+    if (config->uid_map) {
+        unsigned long long inside, outside, count;
+        if (sscanf(config->uid_map, "%llu %llu %llu",
+                   &inside, &outside, &count) == 3 && inside == 0 && count > 0)
+            mapped_root = (uid_t)outside;
+        else
+            mapped_root = 0;   /* container root is not mapped at all */
+    }
+
+    if (st.st_uid != 0 && st.st_uid != mapped_root) {
+        fprintf(stderr, "compartment-root: rootdir %s is owned by uid %u\n",
+                config->rootdir, (unsigned)st.st_uid);
+        if (mapped_root != 0)
+            fprintf(stderr, "  It must be owned by root or by uid %u, the "
+                    "host uid the container's root is mapped to.\n",
+                    (unsigned)mapped_root);
+        else
+            fprintf(stderr, "  It must be owned by root: whoever can write "
+                    "the container root chooses what runs inside it.\n");
+        return -1;
+    }
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        fprintf(stderr, "compartment-root: rootdir %s is mode %04o — group- "
+                "or world-writable container roots are not accepted\n",
+                config->rootdir, (unsigned)(st.st_mode & 07777));
+        fprintf(stderr, "  fix with: chmod go-w %s\n", config->rootdir);
+        return -1;
+    }
+    return 0;
+}
+
+/* ── Mount flag hardening (child, inside the new mount namespace) ───── */
+
+/*
+ * remount_with_flags — force MS_* flags onto an existing mount.
+ *
+ * Changing the flags of a bind mount needs a second mount(2) call with
+ * MS_REMOUNT|MS_BIND: the filesystem type, source and data arguments are
+ * ignored and the superblock is untouched, so the host's own view of the
+ * same filesystem is unaffected.  mount(2) ignores MS_REC on a remount, so
+ * that call covers the top mount only; mount_setattr(2) (Linux 5.12+) with
+ * AT_RECURSIVE also covers the submounts.  Prefer it, fall back to the
+ * plain remount on older kernels.
+ */
+static int remount_with_flags(Config *config, const char *path,
+                              unsigned long flags, const char *what,
+                              int recursive)
+{
+    int rec = -1;
+#ifdef __NR_mount_setattr
+    if (recursive) {
+        struct compartment_mount_attr ma;
+        memset(&ma, 0, sizeof(ma));
+        if (flags & MS_RDONLY) ma.attr_set |= MOUNT_ATTR_RDONLY;
+        if (flags & MS_NOSUID) ma.attr_set |= MOUNT_ATTR_NOSUID;
+        if (flags & MS_NODEV)  ma.attr_set |= MOUNT_ATTR_NODEV;
+        if (flags & MS_NOEXEC) ma.attr_set |= MOUNT_ATTR_NOEXEC;
+        rec = (int)syscall(__NR_mount_setattr, AT_FDCWD, path,
+                           AT_RECURSIVE, &ma, sizeof(ma));
+    }
+#else
+    (void)recursive;
+#endif
+    if (rec != 0 &&
+        mount(NULL, path, NULL, MS_BIND | MS_REMOUNT | flags, NULL) != 0) {
+        fprintf(stderr, "compartment-root: remount %s %s: %s\n",
+                path, what, strerror(errno));
+        return -1;
+    }
+    if (config->verbose)
+        fprintf(stderr, "compartment-root: %s remounted %s (%s)\n",
+                path, what, rec == 0 ? "recursive" : "top mount only");
+    return 0;
+}
+
+/*
+ * apply_mount_flags — the mount-ro / mount-noexec / mount-nosuid /
+ * mount-nodev directives.
+ *
+ * A path inside the new root is bind-mounted onto itself so it has a mount
+ * of its own to carry the flags, then remounted with them.  Without the
+ * self-bind there is usually nothing to remount: everything under the
+ * container root belongs to the single rootdir mount.
+ */
+static int apply_mount_flags(Config *config)
+{
+    for (int i = 0; i < config->mount_flags_count; i++) {
+        const char *path = config->mount_flags[i].path;
+        unsigned long f = 0;
+        char what[64];
+        int n = 0;
+
+        if (path[0] != '/') {
+            fprintf(stderr, "compartment-root: mount flag path must be "
+                    "absolute: %s\n", path);
+            return -1;
+        }
+        if (path_has_dotdot(path)) {
+            fprintf(stderr, "compartment-root: mount flag path contains "
+                    "'..': %s\n", path);
+            return -1;
+        }
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            fprintf(stderr, "compartment-root: mount flag %s: %s\n",
+                    path, strerror(errno));
+            return -1;
+        }
+
+        if (config->mount_flags[i].flags & COMPARTMENT_MS_RDONLY) {
+            f |= MS_RDONLY; n += snprintf(what + n, sizeof(what) - (size_t)n, "%sro", n ? "," : "");
+        }
+        if (config->mount_flags[i].flags & COMPARTMENT_MS_NOSUID) {
+            f |= MS_NOSUID; n += snprintf(what + n, sizeof(what) - (size_t)n, "%snosuid", n ? "," : "");
+        }
+        if (config->mount_flags[i].flags & COMPARTMENT_MS_NODEV) {
+            f |= MS_NODEV;  n += snprintf(what + n, sizeof(what) - (size_t)n, "%snodev", n ? "," : "");
+        }
+        if (config->mount_flags[i].flags & COMPARTMENT_MS_NOEXEC) {
+            f |= MS_NOEXEC; n += snprintf(what + n, sizeof(what) - (size_t)n, "%snoexec", n ? "," : "");
+        }
+
+        /* MS_REC so a directory that already carries submounts keeps them
+         * covered; the remount below is what actually sets the flags. */
+        if (mount(path, path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+            fprintf(stderr, "compartment-root: bind %s onto itself: %s\n",
+                    path, strerror(errno));
+            return -1;
+        }
+        if (remount_with_flags(config, path, f, what, 1) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 /* ── Network namespace join ──────────────────────────────────────────── */
 
 static void join_netns(const char *netns_name)
@@ -1630,6 +2015,19 @@ static void print_help(const char *prog_name)
     printf("  -l, --loopback                   Bring up loopback in new netns\n");
     printf("  -C, --cgroup <path>              Cgroup path (repeatable)\n");
     printf("  -M, --mount-mask <path>          Extra path to mask in /proc (repeatable)\n");
+    printf("\nFilesystem (Landlock, opt-in — 'landlock on' or any rule below):\n");
+    printf("      --landlock                   Enforce Landlock inside the container\n");
+    printf("      --ro <path>                  Read + execute (repeatable)\n");
+    printf("      --rw <path>                  Read + write, no execute (repeatable)\n");
+    printf("      --rwx <path>                 Read + write + execute (repeatable)\n");
+    printf("      --exec <path>                Read + execute; naming a FILE makes it\n");
+    printf("                                   a per-binary allow-list entry\n");
+    printf("                                   Append '?' to skip a rule when the\n");
+    printf("                                   path does not exist.\n");
+    printf("      profile only: net-bind PORT, net-connect PORT, net-default deny\n");
+    printf("                    (TCP only, Landlock ABI v4 / Linux 6.7+)\n");
+    printf("                    rootdir-flags nosuid,nodev,noexec,ro\n");
+    printf("                    mount-ro/-noexec/-nosuid/-nodev PATH\n");
     printf("\nCapabilities:\n");
     printf("  -A, --cap-allowed <cap>          Allowed capability (repeatable)\n");
     printf("                                   Accepts: CAP_NET_BIND_SERVICE or net_bind_service\n");
@@ -1657,7 +2055,8 @@ static void print_help(const char *prog_name)
     printf("  -h, --help                       This help\n");
     printf("\nHardening (always on):\n");
     printf("  pivot_root (old root unmounted), container root remounted\n");
-    printf("  nosuid+nodev, /dev with bind-mounted device nodes, read-only\n");
+    printf("  nosuid+nodev, /dev with bind-mounted device nodes, a private\n");
+    printf("  devpts on /dev/pts, a tmpfs /dev/shm, read-only\n");
     printf("  /sys, %d masked /proc paths, UTS hostname isolation,\n",
            count_strv(default_proc_masks));
     printf("  setgroups denied, PID 1 reaper + PR_SET_PDEATHSIG,\n");
