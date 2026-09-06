@@ -507,6 +507,10 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  ── built-in, always applied ──\n");
             fprintf(stderr, "  container root: recursive bind of %s, "
                     "remounted nosuid,nodev\n", config.rootdir);
+            fprintf(stderr, "  /dev/pts: private devpts instance, "
+                    "/dev/ptmx bound to it\n");
+            fprintf(stderr, "  /dev/shm: tmpfs 64m "
+                    "(nosuid,nodev,noexec,mode=1777)\n");
             fprintf(stderr, "  /proc: fresh procfs (nosuid,noexec,nodev)\n");
             fprintf(stderr, "  /sys: read-only sysfs (+ /sys/firmware "
                     "masked), or an empty tmpfs if the kernel refuses\n");
@@ -881,7 +885,7 @@ static int child_func(void *arg)
      */
     (void)mkdir("/dev", 0755);
     if (mount("tmpfs", "/dev", "tmpfs",
-              MS_NOSUID | MS_NOEXEC, "size=64k,mode=0755") != 0) {
+              MS_NOSUID | MS_NOEXEC, "size=1m,mode=0755") != 0) {
         perror("compartment-root: mount /dev tmpfs");
         exit(EXIT_FAILURE);
     }
@@ -902,7 +906,48 @@ static int child_func(void *arg)
         if (config->verbose)
             fprintf(stderr, "compartment-root: dev %s\n", dst);
     }
+    /* A private devpts instance, so anything needing a pty works.  Without
+     * it /dev/pts was an empty directory and posix_openpt() failed with
+     * ENOENT: script(1), su(1), sudo(8), ssh(1) and every interactive shell
+     * launcher need one.
+     *
+     * gid=5 is the host's tty group.  Under a shifted uid/gid map that gid
+     * is not mapped into the container's user namespace and the kernel
+     * refuses the option, so retry without it: the ptmxmode above is what
+     * actually makes the multiplexer usable. */
     (void)mkdir("/dev/pts", 0755);
+    if (mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC,
+              "newinstance,ptmxmode=0666,mode=0620,gid=5") != 0 &&
+        mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC,
+              "newinstance,ptmxmode=0666,mode=0620") != 0) {
+        perror("compartment-root: mount /dev/pts devpts");
+        exit(EXIT_FAILURE);
+    }
+    /* /dev/ptmx has to be the multiplexer of *this* devpts instance.  Bind
+     * the instance's own node over the placeholder rather than symlinking,
+     * so a container that chroots again still gets the right one. */
+    {
+        int pfd = open("/dev/ptmx", O_CREAT | O_WRONLY | O_CLOEXEC, 0666);
+        if (pfd >= 0)
+            close(pfd);
+        if (mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL) != 0) {
+            perror("compartment-root: bind /dev/pts/ptmx -> /dev/ptmx");
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (config->verbose)
+        fprintf(stderr, "compartment-root: devpts mounted, /dev/ptmx bound\n");
+
+    /* POSIX shared memory.  glibc's shm_open(3), sem_open(3) and anything
+     * built on them need /dev/shm to exist and be writable; a container
+     * without it fails in ways that look like an application bug. */
+    (void)mkdir("/dev/shm", 01777);
+    if (mount("tmpfs", "/dev/shm", "tmpfs",
+              MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=64m,mode=1777") != 0) {
+        perror("compartment-root: mount /dev/shm tmpfs");
+        exit(EXIT_FAILURE);
+    }
+
     if (symlink("/proc/self/fd",   "/dev/fd")     < 0) { /* best-effort */ }
     if (symlink("/proc/self/fd/0", "/dev/stdin")  < 0) { /* best-effort */ }
     if (symlink("/proc/self/fd/1", "/dev/stdout") < 0) { /* best-effort */ }
@@ -1631,7 +1676,8 @@ static void print_help(const char *prog_name)
     printf("  -h, --help                       This help\n");
     printf("\nHardening (always on):\n");
     printf("  pivot_root (old root unmounted), container root remounted\n");
-    printf("  nosuid+nodev, /dev with bind-mounted device nodes, read-only\n");
+    printf("  nosuid+nodev, /dev with bind-mounted device nodes, a private\n");
+    printf("  devpts on /dev/pts, a tmpfs /dev/shm, read-only\n");
     printf("  /sys, %d masked /proc paths, UTS hostname isolation,\n",
            count_strv(default_proc_masks));
     printf("  setgroups denied, PID 1 reaper + PR_SET_PDEATHSIG,\n");
