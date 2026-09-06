@@ -58,9 +58,22 @@ mkdir -p "$RESULTS_DIR"
 # in the docs and the obvious one for an operator — did not, so on a freshly
 # rsync'd, user-owned tree every sequence FATAL'd and the operator got a
 # silent hole in the run. We already require root here, so do it ourselves.
-if [ -d "$REPO_ROOT/tests/mesh/sequences" ]; then
-	if ! chown -R 0:0 "$REPO_ROOT/tests/mesh/sequences" 2>/dev/null ||
-	   ! chmod -R u=rwX,go=rX "$REPO_ROOT/tests/mesh/sequences" 2>/dev/null; then
+# The ownership is restored on exit. Leaving a root-owned directory in
+# somebody's checkout is not this harness's business — and it is not
+# cosmetic: rsync of the tree back or forward then fails with
+# "chgrp ... Operation not permitted" on every file in it.
+SEQ_DIR="$REPO_ROOT/tests/mesh/sequences"
+SEQ_OWNER=""
+restore_sequences_owner() {
+	[ -n "$SEQ_OWNER" ] || return 0
+	chown -R "$SEQ_OWNER" "$SEQ_DIR" 2>/dev/null || true
+	SEQ_OWNER=""
+}
+if [ -d "$SEQ_DIR" ]; then
+	SEQ_OWNER="$(stat -c %u:%g "$SEQ_DIR" 2>/dev/null || true)"
+	[ "$SEQ_OWNER" = "0:0" ] && SEQ_OWNER=""
+	if ! chown -R 0:0 "$SEQ_DIR" 2>/dev/null ||
+	   ! chmod -R u=rwX,go=rX "$SEQ_DIR" 2>/dev/null; then
 		echo "[mesh] FATAL: cannot make $REPO_ROOT/tests/mesh/sequences root-owned and non-group/world-writable." >&2
 		echo "[mesh]        ME-21 sources those files as root shell code and refuses anything else (HIGH-13)." >&2
 		echo "[mesh]        Fix with: chown -R 0:0 tests/mesh/sequences && chmod -R u=rwX,go=rX tests/mesh/sequences" >&2
@@ -221,6 +234,7 @@ cleanup() {
 		done
 	fi
 	rm -rf "$WORK"
+	restore_sequences_owner
 }
 trap cleanup EXIT INT TERM
 

@@ -64,7 +64,7 @@ check wrapper         21   's/^check-wrapper Total PASS=\([0-9]*\) FAIL=[0-9]*$/
 check profiles        19   's/^\[check-profiles\] \([0-9]*\)\/[0-9]* profiles parsed cleanly$/\1/p'
 check pin-regression  6    's/^pin-regression: \([0-9]*\) passed, [0-9]* failed.*/\1/p'
 check counter-smoke   4    's/^counter-smoke: \([0-9]*\)\/[0-9]* passed, [0-9]* failed$/\1/p'
-check limitations     6    's/^\[limitations\] \([0-9]*\) PASS \/ .*/\1/p'
+check limitations     7    's/^\[limitations\] \([0-9]*\) PASS \/ .*/\1/p'
 
 if [ "$rc" -ne 0 ]; then
 	echo "[totals] FAIL: at least one suite is below its tracked floor."

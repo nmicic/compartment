@@ -16,16 +16,19 @@
 #
 # Rows witnessed:
 #   L1  pre-seal writable fd, ordinary write        -> DENIED
-#       ("Pre-existing writable file descriptors": file_permission
-#        catches it, which is tighter than the row's own history)
-#   L2  pre-seal writable fd, FALLOC_FL_PUNCH_HOLE  -> ALLOWED, no audit
-#       ("VFS write-class transitive coverage": vfs_fallocate() has no
-#        security_* call; there is nothing to hook)
-#   L3  the punch actually destroys content         -> zeroed
-#   L4  mount -o remount,rw on a filesystem holding seals -> ALLOWED,
+#   L2  pre-seal writable fd, FALLOC_FL_PUNCH_HOLE, no policy -> ALLOWED
+#   L3  the same punch with the policy live         -> DENIED + audited
+#   L4  the same punch on an UNSEALED sibling       -> ALLOWED
+#       L2-L4 together are the attribution chain for the
+#       "VFS write-class transitive coverage" row, which claims
+#       fallocate is an unhooked gap. Measured on 6.8.0-139 and
+#       7.0.0-31, on tmpfs and on ext4: it is not. The row is wrong and
+#       these three witnesses are what will say so if it ever becomes
+#       right.
+#   L5  mount -o remount,rw on a filesystem holding seals -> ALLOWED,
 #       and the seal still denies afterwards
 #       ("sb_remount is deliberately not attached ... defeats nothing")
-#   L5  MAP_SHARED writable mapping established before the seal
+#   L6  MAP_SHARED writable mapping established before the seal
 #       -> writes through it still land
 #
 # Root + BPF LSM. SKIPs cleanly otherwise, like every sibling suite.
@@ -64,13 +67,27 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "${MNT}"
-mount -t tmpfs -o size=4m tmpfs "${MNT}" || skipall "cannot mount a scratch tmpfs"
+mount -t tmpfs -o size=8m tmpfs "${MNT}" || skipall "cannot mount a scratch tmpfs"
 TARGET="${MNT}/target"
+CONTROL="${MNT}/control"
 head -c 8192 /dev/urandom > "${TARGET}"
-BEFORE_SUM="$(md5sum < "${TARGET}")"
+head -c 8192 /dev/urandom > "${CONTROL}"
 
-# The descriptor that predates the policy. Everything below uses it.
+# The descriptors that predate the policy. Everything below uses them.
 exec 9<>"${TARGET}"
+exec 8<>"${CONTROL}"
+
+# ── L2 (baseline, before any policy) ───────────────────────────────
+# Without this the deny in L3 is not attributable to compartment-bpf:
+# fallocate can fail for filesystem reasons of its own.
+"${SEALPROBE}" punch-hole-via-fd 9 >/dev/null 2>&1
+rc=$?
+if [ "${rc}" -eq 0 ]; then
+    pass "L2-fallocate-baseline-allowed: FALLOC_FL_PUNCH_HOLE succeeds with no policy loaded"
+else
+    fail "L2-fallocate-baseline-allowed: rc=${rc} with no policy loaded — the filesystem under ${MNT} refuses PUNCH_HOLE, so L3 would prove nothing"
+fi
+head -c 8192 /dev/urandom > "${TARGET}"
 
 DAEMON_LOG="${TMP}/daemon.err"
 printf 'seal %s no-write\n' "${TARGET}" > "${TMP}/policy.conf"
@@ -84,7 +101,8 @@ done
 grep -q '\[run\] compartment-bpf live' "${DAEMON_LOG}" 2>/dev/null \
     || { cat "${DAEMON_LOG}" >&2; skipall "daemon did not go live"; }
 
-denies_before="$(grep -c 'DENY_' "${DAEMON_LOG}" 2>/dev/null || echo 0)"
+denies_before="$(grep -c 'DENY_' "${DAEMON_LOG}" 2>/dev/null || true)"
+denies_before="${denies_before:-0}"
 
 # ── L1 ─────────────────────────────────────────────────────────────
 "${SEALPROBE}" write-to-fd 9 >/dev/null 2>&1
@@ -92,59 +110,73 @@ rc=$?
 if [ "${rc}" -eq 1 ]; then
     pass "L1-preseal-fd-write-denied: ordinary write through a pre-seal fd is denied (file_permission)"
 else
-    fail "L1-preseal-fd-write-denied: rc=${rc} (want 1=DENY). The transitive write coverage that LIMITATIONS.md 'Pre-existing writable file descriptors' relies on has changed — update the row."
-fi
-
-# ── L2 ─────────────────────────────────────────────────────────────
-"${SEALPROBE}" punch-hole-via-fd 9 >/dev/null 2>&1
-rc=$?
-sleep 0.5
-denies_after="$(grep -c 'DENY_' "${DAEMON_LOG}" 2>/dev/null || echo 0)"
-if [ "${rc}" -eq 0 ] && [ "${denies_after}" -eq "${denies_before}" ]; then
-    pass "L2-fallocate-punch-hole-unhooked: FALLOC_FL_PUNCH_HOLE through a pre-seal fd succeeds with no audit event (vfs_fallocate has no security_* call)"
-elif [ "${rc}" -ne 0 ]; then
-    fail "L2-fallocate-punch-hole-unhooked: the punch was refused (rc=${rc}). An upstream hook on fallocate would be good news — update the LIMITATIONS.md 'VFS write-class transitive coverage' and 'Pre-existing writable file descriptors' rows."
-else
-    fail "L2-fallocate-punch-hole-unhooked: the punch succeeded but produced $((denies_after - denies_before)) audit DENY line(s); the row says there is no deny and no audit event."
+    fail "L1-preseal-fd-write-denied: rc=${rc} (want 1=DENY). The transitive write coverage LIMITATIONS.md 'Pre-existing writable file descriptors' relies on has changed — update the row."
 fi
 
 # ── L3 ─────────────────────────────────────────────────────────────
-AFTER_SUM="$(md5sum < "${TARGET}")"
-ZEROES="$(head -c 4096 "${TARGET}" | tr -d '\0' | wc -c)"
-if [ "${BEFORE_SUM}" != "${AFTER_SUM}" ] && [ "${ZEROES}" -eq 0 ]; then
-    pass "L3-punch-hole-destroys-content: the first 4 KiB of the sealed file are now zero"
+# LIMITATIONS.md's "VFS write-class transitive coverage" row says
+# vfs_fallocate() contains no security_* call, so FALLOC_FL_PUNCH_HOLE
+# through a pre-seal writable fd zeroes a no-write sealed file "with no
+# deny and no audit event". Measured on 6.8.0-139 and 7.0.0-31, on tmpfs
+# and on ext4: the punch is denied with EACCES and a DENY_WRITE audit
+# line, and it is allowed again the moment the policy goes away. The row
+# is wrong. This witness is what will notice if it ever becomes right.
+"${SEALPROBE}" punch-hole-via-fd 9 >/dev/null 2>&1
+rc=$?
+sleep 0.5
+denies_after="$(grep -c 'DENY_' "${DAEMON_LOG}" 2>/dev/null || true)"
+denies_after="${denies_after:-0}"
+if [ "${rc}" -eq 1 ] && [ "${denies_after}" -gt "${denies_before}" ]; then
+    pass "L3-fallocate-punch-hole-denied: FALLOC_FL_PUNCH_HOLE through a pre-seal fd is denied and audited"
+elif [ "${rc}" -eq 0 ]; then
+    fail "L3-fallocate-punch-hole-denied: the punch succeeded. fallocate has become an unhooked gap on this kernel — that IS the LIMITATIONS.md 'VFS write-class transitive coverage' row as written, so restore it and say which kernels it applies to."
 else
-    fail "L3-punch-hole-destroys-content: content unchanged (nonzero bytes in the punched range: ${ZEROES}) — L2 may have measured nothing"
+    fail "L3-fallocate-punch-hole-denied: rc=${rc}, audit delta $((denies_after - denies_before)) — denied without an audit event, or refused for some other reason"
 fi
 
 # ── L4 ─────────────────────────────────────────────────────────────
+"${SEALPROBE}" punch-hole-via-fd 8 >/dev/null 2>&1
+rc=$?
+if [ "${rc}" -eq 0 ]; then
+    pass "L4-fallocate-control-allowed: the same punch on an unsealed sibling still succeeds"
+else
+    fail "L4-fallocate-control-allowed: rc=${rc} on an UNSEALED file — the write path is over-denying"
+fi
+denies_after="$(grep -c 'DENY_' "${DAEMON_LOG}" 2>/dev/null || true)"
+denies_after="${denies_after:-0}"
+
+# ── L5 ─────────────────────────────────────────────────────────────
+# "sb_remount is deliberately NOT attached ... mount -o remount,rw on a
+# filesystem holding seals defeats nothing, because compartment keys on
+# (dev, ino) and its denies are LSM-layer." Both halves are asserted: the
+# remount is allowed and unaudited, and the seal still bites after it. If
+# the second ever stops being true the row's reasoning is gone.
 mount -o remount,ro "${MNT}" 2>/dev/null
 if mount -o remount,rw "${MNT}" 2>/dev/null; then
     sleep 0.3
-    denies_now="$(grep -c 'DENY_' "${DAEMON_LOG}" 2>/dev/null || echo 0)"
+    denies_now="$(grep -c 'DENY_' "${DAEMON_LOG}" 2>/dev/null || true)"
+    denies_now="${denies_now:-0}"
     if [ "${denies_now}" -eq "${denies_after}" ]; then
-        pass "L4-remount-not-attached: remount,rw on a filesystem holding seals is allowed and unaudited (sb_remount is deliberately not attached)"
+        pass "L5-remount-not-attached: remount,rw on a filesystem holding seals is allowed and unaudited (sb_remount is deliberately not attached)"
     else
-        fail "L4-remount-not-attached: remount produced an audit DENY line; sb_remount looks attached now — update LIMITATIONS.md"
+        fail "L5-remount-not-attached: remount produced an audit DENY line; sb_remount looks attached now — update LIMITATIONS.md"
     fi
 else
-    fail "L4-remount-not-attached: remount,rw was refused; either sb_remount is attached now or the scratch tmpfs is not remountable"
+    fail "L5-remount-not-attached: remount,rw was refused; either sb_remount is attached now or the scratch tmpfs is not remountable"
 fi
 
-# The seal must still be in force after the remount — that is the reason
-# the row gives for not attaching sb_remount in the first place.
 "${SEALPROBE}" open-write "${TARGET}" >/dev/null 2>&1
 rc=$?
 if [ "${rc}" -eq 1 ]; then
-    pass "L4b-seal-survives-remount: the no-write seal still denies after remount,rw"
+    pass "L5b-seal-survives-remount: the no-write seal still denies after remount,rw"
 else
-    fail "L4b-seal-survives-remount: rc=${rc} (want 1=DENY) — a remount now defeats a seal"
+    fail "L5b-seal-survives-remount: rc=${rc} (want 1=DENY) — a remount now defeats a seal"
 fi
 
-# ── L5 ─────────────────────────────────────────────────────────────
+# ── L6 ─────────────────────────────────────────────────────────────
 if ! command -v python3 >/dev/null 2>&1; then
     SKIP=$((SKIP + 1))
-    echo "SKIP limitations-L5-preattach-shared-mmap: python3 not installed"
+    echo "SKIP limitations-L6-preattach-shared-mmap: python3 not installed"
 else
     MTARGET="${MNT}/mmaptarget"
     head -c 4096 /dev/zero > "${MTARGET}"
@@ -175,7 +207,7 @@ PYEOF
     MMAP_PID=$!
     for _ in $(seq 1 100); do [ -f "${READY}" ] && break; sleep 0.05; done
     if [ ! -f "${READY}" ]; then
-        fail "L5-preattach-shared-mmap: the mapping helper never became ready"
+        fail "L6-preattach-shared-mmap: the mapping helper never became ready"
         kill "${MMAP_PID}" 2>/dev/null
     else
         # Seal the mapped file only now, with the mapping already live.
@@ -193,9 +225,9 @@ PYEOF
         wait "${MMAP_PID}" 2>/dev/null
         RESULT="$(cat "${DONE}" 2>/dev/null || echo missing)"
         if [ "${RESULT}" = "ok" ] && [ "$(head -c 4 "${MTARGET}")" = "MMAP" ]; then
-            pass "L5-preattach-shared-mmap: a MAP_SHARED writable mapping made before the seal still writes through (documented: load policy before the protected services start)"
+            pass "L6-preattach-shared-mmap: a MAP_SHARED writable mapping made before the seal still writes through (documented: load policy before the protected services start)"
         else
-            fail "L5-preattach-shared-mmap: the write through the pre-seal mapping did not land (${RESULT}) — the residual is closed; update the LIMITATIONS.md mmap row"
+            fail "L6-preattach-shared-mmap: the write through the pre-seal mapping did not land (${RESULT}) — the residual is closed; update the LIMITATIONS.md mmap row"
         fi
     fi
 fi

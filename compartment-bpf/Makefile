@@ -495,12 +495,13 @@ check-mesh: compartment-bpf test-tools mesh-stubs
 	@# ME11-perf row; this outer cap guards against pathological hangs
 	@# (e.g. daemon attach stuck, ringbuf consumer wedged) that would
 	@# otherwise leave CI hung indefinitely.
-	@# HIGH-8 (Review-3): ME-21 sequences directory must be root-owned;
-	@# run-mesh.sh FATALs on non-root-owned seq files as a security-by-
-	@# design check. Fix ownership here (check-mesh always runs as root).
-	@[ -d tests/mesh/sequences ] && \
-		chown -R 0:0 tests/mesh/sequences && \
-		chmod -R u=rwX,go=rX tests/mesh/sequences || true
+	@# HIGH-8 (Review-3): ME-21's sequences directory must be root-owned;
+	@# run-mesh.sh FATALs on non-root-owned seq files as a
+	@# security-by-design check. It now does that chown itself — and
+	@# restores the previous owner on exit, which the chown here never
+	@# did: a root-owned tests/mesh/sequences left behind in a checkout
+	@# makes every later `rsync` of the tree fail with "chgrp ...
+	@# Operation not permitted" on each file in it.
 	@timeout --preserve-status --kill-after=10s 120s bash tests/mesh/run-mesh.sh
 
 # HIGH-5: wrapper-aide regression gate. tests/actor-wrapper/run.sh
@@ -710,6 +711,19 @@ check-release: check-env
 	fi; \
 	pats=$$(mktemp); unknown=$$(mktemp); \
 	grep -vE '^[[:space:]]*(#|$$)' tests/release-skip-allowlist.txt > "$$pats"; \
+	stlog=$$(mktemp); stout=$$(mktemp); \
+	printf '%s\n' '  SKIP: 7' \
+	  'SKIP __release-gate-selftest__: deliberately not in the allowlist' > "$$stlog"; \
+	grep -ai 'skip' "$$stlog" | grep -avEi -f "$$pats" > "$$stout" || true; \
+	if [ "$$(wc -l < "$$stout")" -ne 1 ] || ! grep -q '__release-gate-selftest__' "$$stout"; then \
+	  echo "[check-release] FAIL: the gate's own skip scan is broken — it did not flag"; \
+	  echo "[check-release]       the self-test sentinel, or it flagged an allow-listed line."; \
+	  echo "[check-release]       A gate that cannot fail is not a gate; this is the same"; \
+	  echo "[check-release]       self-test discipline the core harness uses."; \
+	  sed 's/^/  /' "$$stout"; \
+	  rm -f "$$log" "$$pats" "$$unknown" "$$stlog" "$$stout"; exit 1; \
+	fi; \
+	rm -f "$$stlog" "$$stout"; \
 	grep -ai 'skip' "$$log" | grep -avEi -f "$$pats" > "$$unknown" || true; \
 	if [ -s "$$unknown" ]; then \
 	  echo "[check-release] FAIL: unrecognised SKIP line(s). Every skip must match a documented"; \
