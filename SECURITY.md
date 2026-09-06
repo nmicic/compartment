@@ -72,6 +72,20 @@ documented limitations, including:
 - The uid/gid map defaults to the identity map, so the user namespace
   provides a capability boundary but no uid isolation unless `uid-map` /
   `gid-map` are set (see HOWTO.md)
+- The limited-root deployment (HOWTO.md, "Limited root over SSH") confines a
+  *session*, not a uid. It does not create a uid boundary — the Landlock
+  allow-list is the only thing between the account and the filesystem, so
+  `ro /etc` means the account can read `/etc/shadow` — and it does not
+  constrain a root process that was never in the session. Its known-open
+  edges, all documented in that section: the mount-mask list is an
+  enumeration of privileged unix sockets and a distribution that adds one
+  adds a hole, because Landlock has no access right covering `connect(2)` to
+  a pathname unix socket and seccomp cannot filter that call's address
+  family; sshd forwarding and `internal-sftp` route around a login-shell
+  confinement and are closed by `sshd_config` plus a seal rather than by
+  enforcement; below Landlock ABI v6 the session can signal processes outside
+  its domain, which is why the seal profile must be pinned rather than run as
+  a daemon; and anything holding `CAP_BPF` owns the seals outright
 - `compartment-root --netns NAME` joins the target namespace in the parent,
   before `clone()`, and drops `CLONE_NEWNET` so the container inherits it.
   One consequence: a network namespace owned by the initial user namespace

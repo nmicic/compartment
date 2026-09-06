@@ -555,6 +555,31 @@ modules, cannot mount filesystems, and writes only to allowed paths.
 - **Recovery**: always keep at least one admin account with a real
   shell. If compartment-user has a bug, you need a way back in.
 
+### Limited root
+
+The same machinery, pointed at a **uid-0** account: `radmin` logs in over
+sshd, gets the wrapper as its login shell, and can inspect the system, read
+logs and manage the paths a profile names — but cannot load a module, kexec,
+write the raw disk, reach kernel memory, use `ptrace`/`perf`/`bpf`, leave its
+namespace, edit anything in the authentication or login path, or ask systemd,
+D-Bus or snapd to do any of it on its behalf.
+
+Two directives make that possible on top of Landlock and seccomp:
+
+| Directive | What it adds |
+|-----------|--------------|
+| `cap-drop CAP` | drops `CAP` from the bounding set, which for a root exec *is* the effective set the session inherits; one-way |
+| `mask PATH` | covers `PATH` in a private mount namespace — the only way to take away `connect(2)` to a privileged unix socket, which is not a Landlock access right |
+
+Ship `examples/limited-root.conf` and
+`compartment-bpf/profiles/limited-root-authpath.conf` together: the first
+binds the session, the second binds the inodes, and they answer different
+adversaries. Full walk-through, the sshd settings it needs, the recovery
+plan and the residual-risk list: [HOWTO.md](HOWTO.md), "Limited root over
+SSH". `tests/scripts/root.d/limited-root.sh` exercises it end to end
+through a real sshd login, with an unconfined uid-0 login as the positive
+control.
+
 ## Requirements
 
 - Linux >= 5.13 (Landlock) — compartment-user

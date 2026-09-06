@@ -90,7 +90,7 @@ want_rc_nonzero() {
 }
 
 # Declared assertion count for the whole suite (see harness_expect_total).
-LANDLOCK_RULES_TOTAL=89
+LANDLOCK_RULES_TOTAL=90
 
 if [ "${ABI}" -lt 1 ]; then
     skip_to_total "${LANDLOCK_RULES_TOTAL}" \
