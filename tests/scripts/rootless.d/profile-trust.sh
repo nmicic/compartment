@@ -162,6 +162,29 @@ run "${CU}" --dry-run --profile "${WORK}/wwdir/p.conf" -- /bin/true
 want_rc_nonzero "trust: profile in a world-writable directory refused"
 want_out "trust: message names the directory" "profile directory"
 
+# The documented private-group exemption (HOWTO): umask 002 plus a
+# user-private group leaves everything a user creates at 0664, and
+# group-write is then no wider than owner-write because the group has
+# exactly one member. Assert the exemption in both directions here; the
+# refusal half needs a group the caller is not in and therefore lives in
+# root.d/profile-trust-root.sh.
+cp "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${WORK}/gw-private.conf"
+chmod 0664 "${WORK}/gw-private.conf"
+GW_GROUP_MEMBERS="$(getent group "$(id -g)" | cut -d: -f4)"
+if [ "$(id -gn)" = "$(id -un)" ] && [ -z "${GW_GROUP_MEMBERS}" ]; then
+    run "${CU}" --dry-run --profile "${WORK}/gw-private.conf" -- /bin/true
+    want_rc "trust: 0664 in your own private group is accepted" 0
+    mkdir -p "${WORK}/gwprivdir"
+    chmod 0775 "${WORK}/gwprivdir"
+    cp "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${WORK}/gwprivdir/p.conf"
+    chmod 0644 "${WORK}/gwprivdir/p.conf"
+    run "${CU}" --dry-run --profile "${WORK}/gwprivdir/p.conf" -- /bin/true
+    want_rc "trust: 0775 directory in your own private group is accepted" 0
+else
+    skip "trust: 0664 in your own private group (gid $(id -g) is not private)"
+    skip "trust: 0775 directory in your own private group (gid $(id -g) is not private)"
+fi
+
 # A sticky world-writable directory (/tmp) is fine: the sticky bit is what
 # stops a third party replacing the file.
 STICKY="/tmp/compartment-trust-$$.conf"

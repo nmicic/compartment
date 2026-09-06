@@ -168,6 +168,135 @@ want_out "C2: refusal names the mode" "group- or world-writable"
 
 echo ""
 
+# ── Profile search precedence: /etc outranks $HOME (C1) ───────────────
+
+echo "--- Test group: profile search precedence (C1) ---"
+
+# The headline 1.4 fix. $HOME used to be searched first, so a sandboxed
+# agent could drop a file in ~/.config/compartment and un-sandbox every
+# future run of the same command line. Only compartment-user can search
+# $HOME at all, and only with --user-profiles, so the precedence case
+# needs both files present at once — which needs a root-owned
+# /etc/compartment. Nothing rootless can set that up, which is why the
+# release shipped with the ordering untested.
+if [ -z "${SUDO_USER:-}" ] || ! command -v runuser >/dev/null 2>&1; then
+    skip "precedence: /etc wins over \$HOME (needs SUDO_USER + runuser)"
+    skip "precedence: the \$HOME copy is not loaded (needs SUDO_USER + runuser)"
+    skip "precedence: the rule set comes from /etc (needs SUDO_USER + runuser)"
+    skip "precedence: the \$HOME rule set is not applied (needs SUDO_USER + runuser)"
+    skip "precedence: inherit from /etc does not reach \$HOME (needs SUDO_USER + runuser)"
+    skip "precedence: the refusal names the inherited profile (needs SUDO_USER + runuser)"
+else
+    PU="${SUDO_USER}"
+    PHOME="${WORK}/prec-home"
+    mkdir -p "${PHOME}/.config/compartment"
+
+    mkdir -p "${PHOME}/etc-marker" "${PHOME}/home-marker"
+    printf 'ro %s/etc-marker\n' "${PHOME}" > /etc/compartment/cptest-prec.conf
+    chown root:root /etc/compartment/cptest-prec.conf
+    chmod 0644 /etc/compartment/cptest-prec.conf
+
+    printf 'ro %s/home-marker\n' "${PHOME}" \
+        > "${PHOME}/.config/compartment/cptest-prec.conf"
+
+    # A profile that only exists under $HOME. A profile loaded from /etc
+    # drops PROFILE_SEARCH_USER, so `inherit` must not reach it.
+    printf 'ro %s/home-marker\n' "${PHOME}" \
+        > "${PHOME}/.config/compartment/cptest-prec-child.conf"
+    printf 'inherit cptest-prec-child\n' > /etc/compartment/cptest-prec-i.conf
+    chown root:root /etc/compartment/cptest-prec-i.conf
+    chmod 0644 /etc/compartment/cptest-prec-i.conf
+
+    chown -R "${PU}" "${PHOME}"
+    chmod -R go-w "${PHOME}"
+    chmod 0755 "${WORK}"
+
+    run runuser -u "${PU}" -- env HOME="${PHOME}" "${CU}" --verbose \
+        --user-profiles --dry-run --profile cptest-prec -- /bin/true
+    want_out "precedence: /etc wins over \$HOME" \
+             "/etc/compartment/cptest-prec.conf"
+    want_no_out "precedence: the \$HOME copy is not loaded" \
+             "${PHOME}/.config/compartment/cptest-prec.conf"
+    want_out "precedence: the rule set comes from /etc" "ro ${PHOME}/etc-marker"
+    want_no_out "precedence: the \$HOME rule set is not applied" \
+             "ro ${PHOME}/home-marker"
+
+    run runuser -u "${PU}" -- env HOME="${PHOME}" "${CU}" --verbose \
+        --user-profiles --dry-run --profile cptest-prec-i -- /bin/true
+    want_rc_nonzero "precedence: inherit from /etc does not reach \$HOME"
+    want_out "precedence: the refusal names the inherited profile" \
+             "inherited profile 'cptest-prec-child' not found"
+
+    rm -f /etc/compartment/cptest-prec.conf /etc/compartment/cptest-prec-i.conf
+fi
+
+echo ""
+
+# ── Profile file trust: the group-writable half (C1) ──────────────────
+
+echo "--- Test group: profile file trust, group-writable (C1) ---"
+
+# rootless.d/profile-trust.sh can only reach the world-writable half:
+# the caller belongs to exactly one group, its own, and the private-group
+# exemption covers that. Dropping S_IWGRP from the trust mask therefore
+# left all 420 rootless assertions green while a 0664 profile in a shared
+# group became trusted. Root can hand a user-owned file to a group the
+# user is not in, which is the shape the exemption must not cover.
+if [ -z "${SUDO_USER:-}" ] || ! command -v runuser >/dev/null 2>&1; then
+    skip "trust: 0664 in a foreign group refused (needs SUDO_USER + runuser)"
+    skip "trust: the refusal names the mode (needs SUDO_USER + runuser)"
+    skip "trust: 0775 directory in a foreign group refused (needs SUDO_USER + runuser)"
+    skip "trust: the directory refusal names the directory (needs SUDO_USER + runuser)"
+    skip "trust: a root-owned user profile is refused (needs SUDO_USER + runuser)"
+    skip "trust: control — 0644 owned by the caller is accepted (needs SUDO_USER + runuser)"
+else
+    TU="${SUDO_USER}"
+    TUID="$(id -u "${TU}")"
+    FOREIGN_GID="$(id -g daemon 2>/dev/null || echo 1)"
+    TDIR="${WORK}/trustmodes"
+    mkdir -p "${TDIR}"
+    chown "${TUID}" "${TDIR}"
+    chmod 0755 "${TDIR}" "${WORK}"
+
+    install -o "${TUID}" -g "${FOREIGN_GID}" -m 0664 \
+        "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${TDIR}/gw-shared.conf"
+    run runuser -u "${TU}" -- "${CU}" --dry-run \
+        --profile "${TDIR}/gw-shared.conf" -- /bin/true
+    want_rc_nonzero "trust: 0664 in a foreign group refused"
+    want_out "trust: the refusal names the mode" \
+             "is mode 0664 — group- or world-writable policy is not trusted"
+
+    mkdir -p "${TDIR}/gwdir"
+    chown "${TUID}:${FOREIGN_GID}" "${TDIR}/gwdir"
+    chmod 0775 "${TDIR}/gwdir"
+    install -o "${TUID}" -m 0644 \
+        "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${TDIR}/gwdir/p.conf"
+    run runuser -u "${TU}" -- "${CU}" --dry-run \
+        --profile "${TDIR}/gwdir/p.conf" -- /bin/true
+    want_rc_nonzero "trust: 0775 directory in a foreign group refused"
+    want_out "trust: the directory refusal names the directory" "profile directory"
+
+    # HOWTO: "a root-owned file never qualifies" for the exemption — and
+    # for compartment-user a root-owned profile is not owned by the caller
+    # at all, so it is refused on ownership.
+    install -o root -g root -m 0664 \
+        "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${TDIR}/root-owned.conf"
+    run runuser -u "${TU}" -- "${CU}" --dry-run \
+        --profile "${TDIR}/root-owned.conf" -- /bin/true
+    want_rc_nonzero "trust: a root-owned user profile is refused"
+
+    # Control: the same file, caller-owned and 0644, is accepted — so the
+    # three refusals above are attributable to the mode and the owner and
+    # not to anything about runuser or the fixture.
+    install -o "${TUID}" -m 0644 \
+        "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${TDIR}/ok.conf"
+    run runuser -u "${TU}" -- "${CU}" --dry-run \
+        --profile "${TDIR}/ok.conf" -- /bin/true
+    want_rc "trust: control — 0644 owned by the caller is accepted" 0
+fi
+
+echo ""
+
 # ── One-way switches under root ───────────────────────────────────────
 
 echo "--- Test group: one-way switches (compartment-root) ---"
