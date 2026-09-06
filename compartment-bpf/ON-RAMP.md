@@ -101,7 +101,7 @@ Headline tallies inside `make check`:
 |---|---|
 | `check-coverage-static` | selftest 11/11, then "every surface is witnessed or explicitly exempted" |
 | `check-mesh` | 3284 trials: 3277 PASS / 0 FAIL / 0 KNOWN-GAP / 7 SKIP |
-| `check-bypass` | 39 PASS / 0 FAIL / 0 SKIP over 39 scripts |
+| `check-bypass` | 44 PASS / 0 FAIL / 0 SKIP over 44 scripts |
 | `check-strict-launch` | PASS=17 FAIL=0 |
 | `check-observe` | PASS=21 FAIL=0 SKIP=1 (T12, AIDE not installed) |
 | `check-dir-matrix` | 40/40 PASS |

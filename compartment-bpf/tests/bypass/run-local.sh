@@ -75,9 +75,24 @@ for script in $scripts; do
 	name=${script#tests/bypass/}
 	echo "=== $name ==="
 	per=$(mktemp /tmp/bypass-local.XXXXXX)
-	# Same 60s/SIGKILL+5s cap as run-all.sh; the longest shipped witness is
-	# BX-9 (~3s). REPO is exported so lib-bypass.sh finds the daemon/sealprobe.
-	timeout --kill-after=5s 60s bash "$script" >"$per" 2>&1 || true
+	# Same 60s/SIGKILL+5s cap as run-all.sh; the longest of the original
+	# witnesses is BX-9 (~3s). REPO is exported so lib-bypass.sh finds the
+	# daemon/sealprobe.
+	#
+	# The self-protection witnesses get 180s. They are a different shape from
+	# every other witness here: each PINS a real policy, exercises it, unpins
+	# it and waits for the kernel to drain the programs, and 25-loader-upgrade
+	# does that cycle three times. A witness killed at 60s mid-cycle exits
+	# without a label — counted FAIL by the loop below, correctly — but its
+	# teardown never runs either, so it leaves a SELF-PROTECTED policy pinned
+	# whose only authorised loader image is in the $TMP the kill prevented it
+	# from cleaning up. That costs a reboot. The cap has to be larger than the
+	# work, not the other way round.
+	case "$name" in
+		2[2-6]-*) cap=180s ;;
+		*)        cap=60s ;;
+	esac
+	timeout --kill-after=5s "$cap" bash "$script" >"$per" 2>&1 || true
 	cat "$per"
 	# Exactly one label per script. run-all.sh has enforced this since
 	# A-2 (2026-05-15) with an explicit comment: a multi-subtest script

@@ -278,6 +278,43 @@ check-actor-hook: compartment.bpf.o
 	@grep -Eq '_Static_assert\(SEAL_STRICT_LAUNCH +== +\(1U *<< *5\)' compartment-abi.h || { echo "error: SEAL_STRICT_LAUNCH value-drift assert missing in compartment-abi.h"; exit 1; }
 	@grep -Eq '_Static_assert\(ACTION_DENY_STRICT_LAUNCH_MISSING +== +8' compartment-abi.h || { echo "error: ACTION_DENY_STRICT_LAUNCH_MISSING value-drift assert missing in compartment-abi.h"; exit 1; }
 	@grep -Eq '_Static_assert\(sizeof\(struct policy_state\) +== +8' compartment-abi.h || { echo "error: policy_state size assert missing in compartment-abi.h"; exit 1; }
+	@# Self-protection gates. The feature is opt-in, which makes it the
+	@# easiest thing in the tree to break silently: with --self-protect
+	@# unset every one of these symbols is dead code, so nothing in the
+	@# default test path notices when one goes missing. Each grep below is
+	@# a site that, on its own, turns the gate into a no-op that still
+	@# prints "self-protection ARMED".
+	@grep -q 'ACTION_DENY_BPF_SELF' compartment-abi.h || { echo "error: ACTION_DENY_BPF_SELF missing in compartment-abi.h"; exit 1; }
+	@grep -q 'ACTION_DENY_PIN_TAMPER' compartment-abi.h || { echo "error: ACTION_DENY_PIN_TAMPER missing in compartment-abi.h"; exit 1; }
+	@grep -Eq '_Static_assert\(ACTION_DENY_BPF_SELF +== +16' compartment-abi.h || { echo "error: ACTION_DENY_BPF_SELF value-drift assert missing in compartment-abi.h"; exit 1; }
+	@grep -Eq '_Static_assert\(ACTION_DENY_PIN_TAMPER +== +17' compartment-abi.h || { echo "error: ACTION_DENY_PIN_TAMPER value-drift assert missing in compartment-abi.h"; exit 1; }
+	@grep -Eq '_Static_assert\(sizeof\(struct self_protect_cfg\) == 16' compartment-abi.h || { echo "error: self_protect_cfg size assertion missing or drifted from 16 in compartment-abi.h"; exit 1; }
+	@grep -q 'case ACTION_DENY_BPF_SELF' compartment-bpf.c || { echo "error: action_name() lacks ACTION_DENY_BPF_SELF in compartment-bpf.c"; exit 1; }
+	@grep -q 'case ACTION_DENY_PIN_TAMPER' compartment-bpf.c || { echo "error: action_name() lacks ACTION_DENY_PIN_TAMPER in compartment-bpf.c"; exit 1; }
+	@grep -q 'SEC("lsm/bpf_map")' compartment.bpf.c || { echo "error: the lsm/bpf_map attach point is missing in compartment.bpf.c"; exit 1; }
+	@grep -q 'PIN_LINK(comp_bpf_map)' compartment-bpf.c || { echo "error: comp_bpf_map not pinned in compartment-bpf.c pin_links()"; exit 1; }
+	@grep -q '"comp_bpf_map"' compartment-bpf.c || { echo "error: comp_bpf_map missing from KNOWN_LINK_NAMES in compartment-bpf.c (a pin --unpin cannot sweep is an orphan)"; exit 1; }
+	@grep -q 'select_bpf_map_variant' compartment-bpf.c || { echo "error: bpf_map BTF autoload gate missing in compartment-bpf.c"; exit 1; }
+	@grep -q 'bpf_lsm_bpf_map' compartment-bpf.c || { echo "error: bpf_lsm_bpf_map BTF probe symbol missing in compartment-bpf.c"; exit 1; }
+	@# The gate is only as good as what it protects: loader_ids and
+	@# protected_map_ids are the root of trust and MUST be frozen before
+	@# attach, and protected_pins must be populated after pin_links().
+	@for m in protected_map_ids loader_ids protected_pins self_protect_cfg_map 	          bpf_self_denied_total pin_tamper_denied_total; do 		grep -q "$$m" compartment.bpf.c || { echo "error: self-protection map $$m missing in compartment.bpf.c"; exit 1; }; 		grep -q "$$m" compartment-bpf.c || { echo "error: self-protection map $$m unused by the loader in compartment-bpf.c"; exit 1; }; 	done
+	@grep -q 'self_protect_populate_early' compartment-bpf.c || { echo "error: self_protect_populate_early missing (the root of trust is never written)"; exit 1; }
+	@grep -q 'self_protect_record_pins' compartment-bpf.c || { echo "error: self_protect_record_pins missing (protected_pins is never populated, so every pin stays removable)"; exit 1; }
+	@grep -q 'caller_is_loader' compartment.bpf.c || { echo "error: caller_is_loader missing in compartment.bpf.c (the gate would deny the loader too)"; exit 1; }
+	@grep -q 'deny_pin_tamper' compartment.bpf.c || { echo "error: deny_pin_tamper missing in compartment.bpf.c"; exit 1; }
+	@# Both new counters must be pinned AND frozen, or --stats reads
+	@# nothing and --unpin leaves an orphan behind.
+	@# Two occurrences, not one: the same "<name>, skel->maps.<name>" shape appears
+	@# in pin_counter_maps() and in freeze_seal_maps(), and grep -q is satisfied by
+	@# either alone -- so dropping the freeze entry passed a gate whose own error
+	@# message claims to check both.
+	@for c in bpf_self_denied_total pin_tamper_denied_total; do \
+		n=$$(grep -c "\"$$c\", *skel->maps.$$c" compartment-bpf.c); \
+		[ "$$n" -ge 2 ] || { echo "error: counter $$c appears in $$n of the two tables (pin_counter_maps and freeze_seal_maps) in compartment-bpf.c; missing from either means an orphan pin or an unfrozen map"; exit 1; }; \
+		grep -q "$$c" COUNTERS.md || { echo "error: counter $$c missing from COUNTERS.md (smoke-telemetry TM-5 counts the catalogue)"; exit 1; }; \
+	done
 	@# HIGH-6 (Review-1): wrapper-loader env-list identity invariant.
 	@# Both translation units must reference the shared header so a
 	@# future drift cannot land silently.
@@ -463,6 +500,18 @@ bench-overhead: compartment-bpf
 # WITH vs WITHOUT the daemon, thread sweep. Resolves the "concurrency cliff"
 # question (RESULTS-concurrency.md) — flat overhead => no file_open serialization.
 # Env: OC_THREADS, OC_ITERS, OC_MAXPCT. Standalone (not in `make check`).
+# What --self-protect costs bpf(2). comp_bpf_map sits on
+# security_bpf_map(), which bpf_map_new_fd() calls for every map fd the
+# kernel hands out, so the cost of arming the flag has to be a number.
+# Three legs on the same box back to back: no policy, plain --pin (the
+# program is not autoloaded), --pin --self-protect. rc=77 SKIPs cleanly
+# off a root+BPF host.
+.PHONY: bench-bpf-syscall
+bench-bpf-syscall: compartment-bpf
+	@bash tests/bench/bpf-syscall-overhead.sh; rc=$$?; \
+	if [ "$$rc" -eq 77 ]; then echo "[bench-bpf-syscall] SKIP"; exit 0; \
+	elif [ "$$rc" -ne 0 ]; then echo "[bench-bpf-syscall] FAIL (rc=$$rc)"; exit $$rc; fi
+
 bench-concurrency: compartment-bpf
 	sudo OC_THREADS="$(OC_THREADS)" OC_ITERS="$(OC_ITERS)" OC_MAXPCT="$(OC_MAXPCT)" bash tests/bench/open-concurrency.sh
 

@@ -485,6 +485,9 @@ rm -f "${SENTINEL}" 2>/dev/null || true
 # comp_file_ioctl_compat is expected only when the loader's own BTF probe
 # says the kernel has security_file_ioctl_compat(), so the assertion is
 # exact on 6.8 and on 7.0 instead of a count with a tolerance.
+#
+# comp_bpf_map is expected only when the pin armed --self-protect, which this
+# daemon does not; the armed 29-link set is asserted by bypass witness 22.
 test_t46()
 {
 	local expected_file="${REPO}/tests/expected-links.txt"
@@ -503,16 +506,30 @@ test_t46()
 		compat_state="absent"
 	fi
 
+	# comp_bpf_map is pinned only when --self-protect armed the policy.
+	# This daemon is started without it, so the expected set is the 28-link
+	# default; the armed set is asserted by bypass witness 22.
+	local sp_state="off"
+	if grep -q 'self-protection ARMED' "${DAEMON_LOG}"; then
+		sp_state="armed"
+	fi
+
 	local want got
 	want="$(mktemp /tmp/v4-links-want.XXXXXX)"
 	got="$(mktemp /tmp/v4-links-got.XXXXXX)"
-	awk -v compat="${compat_state}" '
+	awk -v compat="${compat_state}" -v sp="${sp_state}" '
 		/^[[:space:]]*(#|$)/ { next }
 		{
 			name = $1
-			cond = ($2 == "conditional")
-			if (!cond) { print name; next }
-			if (compat == "present") print name
+			if ($2 == "conditional") {
+				if (compat == "present") print name
+				next
+			}
+			if ($2 == "self-protect") {
+				if (sp == "armed") print name
+				next
+			}
+			print name
 		}' "${expected_file}" | sort > "${want}"
 	ls "${PIN_ROOT}/links" 2>/dev/null | sort > "${got}"
 
@@ -530,7 +547,7 @@ test_t46()
 	n_want="$(wc -l < "${want}")"
 	n_got="$(wc -l < "${got}")"
 	if diff_out="$(diff "${want}" "${got}" 2>&1)"; then
-		record T4.6 PASS "pinned link set matches expected-links.txt (${n_got} links; file_ioctl_compat ${compat_state})"
+		record T4.6 PASS "pinned link set matches expected-links.txt (${n_got} links; file_ioctl_compat ${compat_state}; self-protect ${sp_state})"
 		rm -f "${want}" "${got}"
 		return 0
 	fi

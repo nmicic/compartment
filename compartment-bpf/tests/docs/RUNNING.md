@@ -27,7 +27,7 @@ not read `/etc/profile.d`, and `sudo` replaces `PATH` with its
 | static coverage | `make check-coverage-static` | selftest 11/11, then "every surface is witnessed or explicitly exempted" |
 | smoke | `sudo make smoke` | `smoke ok` |
 | mesh | `sudo tests/mesh/run-mesh.sh` | 3284 trials: 3277 PASS / 0 FAIL / 0 KNOWN-GAP / 7 SKIP |
-| bypass (in place) | `sudo tests/bypass/run-local.sh` | `39 PASS / 0 FAIL / 0 SKIP over 39 scripts` |
+| bypass (in place) | `sudo tests/bypass/run-local.sh` | `44 PASS / 0 FAIL / 0 SKIP over 44 scripts` |
 | bypass (host driver) | `tests/bypass/run-all.sh` | see below — it is NOT an in-guest command |
 | strict-launch | `sudo tests/strict-launch/run.sh` | `PASS=17 FAIL=0` |
 | observe | `sudo tests/observe/run.sh` | `PASS=21 FAIL=0 SKIP=1` (T12: AIDE absent) |
@@ -35,6 +35,7 @@ not read `/etc/profile.d`, and `sudo` replaces `PATH` with its
 | actor wrapper | `sudo make check-wrapper` | `Total PASS=21 FAIL=0` |
 | stability (quick) | `sudo make check-stability-quick` | `stability summary: pass=8 fail=0 skip=0` |
 | stability (full) | `sudo make check-stability` | 1024 cycles, ~45-60 min |
+| bpf(2) overhead | `sudo make bench-bpf-syscall` | three legs (no policy / `--pin` / `--pin --self-protect`); flag off within ±0.5 % of baseline, flag on +10 % to +17 % (~120-250 ns per `BPF_MAP_GET_FD_BY_ID`, guest-dependent) |
 
 ### `tests/bypass/run-all.sh` is a host-side driver
 
@@ -85,7 +86,7 @@ sequence or died with a bare "missing stub".
 in `tests/release-skip-allowlist.txt`. That file is the authoritative
 list; the categories are:
 
-* **tallies** — `SKIP: 7`, `... 0 SKIP over 39 scripts`, `Summary:
+* **tallies** — `SKIP: 7`, `... 0 SKIP over 44 scripts`, `Summary:
   PASS=.. SKIP=..`. Counts, not verdicts; the lines they summarise are
   scanned individually.
 * **optional packages** — `aide not installed`, `pg_lsclusters not

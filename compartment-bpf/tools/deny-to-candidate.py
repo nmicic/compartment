@@ -65,7 +65,22 @@ ACTION_FLAG = {
     # --unpin before the umount, or to keep the sealed paths off that
     # filesystem. REVIEW-ONLY.
     "DENY_UMOUNT": None,
+    # DENY_BPF_SELF / DENY_PIN_TAMPER (self-protection, --pin --self-protect):
+    # these are not policy denies at all. They mean the tool refused to let
+    # something that is not an authorised loader image take its own enforcement
+    # off -- an fd to a compartment BPF map, or an unlink/rename/rmdir/mount on
+    # a bpffs pin. No seal flag relaxes them and none should: the fix is to run
+    # the operation from the image that pinned the policy (or one authorised
+    # with --authorize-loader at pin time), not to widen a profile. They get
+    # their own branch in the writer, because "exec-domain / structural deny --
+    # allow only if you understand the implication" is the wrong advice here.
+    "DENY_BPF_SELF": None,
+    "DENY_PIN_TAMPER": None,
 }
+
+# Self-protection denies. Kept as a set rather than a flag on ACTION_FLAG so
+# the closed-set `known` check above stays a single membership test.
+SELF_PROTECT_ACTIONS = {"DENY_BPF_SELF", "DENY_PIN_TAMPER"}
 
 # The daemon emits three deny line shapes: basic (uniform-deny, no caller/actor),
 # +caller (actor-mismatch path), and +caller+actor. Caller and actor are OPTIONAL.
@@ -251,6 +266,19 @@ def main() -> int:
                 out.write(f"#   (dev={dev} ino={ino}; pass --profile to resolve the path). If the\n")
                 out.write(f"#   caller is legitimate, extend the EXISTING actor allowlist for that\n")
                 out.write(f"#   seal — no auto-rule suggested.\n")
+        elif action in SELF_PROTECT_ACTIONS:
+            # DENY_BPF_SELF carries dev=0 and ino=<bpf map id>: the target is a
+            # BPF object, not a filesystem inode, so never present it as a path.
+            what = ("an fd to this tool's own BPF map (id %s)" % ino
+                    if action == "DENY_BPF_SELF"
+                    else "removal or shadowing of this tool's own bpffs pin")
+            out.write(f"#   self-protection deny: the caller above asked for {safe(what)}\n")
+            out.write(f"#   while the policy was pinned with --self-protect, and is not one of\n")
+            out.write(f"#   the authorised loader images. There is NO seal flag to relax and no\n")
+            out.write(f"#   candidate rule to un-comment. Run the operation from the binary\n")
+            out.write(f"#   image that pinned the policy, or from one pre-authorised with\n")
+            out.write(f"#   --authorize-loader at pin time. If neither exists any more, the pin\n")
+            out.write(f"#   tree is cleared by a reboot (bpffs is not persistent).\n")
         elif flag and path:
             out.write(f"#   to allow this caller (review!):\n")
             out.write(f"#     actor <name> = <caller-binary-path>\n")
