@@ -358,7 +358,8 @@ int main(int argc, char *argv[])
                             MAX_PATHS, CLI_WHERE, "mount-mask", optarg, 1) != 0)
                 return 1;
             break;
-        case 'L': config.audit_log_dir = optarg; config.audit = 1; break;
+        case 'L': free((void *)config.audit_log_dir);
+                  config.audit_log_dir = xstrdup(optarg); config.audit = 1; break;
         case 'l': config.loopback = 1; break;
         case 'S': config.use_seccomp = 0; break;
         case 'N': config.use_env_sanitize = 0; break;
@@ -647,6 +648,7 @@ int main(int argc, char *argv[])
                             config.blocked_syscalls[i]);
             }
         }
+        config_free_oneshot(&config);
         return 0;
     }
 

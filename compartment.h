@@ -98,6 +98,7 @@ typedef struct {
     const char *path;
     PathMode    mode;
     int         optional;   /* trailing '?': skip silently when absent */
+    int         owned;      /* path is heap-allocated and ours to free */
 } PathRule;
 
 /* ── Mount flag rule (compartment-root) ─────────────────────────────
@@ -131,9 +132,15 @@ typedef struct {
     SeccompAction seccomp_default;   /* action for a call the filter denies */
 
     const char *env_deny[MAX_ENV_VARS];
+    /* Parallel ownership bits: an entry is heap-allocated when it came
+     * from a profile file, and a pointer into a built-in table or into
+     * argv when it did not. Without recording which is which, none of
+     * them could be freed. */
+    unsigned char env_deny_owned[MAX_ENV_VARS];
     int         env_deny_count;
 
     const char *env_allow[MAX_ENV_VARS];
+    unsigned char env_allow_owned[MAX_ENV_VARS];
     int         env_allow_count;
     int         env_allow_mode;      /* 0=deny-list, 1=allow-list */
 
@@ -738,6 +745,12 @@ static inline int cfg_add_path(Config *c, const char *where,
     }
     c->paths[c->path_count].mode     = mode;
     c->paths[c->path_count].optional = optional;
+    /* Whether this entry is ours to free. A '?' rule is always
+     * duplicated (the '?' has to be trimmed off a caller-owned string),
+     * and the `dup` argument decides for the rest — built-in tables and
+     * argv strings are not heap. Without the flag the mix could not be
+     * freed at all, which is what made detect_leaks=0 mandatory. */
+    c->paths[c->path_count].owned    = optional || dup;
     c->path_count++;
     return 0;
 }
@@ -804,6 +817,7 @@ static inline int cfg_add_env_deny(Config *c, const char *where,
 {
     if (c->env_deny_count >= MAX_ENV_VARS)
         return policy_full(where, "env-deny", name, MAX_ENV_VARS);
+    c->env_deny_owned[c->env_deny_count] = (unsigned char)(dup ? 1 : 0);
     c->env_deny[c->env_deny_count++] = dup ? xstrdup(name) : name;
     return 0;
 }
@@ -813,6 +827,7 @@ static inline int cfg_add_env_allow(Config *c, const char *where,
 {
     if (c->env_allow_count >= MAX_ENV_VARS)
         return policy_full(where, "env-allow", name, MAX_ENV_VARS);
+    c->env_allow_owned[c->env_allow_count] = (unsigned char)(dup ? 1 : 0);
     c->env_allow[c->env_allow_count++] = dup ? xstrdup(name) : name;
     c->env_allow_mode = 1;
     return 0;
@@ -1359,6 +1374,7 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
             else
                 cfg->env_allow_mode = 0;
         } else if (strcmp(directive, "workdir") == 0) {
+            free((void *)cfg->workdir);
             cfg->workdir = xstrdup(val);
         } else if (strcmp(directive, "landlock") == 0) {
             if (profile_switch(where, "landlock", "--no-landlock", val, &cfg->use_landlock) != 0) {
@@ -1382,6 +1398,7 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "audit-log") == 0) {
+            free((void *)cfg->audit_log_dir);
             cfg->audit_log_dir = xstrdup(val);
             cfg->audit = 1;
         } else if (strcmp(directive, "inherit") == 0) {
@@ -1640,6 +1657,85 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name,
     }
 
     return PROFILE_NOT_FOUND;  /* caller falls back to a built-in */
+}
+
+/* config_free_oneshot — release the single-instance strings a Config
+ * owns outright.
+ *
+ * These are the allocations that made ASAN_OPTIONS=detect_leaks=0
+ * mandatory in CI, which in turn hid every real leak. The counted arrays
+ * hold a mix of duplicated profile values and non-heap argv/built-in
+ * pointers; the `dup` argument that used to decide is now recorded per
+ * entry (PathRule.owned, env_*_owned[]) so the mix can be freed
+ * correctly. cgroups[], cap_allowed_names[], mount_masks[] and
+ * mount_flags[] are duplicated at every call site, so they are owned
+ * unconditionally.
+ *
+ * Call it on any path that returns instead of exec'ing. After an
+ * execvp() the image is replaced and nothing runs, so it is only
+ * cosmetic there — but on --dry-run, --dump-profile, --verify and every
+ * error return it is what lets LeakSanitizer say something. */
+static inline void config_free_oneshot(Config *cfg)
+{
+    if (!cfg)
+        return;
+    for (int i = 0; i < cfg->path_count; i++) {
+        if (cfg->paths[i].owned) {
+            free((void *)cfg->paths[i].path);
+            cfg->paths[i].path = NULL;
+            cfg->paths[i].owned = 0;
+        }
+    }
+    for (int i = 0; i < cfg->env_deny_count; i++) {
+        if (cfg->env_deny_owned[i]) {
+            free((void *)cfg->env_deny[i]);
+            cfg->env_deny[i] = NULL;
+            cfg->env_deny_owned[i] = 0;
+        }
+    }
+    for (int i = 0; i < cfg->env_allow_count; i++) {
+        if (cfg->env_allow_owned[i]) {
+            free((void *)cfg->env_allow[i]);
+            cfg->env_allow[i] = NULL;
+            cfg->env_allow_owned[i] = 0;
+        }
+    }
+    for (int i = 0; i < cfg->cgroups_count; i++) {
+        free((void *)cfg->cgroups[i]);
+        cfg->cgroups[i] = NULL;
+    }
+    cfg->cgroups_count = 0;
+    for (int i = 0; i < cfg->cap_allowed_count; i++) {
+        free((void *)cfg->cap_allowed_names[i]);
+        cfg->cap_allowed_names[i] = NULL;
+    }
+    cfg->cap_allowed_count = 0;
+    for (int i = 0; i < cfg->mount_mask_count; i++) {
+        free((void *)cfg->mount_masks[i]);
+        cfg->mount_masks[i] = NULL;
+    }
+    cfg->mount_mask_count = 0;
+    for (int i = 0; i < cfg->mount_flags_count; i++) {
+        free((void *)cfg->mount_flags[i].path);
+        cfg->mount_flags[i].path = NULL;
+    }
+    cfg->mount_flags_count = 0;
+    free((void *)cfg->workdir);
+    cfg->workdir = NULL;
+    free((void *)cfg->audit_log_dir);
+    cfg->audit_log_dir = NULL;
+    free((void *)cfg->profile_source);
+    cfg->profile_source = NULL;
+    free(cfg->rootdir);
+    cfg->rootdir = NULL;
+    free(cfg->username);
+    cfg->username = NULL;
+    free(cfg->netns);
+    cfg->netns = NULL;
+    free(cfg->uid_map);
+    cfg->uid_map = NULL;
+    free(cfg->gid_map);
+    cfg->gid_map = NULL;
 }
 
 /* ── PPID chain (who launched us?) ─────────────────────────────── */
