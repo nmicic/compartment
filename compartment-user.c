@@ -75,6 +75,25 @@ static int apply_profile_ai_agent(Config *cfg)
             return -1;
     }
 
+    /* Writable device nodes, one rule each.
+     *
+     * `ro /dev` above makes the directory readable but leaves /dev/null
+     * unwritable, so any command containing `2>/dev/null` failed inside the
+     * flagship profile.  The fix is per-node rules rather than a blanket
+     * `rw /dev`: from ABI 5 a writable rule also carries
+     * LANDLOCK_ACCESS_FS_IOCTL_DEV, and granting that across the whole of
+     * /dev would hand back every device ioctl — including TIOCSTI on
+     * kernels where dev.tty.legacy_tiocsti is enabled. */
+    const char *rw_dev[] = {
+        "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom",
+        "/dev/tty",  "/dev/pts",  "/dev/ptmx",
+        NULL
+    };
+    for (int i = 0; rw_dev[i]; i++) {
+        if (cfg_add_path(cfg, BUILTIN_WHERE, rw_dev[i], PATH_RW, 0) != 0)
+            return -1;
+    }
+
     /* Add HOME and workdir as RWX (agents write AND execute scripts) */
     const char *home = getenv("HOME");
     if (home) {
