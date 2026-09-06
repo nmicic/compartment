@@ -8,6 +8,8 @@ tests/probes/deny_probe
 *.d
 *.a
 *.so
+# ...but root.d is a test directory, not a dependency file
+!tests/scripts/root.d/
 
 # Generated headers (config.py output)
 config.h
