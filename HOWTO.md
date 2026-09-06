@@ -735,19 +735,21 @@ with `uid-map`/`gid-map` and `chown` `rootdir` to the mapped host uid.
 
 ### Testing compartment-root
 
-The rootless suite (`make test`) cannot exercise any of this. There is a
-separate root-only suite:
+The rootless suite (`make test-integration`) cannot exercise any of this.
+The root-only suites are run separately, as root:
 
 ```bash
-sudo ./tests/scripts/root.d/compartment-root.sh
+sudo make test-root
 ```
 
-It builds its own busybox rootdir under `mktemp -d`, runs 59 assertions
-against a real container (start-up, `/dev`, seccomp, privilege drop,
-`/proc` and `/sys` masking, namespace isolation and escape attempts, the
-init reaper, networking, uid mapping, cgroup confinement, reporting), and
-removes everything it created on exit. All 59 pass on kernel 6.8
-(Ubuntu 24.04) and kernel 7.0 (Ubuntu 26.04).
+`tests/scripts/root.d/compartment-root.sh` builds its own busybox rootdir
+under `mktemp -d` and asserts against a real container (start-up, `/dev`,
+seccomp, privilege drop, `/proc` and `/sys` masking, namespace isolation
+and escape attempts, the init reaper, networking, uid mapping, cgroup
+confinement, reporting), then removes everything it created on exit —
+including on failure. Green on kernel 6.8 (Ubuntu 24.04) and kernel 7.0
+(Ubuntu 26.04). The runner prints the assertion totals it measured; they
+move as suites are added, so read them from a run rather than from here.
 
 ---
 
