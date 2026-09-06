@@ -12,7 +12,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=tests/scripts/lib/harness.sh
+. "${SCRIPT_DIR}/lib/harness.sh"
+
+REPO_DIR="$(harness_repo_dir)"
 QUICK=0
 VERBOSE=""
 
@@ -23,11 +26,9 @@ for arg in "$@"; do
     esac
 done
 
-TOTAL_PASS=0
-TOTAL_FAIL=0
-TOTAL_SKIP=0
 SUITES_RUN=0
 SUITES_FAILED=0
+FAILED_SUITES=""
 
 run_suite() {
     local name="$1" script="$2"
@@ -44,6 +45,7 @@ run_suite() {
         echo ""
     else
         SUITES_FAILED=$((SUITES_FAILED + 1))
+        FAILED_SUITES="${FAILED_SUITES}  - ${name}"$'\n'
         echo ""
         echo "^^^ SUITE FAILED ^^^"
         echo ""
@@ -61,7 +63,10 @@ cc -Wall -Wextra -Wpedantic -std=c11 -O2 \
     -o tests/probes/deny_probe tests/probes/deny_probe.c 2>&1
 
 echo "Creating fixtures..."
-bash tests/scripts/make_fixtures.sh > /dev/null 2>&1
+# One fixture root for the whole run; exported so every suite reuses it and
+# removed by the harness EXIT trap.
+harness_fixtures
+echo "Fixture root: ${FIXTURES}"
 
 echo "Ready."
 
@@ -95,6 +100,10 @@ echo "╚═══════════════════════�
 echo ""
 echo "  Suites run:    ${SUITES_RUN}"
 echo "  Suites failed: ${SUITES_FAILED}"
+if [ -n "${FAILED_SUITES}" ]; then
+    echo ""
+    printf '%s' "${FAILED_SUITES}"
+fi
 echo ""
 
 if [ "${SUITES_FAILED}" -gt 0 ]; then
