@@ -398,7 +398,7 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 61
+harness_expect_total 63
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"
