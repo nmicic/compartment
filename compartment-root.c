@@ -16,8 +16,9 @@
  *   8. Child: PR_SET_KEEPCAPS + privilege drop (setuid/setgid)
  *   8b.Child: capset() to restore effective+permitted+inheritable caps
  *   9. Child: PR_SET_DUMPABLE(0) — prevent ptrace
- *  10. Child: Environment sanitize, seccomp BPF (fatal on failure)
- *  11. Child: Close inherited FDs, exec the target command
+ *  10. Child: Environment sanitize, close inherited FDs
+ *  11. Child: PR_SET_NO_NEW_PRIVS, PR_SET_PDEATHSIG, fork under a PID 1
+ *      reaper, seccomp BPF (fatal on failure), exec the target command
  *
  * Synchronization model:
  *   Parent creates child via clone(), then writes UID/GID maps and assigns
@@ -103,6 +104,7 @@ static int  mask_path(Config *config, const char *path);
 static void join_netns(const char *netns_name);
 static void set_rlimits(void);
 static void apply_default_seccomp_denylist(Config *config);
+static void container_init(char **cmd_args);
 static void print_help(const char *prog_name);
 
 /* ── Built-in seccomp deny-list ──────────────────────────────────────── */
@@ -940,33 +942,20 @@ static int child_func(void *arg)
     if (config->use_env_sanitize)
         sanitize_env(config);
 
-    /* 13. seccomp (must be after no_new_privs, last before exec).
-     *
-     * no-new-privs is unconditional here: it is what makes the seccomp
-     * filter installable without privilege and what stops a setuid binary
-     * inside rootdir from re-gaining privilege after the drop.  The
-     * profile grammar has a `no-new-privs off` switch for compartment-user;
-     * compartment-root refuses to honour it (see main()). */
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-        fprintf(stderr, "compartment-root: PR_SET_NO_NEW_PRIVS: %s\n",
-                strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-    if (config->use_seccomp) {
-        if (apply_seccomp(config) != 0) {
-            fprintf(stderr, "compartment-root: seccomp failed — aborting\n");
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    /* Audit: log just before exec (while audit fd is still open) */
+    /* 13. Audit: log just before exec (while the audit fd is still open —
+     *     the FD cleanup below closes it) */
     if (config->audit) {
         char detail[256];
         snprintf(detail, sizeof(detail), "command=%s", cmd_args[0]);
         audit_log(config, "CONTAINER_EXEC", detail);
     }
 
-    /* 14. Close inherited FDs */
+    /* 14. Close inherited FDs.
+     *
+     * This has to happen BEFORE the seccomp filter is installed.  It used
+     * to run after, so a policy in allow-list mode that did not list
+     * close_range/close left every inherited host fd — including the audit
+     * log — open inside the container, with no diagnostic. */
 #ifdef __NR_close_range
     /* close_range(2): Linux 5.9+, single syscall instead of a loop */
     if (syscall(__NR_close_range, 3U, ~0U, 0U) != 0)
@@ -982,13 +971,119 @@ static int child_func(void *arg)
         for (int i = 3; i < max_fd; i++) close(i);
     }
 
-    /* 15. Set resource limits (moved from step 8 — AFTER FD cleanup
-     *     so the fallback loop sees the original RLIMIT_NOFILE) */
+    /* 15. no-new-privs — unconditional.
+     *
+     * It is what makes the seccomp filter installable without privilege
+     * and what stops a setuid binary inside rootdir from re-gaining
+     * privilege after the drop.  The profile grammar has a
+     * `no-new-privs off` switch for compartment-user; compartment-root
+     * refuses to honour it (see main()).  Set before the fork below so the
+     * container's init inherits it too. */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        fprintf(stderr, "compartment-root: PR_SET_NO_NEW_PRIVS: %s\n",
+                strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    /* 16. Die with the parent.
+     *
+     * Set here, after the credential change: commit_creds() resets
+     * pdeath_signal whenever the euid/egid or capability set changes, so
+     * an earlier prctl() would have been thrown away.  Without it, killing
+     * compartment-root left the whole container running. */
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0) {
+        perror("compartment-root: PR_SET_PDEATHSIG");
+        exit(EXIT_FAILURE);
+    }
+
+    /* 17. Fork the target under a minimal init.  Returns only in the
+     *     child; this process stays behind as PID 1 of the pid namespace
+     *     (see container_init).  Deliberately before the seccomp filter:
+     *     PID 1 has to keep wait4/kill/rt_sigaction available even under
+     *     an allow-list policy that does not mention them. */
+    container_init(cmd_args);
+
+    /* 18. seccomp (last enforcement step before exec) */
+    if (config->use_seccomp) {
+        if (apply_seccomp(config) != 0) {
+            fprintf(stderr, "compartment-root: seccomp failed — aborting\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* 19. Set resource limits (AFTER FD cleanup so the fallback loop
+     *     sees the original RLIMIT_NOFILE) */
     set_rlimits();
 
     execvp(cmd_args[0], cmd_args);
     perror("compartment-root: execvp");
     exit(EXIT_FAILURE);
+}
+
+/* ── Container init (PID 1 of the new pid namespace) ────────────────── */
+
+static volatile pid_t init_target = 0;      /* the exec'd command */
+
+static void init_forward(int sig)
+{
+    if (init_target > 0)
+        kill(init_target, sig);             /* async-signal-safe */
+}
+
+/*
+ * container_init — fork the target and stay behind as PID 1.
+ *
+ * The target used to be PID 1 itself, which has two consequences nobody
+ * wants: PID 1 discards every signal for which it has no handler (Ctrl-C
+ * does not stop a plain /bin/sh), and orphaned grandchildren are reparented
+ * to it and never reaped.
+ *
+ * So PID 1 is this loop instead: forward SIGTERM/SIGINT/SIGHUP/SIGQUIT to
+ * the target, reap everything else, and exit with the target's status
+ * (128+n if it was killed).  Returns 0 in the child; never returns in PID 1.
+ */
+static void container_init(char **cmd_args)
+{
+    (void)cmd_args;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("compartment-root: fork (container init)");
+        exit(EXIT_FAILURE);
+    }
+    if (pid == 0)
+        return;                             /* target: caller execs */
+
+    init_target = pid;
+
+    static const int fwd[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = init_forward;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;    /* no SA_RESTART: waitpid() must return EINTR */
+    for (size_t i = 0; i < sizeof(fwd) / sizeof(fwd[0]); i++)
+        (void)sigaction(fwd[i], &sa, NULL);
+
+    int status = 0;
+    for (;;) {
+        int st;
+        pid_t p = waitpid(-1, &st, 0);
+        if (p == -1) {
+            if (errno == EINTR)
+                continue;                   /* signal forwarded, keep waiting */
+            break;                          /* ECHILD: nothing left */
+        }
+        if (p == pid) {                     /* the target itself */
+            status = st;
+            break;
+        }
+    }
+    while (waitpid(-1, NULL, WNOHANG) > 0)  /* reap stragglers */
+        ;
+
+    _exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status)
+                              : (WIFEXITED(status) ? WEXITSTATUS(status) : 1));
 }
 
 /* ── UID/GID map writer (called by parent) ──────────────────────────── */
