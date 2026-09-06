@@ -6,8 +6,10 @@ Two modes:
   1. Static:  Disassemble ELF binary, find syscall instructions (fast, incomplete)
   2. Dynamic: Run program under strace, collect actual syscalls (complete, slower)
 
-Output: list of syscalls, or a compartment-user profile (.conf) with a deny-list
-of dangerous syscalls the program does NOT need.
+Output: list of syscalls, or a compartment-user profile (.conf).  Generated
+profiles are self-contained: they carry their own Landlock path rules (derived
+from the paths the program actually opened) and their own syscall rules, so they
+load with `compartment-user --profile <file>` without any other file present.
 
 Usage:
   # Static analysis (needs: pip install pyelftools capstone)
@@ -15,7 +17,7 @@ Usage:
 
   # Dynamic profiling (needs: strace)
   ./syscall.py trace -- ls -la /tmp
-  ./syscall.py trace --follow-forks -- claude --model claude-opus-4-6
+  ./syscall.py trace --follow-forks -- my-agent --flag
 
   # Generate compartment-user profile (deny-list — safe default)
   ./syscall.py profile -- ls -la /tmp
@@ -24,10 +26,14 @@ Usage:
   ./syscall.py profile --seccomp-mode allow -- ls -la /tmp
 
   # Include env allow-list in profile
-  ./syscall.py profile --seccomp-mode allow --with-env -- claude
+  ./syscall.py profile --seccomp-mode allow --with-env -- my-agent
 
   # Compare: what would compartment-user block that the program needs?
   ./syscall.py check --profile ai-agent -- ls -la /tmp
+
+Always review a generated profile before using it.  Profiling only sees the
+code paths that ran; rare paths (error handling, signal handlers, TLS
+renegotiation, ...) may need syscalls or files that no trace captured.
 """
 import sys
 import os
@@ -62,63 +68,202 @@ DANGEROUS_SYSCALLS = {
     "mbind", "move_pages", "nfsservctl",
 }
 
+# ── compartment.h introspection ─────────────────────────────────────
+#
+# A generated profile has to fit the limits the C parser enforces, and
+# block/allow entries are easier to read — and portable across
+# architectures — when written as names.  compartment-user only knows the
+# names in its own syscall_table[]; anything else has to be emitted as a raw
+# number.  Both facts are read out of compartment.h so this tool tracks the
+# parser instead of hard-coding a snapshot of it.
+
+DEFAULT_LIMITS = {
+    "MAX_PATHS": 64,
+    "MAX_BLOCKED_SC": 64,
+    "MAX_ALLOWED_SC": 512,
+    "MAX_ENV_VARS": 64,
+}
+
+_HEADER_CACHE = {}
+
+
+def find_compartment_header():
+    """Locate compartment.h (repo checkout first, then installed copies)."""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here.parent / "compartment.h",
+        here / "compartment.h",
+        Path("/usr/local/include/compartment.h"),
+        Path("/usr/include/compartment.h"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def read_compartment_header():
+    if "text" not in _HEADER_CACHE:
+        path = find_compartment_header()
+        try:
+            _HEADER_CACHE["text"] = path.read_text() if path else ""
+        except OSError:
+            _HEADER_CACHE["text"] = ""
+        _HEADER_CACHE["path"] = path
+    return _HEADER_CACHE["text"]
+
+
+def compartment_limits():
+    """Read MAX_* limits from compartment.h, falling back to known defaults."""
+    text = read_compartment_header()
+    limits = dict(DEFAULT_LIMITS)
+    for key in limits:
+        m = re.search(r'^#define\s+%s\s+(\d+)' % key, text, re.M)
+        if m:
+            limits[key] = int(m.group(1))
+    return limits
+
+
+def known_syscall_names():
+    """Names compartment-user's syscall_table[] can resolve.
+
+    An empty set means compartment.h could not be read; callers then fall
+    back to numeric syscall IDs, which resolve_syscall() also accepts."""
+    text = read_compartment_header()
+    m = re.search(r'syscall_table\[\]\s*=\s*\{(.*?)\n\};', text, re.S)
+    if not m:
+        return set()
+    return set(re.findall(r'\{\s*"([a-z0-9_]+)"\s*,', m.group(1)))
+
+
 # ── strace-based dynamic profiling ──────────────────────────────────
 
+class TraceResult:
+    """Outcome of one strace run.
+
+    attempted   — every syscall name seen, regardless of result
+    counts      — attempts per syscall
+    succeeded   — successful calls per syscall (attempted-but-failed == 0)
+    opened      — {absolute path: was it written?} for calls that succeeded
+    executed    — absolute paths passed to a successful execve/execveat
+    rc          — exit status of strace (i.e. of the traced program)
+    timed_out   — True when --duration cut the run short
+    """
+
+    def __init__(self):
+        self.attempted = set()
+        self.counts = Counter()
+        self.succeeded = Counter()
+        self.opened = {}
+        self.executed = set()
+        self.rc = 0
+        self.timed_out = False
+
+
+def _run_strace(strace_cmd, duration):
+    """Run strace, return (returncode, stderr_text, timed_out)."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.strace-err',
+                                     delete=False) as ef:
+        err_file = ef.name
+    timed_out = False
+    try:
+        with open(err_file, 'w') as errf:
+            proc = subprocess.Popen(
+                strace_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=errf,
+            )
+            try:
+                proc.wait(timeout=duration)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                # SIGINT lets strace finalize the trace file.
+                proc.send_signal(signal.SIGINT)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        try:
+            with open(err_file) as f:
+                stderr_text = f.read()
+        except OSError:
+            stderr_text = ""
+        return proc.returncode, stderr_text, timed_out
+    finally:
+        try:
+            os.unlink(err_file)
+        except OSError:
+            pass
+
+
+def _abort_if_trace_failed(result, rc, stderr_text, cmd, timed_out):
+    """Abort when strace never got the program running.
+
+    Without this check a failed trace is indistinguishable from a program
+    that uses no syscalls, and every caller then reports success on an empty
+    syscall set."""
+    if result.attempted:
+        return
+    msg = stderr_text.strip().splitlines()
+    detail = msg[0] if msg else "no syscalls were recorded"
+    print("syscall.py: trace failed for %s (strace rc=%d): %s"
+          % (" ".join(cmd), rc, detail), file=sys.stderr)
+    if timed_out:
+        print("syscall.py: the run was cut short by --duration; "
+              "increase it or drop it.", file=sys.stderr)
+    sys.exit(1)
+
+
 def trace_syscalls(cmd, follow_forks=True, duration=None):
-    """Run command under strace, return set of syscall names used."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.strace', delete=False) as tf:
+    """Run command under strace -c, return a TraceResult.
+
+    Summary mode is cheap but reports only attempts and error counts, so
+    `succeeded` is derived as calls-minus-errors and no paths are collected.
+    Use trace_detailed() when the caller needs paths or per-call results."""
+    result = TraceResult()
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.strace',
+                                     delete=False) as tf:
         trace_file = tf.name
 
     try:
-        strace_cmd = [
-            "strace", "-o", trace_file,
-            "-c",       # summary mode (counts, no per-call output)
-            "-S", "calls",
-        ]
+        strace_cmd = ["strace", "-o", trace_file, "-c", "-S", "calls"]
         if follow_forks:
             strace_cmd.append("-f")
-
         strace_cmd.extend(["--"] + cmd)
 
-        proc = subprocess.Popen(
-            strace_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        rc, stderr_text, timed_out = _run_strace(strace_cmd, duration)
+        result.rc = rc
+        result.timed_out = timed_out
 
-        try:
-            proc.wait(timeout=duration)
-        except subprocess.TimeoutExpired:
-            # Send SIGINT to strace (it will finalize the trace)
-            proc.send_signal(signal.SIGINT)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-
-        # Parse strace -c output
-        syscalls = set()
-        counts = Counter()
+        # strace -c layout:
+        #   % time     seconds  usecs/call     calls    errors syscall
+        #     0.00    0.000000           0         1         1 access
+        # The errors column is omitted entirely when a syscall never failed.
         with open(trace_file, 'r') as f:
             for line in f:
-                # strace -c format: "  0.00    0.000000     0       1           read"
-                # or:               " % time     seconds  usecs/call     calls    errors  syscall"
                 line = line.strip()
                 if not line or line.startswith('%') or line.startswith('-'):
                     continue
                 parts = line.split()
-                if len(parts) >= 5:
-                    name = parts[-1]
-                    if name != 'total' and not name.startswith('-'):
-                        syscalls.add(name)
-                        try:
-                            call_count = int(parts[-3]) if len(parts) >= 6 else int(parts[-2])
-                            counts[name] = call_count
-                        except (ValueError, IndexError):
-                            counts[name] = 0
+                if len(parts) < 5:
+                    continue
+                name = parts[-1]
+                if name == 'total' or name.startswith('-'):
+                    continue
+                result.attempted.add(name)
+                try:
+                    if len(parts) >= 6:
+                        calls, errors = int(parts[-3]), int(parts[-2])
+                    else:
+                        calls, errors = int(parts[-2]), 0
+                except (ValueError, IndexError):
+                    calls, errors = 0, 0
+                result.counts[name] = calls
+                result.succeeded[name] = max(calls - errors, 0)
 
-        return syscalls, counts
+        _abort_if_trace_failed(result, rc, stderr_text, cmd, timed_out)
+        return result
 
     finally:
         try:
@@ -127,9 +272,66 @@ def trace_syscalls(cmd, follow_forks=True, duration=None):
             pass
 
 
-def trace_syscalls_detailed(cmd, follow_forks=True, duration=None):
-    """Run under strace with full output, return syscall set + details."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.strace', delete=False) as tf:
+# strace line: optional "<pid> " or "[pid  <n>] " prefix, then name(args) = ret
+_CALL_RE = re.compile(
+    r'^(?:\[pid\s+\d+\]\s+|\d+\s+)?'
+    r'(?P<name>[a-zA-Z_][A-Za-z0-9_]*)\('
+    r'(?P<args>.*)\)\s+=\s+(?P<ret>.+)$'
+)
+_UNFINISHED_RE = re.compile(
+    r'^(?:\[pid\s+\d+\]\s+|\d+\s+)?'
+    r'(?P<name>[a-zA-Z_][A-Za-z0-9_]*)\(.*<unfinished \.\.\.>\s*$'
+)
+_RESUMED_RE = re.compile(
+    r'^(?:\[pid\s+\d+\]\s+|\d+\s+)?'
+    r'<\.\.\.\s+(?P<name>[a-zA-Z_][A-Za-z0-9_]*)\s+resumed>'
+    r'(?P<args>.*)\)\s+=\s+(?P<ret>.+)$'
+)
+_FIRST_STR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+# Syscalls whose first quoted argument is a filesystem path.
+_PATH_SYSCALLS = {
+    "open", "openat", "openat2", "creat", "execve", "execveat",
+    "stat", "lstat", "newfstatat", "statx", "access", "faccessat",
+    "faccessat2", "readlink", "readlinkat", "truncate", "chdir",
+    "chmod", "chown", "unlink", "unlinkat", "mkdir", "mkdirat",
+    "rmdir", "rename", "renameat", "renameat2", "statfs", "utimensat",
+}
+_EXEC_SYSCALLS = {"execve", "execveat"}
+_WRITE_FLAGS = ("O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC")
+# Syscalls that only ever write: seeing one means the path is written to.
+_WRITE_SYSCALLS = {
+    "creat", "truncate", "chmod", "chown", "unlink", "unlinkat", "mkdir",
+    "mkdirat", "rmdir", "rename", "renameat", "renameat2", "utimensat",
+}
+
+
+def _record_call(result, name, args, ret):
+    result.attempted.add(name)
+    result.counts[name] += 1
+    ok = not ret.startswith('-1') and not ret.startswith('?')
+    if not ok:
+        return
+    result.succeeded[name] += 1
+    if name not in _PATH_SYSCALLS:
+        return
+    m = _FIRST_STR_RE.search(args)
+    if not m:
+        return
+    path = m.group(1)
+    if not path.startswith('/'):
+        return
+    wrote = name in _WRITE_SYSCALLS or any(f in args for f in _WRITE_FLAGS)
+    result.opened[path] = result.opened.get(path, False) or wrote
+    if name in _EXEC_SYSCALLS:
+        result.executed.add(path)
+
+
+def trace_detailed(cmd, follow_forks=True, duration=None):
+    """Run under strace with full output; collect results and paths."""
+    result = TraceResult()
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.strace',
+                                     delete=False) as tf:
         trace_file = tf.name
 
     try:
@@ -138,36 +340,30 @@ def trace_syscalls_detailed(cmd, follow_forks=True, duration=None):
             strace_cmd.append("-f")
         strace_cmd.extend(["--"] + cmd)
 
-        proc = subprocess.Popen(
-            strace_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        try:
-            proc.wait(timeout=duration)
-        except subprocess.TimeoutExpired:
-            proc.send_signal(signal.SIGINT)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-
-        # Parse per-line strace output
-        syscall_pattern = re.compile(r'(?:\d+ +)?(\w+)\(')
-        syscalls = set()
-        counts = Counter()
+        rc, stderr_text, timed_out = _run_strace(strace_cmd, duration)
+        result.rc = rc
+        result.timed_out = timed_out
 
         with open(trace_file, 'r') as f:
             for line in f:
-                m = syscall_pattern.match(line.strip())
+                line = line.rstrip('\n')
+                m = _RESUMED_RE.match(line)
                 if m:
-                    name = m.group(1)
-                    syscalls.add(name)
-                    counts[name] += 1
+                    _record_call(result, m.group('name'), m.group('args'),
+                                 m.group('ret').strip())
+                    continue
+                m = _UNFINISHED_RE.match(line)
+                if m:
+                    # Attempted; the matching "resumed" line carries the result.
+                    result.attempted.add(m.group('name'))
+                    continue
+                m = _CALL_RE.match(line)
+                if m:
+                    _record_call(result, m.group('name'), m.group('args'),
+                                 m.group('ret').strip())
 
-        return syscalls, counts
+        _abort_if_trace_failed(result, rc, stderr_text, cmd, timed_out)
+        return result
 
     finally:
         try:
@@ -252,123 +448,286 @@ def load_syscall_names():
         except FileNotFoundError:
             continue
 
-    # Fallback: parse from strace
-    try:
-        result = subprocess.run(
-            ['strace', '-e', 'trace=none', '--', '/bin/true'],
-            capture_output=True, text=True, timeout=5
-        )
-        # If strace works, we at least know the system has it
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
     return syscall_map
 
 
 # ── Profile generation ──────────────────────────────────────────────
 
-def generate_profile(used_syscalls, name="traced-program", mode="deny",
-                     used_env=None):
-    """Generate a compartment-user .conf profile.
+# Prefixes that get one Landlock rule each instead of one per subdirectory.
+# Longest match wins, so /var/lib beats /var.
+_SYSTEM_PREFIXES = (
+    "/usr", "/lib64", "/lib32", "/libx32", "/lib", "/bin", "/sbin",
+    "/etc", "/proc", "/sys", "/dev", "/run", "/var/lib", "/opt",
+)
 
-    mode="deny":  block dangerous syscalls NOT used (safer, won't break program)
+# Characters that survive a round trip through compartment.h's line parser.
+_SAFE_CONF_VALUE = re.compile(r'^[A-Za-z0-9_./$@:,+=-]+$')
+
+
+def sanitize_conf_text(text):
+    """Make a string safe to interpolate into a .conf comment.
+
+    Everything after a directive is taken verbatim by the C parser, so a
+    newline inside an untrusted string (a program name, say) would start a
+    new directive line — `x\\nallow 101` would inject `allow ptrace` and flip
+    the whole profile into allow-list mode."""
+    return re.sub(r'[^\w .@%+=:,/-]', '_', text)
+
+
+def _bucket_for(path, home):
+    """Map an observed path to the Landlock rule that should cover it."""
+    for prefix in sorted(_SYSTEM_PREFIXES, key=len, reverse=True):
+        if path == prefix or path.startswith(prefix + "/"):
+            return prefix
+    if home and (path == home or path.startswith(home.rstrip("/") + "/")):
+        return "$HOME"
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return "/"
+    # /home/<user>/... would otherwise hand out every user's home directory.
+    depth = 2 if parts[0] in ("home", "media", "mnt") else 1
+    return "/" + "/".join(parts[:depth])
+
+
+def derive_path_rules(result, limits):
+    """Turn observed paths into compartment-user ro/rw/rwx rules.
+
+    Returns (rules, notes): rules is a list of (mode, path); notes is a list
+    of comment lines explaining anything non-obvious."""
+    home = os.environ.get("HOME") or None
+    buckets = {}       # bucket -> {"write": bool, "exec": bool}
+    for path, wrote in sorted(result.opened.items()):
+        info = buckets.setdefault(_bucket_for(path, home),
+                                  {"write": False, "exec": False})
+        info["write"] = info["write"] or wrote
+    for path in sorted(result.executed):
+        info = buckets.setdefault(_bucket_for(path, home),
+                                  {"write": False, "exec": False})
+        info["exec"] = True
+
+    notes = []
+    rules = {}
+    rank = {"ro": 0, "rw": 1, "rwx": 2}
+    for bucket, info in sorted(buckets.items()):
+        target = bucket
+        if bucket != "$HOME":
+            # A Landlock rule on a symlink installs nothing at all: the rule
+            # is accepted and then silently matches no path.  On a merged-/usr
+            # system /bin and /lib are symlinks, so use their real paths.
+            real = os.path.realpath(bucket)
+            if real != bucket and os.path.isdir(real):
+                notes.append("# %s is a symlink to %s — a Landlock rule on a "
+                             "symlink matches nothing, so the real path is used"
+                             % (bucket, real))
+                target = real
+        if not _SAFE_CONF_VALUE.match(target):
+            notes.append("# skipped unrepresentable path: %s"
+                         % sanitize_conf_text(target))
+            continue
+        mode = "ro"
+        if info["write"]:
+            mode = "rwx" if info["exec"] else "rw"
+        prev = rules.get(target)
+        if prev is None or rank[mode] > rank[prev]:
+            rules[target] = mode
+
+    ordered = [(mode, path) for path, mode in sorted(rules.items())]
+    max_paths = limits["MAX_PATHS"]
+    if len(ordered) > max_paths:
+        notes.append("# WARNING: %d path rules observed but compartment.h "
+                     "allows %d — the rest were dropped, review this profile"
+                     % (len(ordered), max_paths))
+        ordered = ordered[:max_paths]
+    return ordered, notes
+
+
+def generate_profile(result, name="traced-program", mode="deny",
+                     used_env=None, limits=None):
+    """Generate a self-contained compartment-user .conf profile.
+
+    mode="deny":  block dangerous syscalls the program never used successfully
     mode="allow": only permit observed syscalls (stricter, may miss rare paths)
+
+    No inline comments are emitted after a directive: the C parser takes the
+    whole rest of the line as the value, so "ro /usr  # libs" would look for a
+    directory literally named "/usr  # libs".
     """
+    limits = limits or compartment_limits()
+    known = known_syscall_names()
+    used_syscalls = result.attempted
+    succeeded = {s for s in used_syscalls if result.succeeded.get(s, 0) > 0}
+    attempted_only = used_syscalls - succeeded
+
     lines = [
-        f"# Auto-generated compartment-user profile for: {name}",
-        f"# Generated by: syscall.py profile --mode {mode}",
-        f"# Syscalls observed: {len(used_syscalls)}",
+        "# Auto-generated compartment-user profile for: %s"
+        % sanitize_conf_text(name),
+        "# Generated by: syscall.py profile --seccomp-mode %s" % mode,
+        "# Syscalls attempted: %d (of which %d succeeded)"
+        % (len(used_syscalls), len(succeeded)),
+        "#",
+        "# REVIEW BEFORE USE. Profiling only observes the code paths that ran.",
         "",
     ]
 
-    if mode == "allow":
+    path_rules, path_notes = derive_path_rules(result, limits)
+    lines.append("# ── Filesystem (Landlock), derived from observed paths ──")
+    lines += path_notes
+    if path_rules:
+        for rule_mode, path in path_rules:
+            lines.append("%s %s" % (rule_mode, path))
+    else:
         lines += [
-            f"# ALLOW-LIST MODE: only these {len(used_syscalls)} syscalls permitted",
-            "# WARNING: if the program has rare code paths not exercised during",
-            "# profiling, those paths will fail with EPERM. Run with --duration",
-            "# long enough to cover all code paths, or add missing syscalls.",
+            "# WARNING: the trace observed no filesystem paths. compartment-user",
+            "# refuses to run with Landlock on and zero path rules, so a minimal",
+            "# read-only system set is used — widen it as needed.",
+            "ro /usr",
+            "ro /etc",
+        ]
+    lines.append("")
+
+    if mode == "allow":
+        max_allowed = limits["MAX_ALLOWED_SC"]
+        lines += [
+            "# ── Syscalls: ALLOW-LIST (%d observed, everything else denied) ──"
+            % len(used_syscalls),
+            "# If the program has rare code paths that profiling did not",
+            "# exercise, those paths fail with EPERM. Profile for long enough to",
+            "# cover them, or add the missing syscalls by hand.",
             "",
             "seccomp-mode allowlist",
             "",
         ]
-        # Emit as numeric IDs (compartment-user's table only has dangerous names)
+        if len(used_syscalls) > max_allowed:
+            lines.append("# WARNING: %d syscalls observed but compartment.h "
+                         "allows %d — list truncated"
+                         % (len(used_syscalls), max_allowed))
         name_map = load_syscall_names()
         reverse_map = {v: k for k, v in name_map.items()}
-        for sc in sorted(used_syscalls):
+        unnamed = []
+        for sc in sorted(used_syscalls)[:max_allowed]:
+            if sc in known:
+                # Names are portable; numbers are architecture specific.
+                lines.append("allow %s" % sc)
+                continue
             nr = reverse_map.get(sc)
             if nr is not None:
-                lines.append(f"allow {nr}  # {sc}")
+                # resolve_syscall() accepts "<nr>  # comment" for numbers.
+                lines.append("allow %d  # %s" % (nr, sc))
+                unnamed.append(sc)
             else:
-                lines.append(f"# unknown: {sc}")
+                lines.append("# unresolved syscall: %s" % sanitize_conf_text(sc))
+        if unnamed:
+            lines += [
+                "",
+                "# NOTE: compartment.h's syscall_table[] has no name for %d of"
+                % len(unnamed),
+                "# these, so they are written as raw numbers that are only valid",
+                "# on this architecture (%s):" % os.uname().machine,
+                "#   %s" % ", ".join(sorted(unnamed)),
+            ]
     else:
-        can_block = DANGEROUS_SYSCALLS - used_syscalls
-        needs_dangerous = DANGEROUS_SYSCALLS & used_syscalls
+        can_block = sorted(DANGEROUS_SYSCALLS - succeeded)
+        needed = sorted(DANGEROUS_SYSCALLS & succeeded)
+        tried_and_failed = sorted(DANGEROUS_SYSCALLS & attempted_only)
+        max_blocked = limits["MAX_BLOCKED_SC"]
         lines += [
-            f"# DENY-LIST MODE: block {len(can_block)} dangerous syscalls not used",
-            f"# Dangerous syscalls NEEDED (not blocked): {len(needs_dangerous)}",
-            "",
-            "# Inherit the ai-agent base profile",
-            "inherit ai-agent",
-            "",
+            "# ── Syscalls: DENY-LIST ──",
+            "# %d dangerous syscalls blocked; %d left open because the program"
+            % (min(len(can_block), max_blocked), len(needed)),
+            "# used them successfully.",
         ]
-        if needs_dangerous:
-            lines.append("# WARNING: program uses these dangerous syscalls (not blocked):")
-            for sc in sorted(needs_dangerous):
-                lines.append(f"#   {sc}")
-            lines.append("")
-
-        lines.append("# Dangerous syscalls the program does NOT use — safe to block:")
-        for sc in sorted(can_block):
-            lines.append(f"block {sc}")
-
-    # Environment allow-list
-    if used_env is not None:
-        lines += [
-            "",
-            f"# Environment: only keep these {len(used_env)} variables",
-            "env-mode allowlist",
-        ]
-        for var in sorted(used_env):
-            lines.append(f"env-allow {var}")
+        if needed:
+            lines.append("#")
+            lines.append("# NEEDED (not blocked — the program really uses these):")
+            for sc in needed:
+                lines.append("#   %s (%d successful calls)"
+                             % (sc, result.succeeded.get(sc, 0)))
+        if tried_and_failed:
+            lines.append("#")
+            lines.append("# Attempted but never succeeded — blocked anyway, since")
+            lines.append("# a call that already fails loses nothing by being denied:")
+            for sc in tried_and_failed:
+                lines.append("#   %s (%d attempts, 0 succeeded)"
+                             % (sc, result.counts.get(sc, 0)))
+        lines.append("")
+        if len(can_block) > max_blocked:
+            lines += [
+                "# WARNING: %d syscalls should be blocked but compartment.h's"
+                % len(can_block),
+                "# MAX_BLOCKED_SC is %d, so the list below is truncated and the"
+                % max_blocked,
+                "# remainder is NOT blocked. Raise MAX_BLOCKED_SC or trim by hand.",
+            ]
+        for sc in can_block[:max_blocked]:
+            if not known or sc in known:
+                lines.append("block %s" % sc)
+            else:
+                lines.append("# not in compartment.h syscall_table[]: %s" % sc)
 
     lines.append("")
+    lines.append("# ── Environment ──")
+    if used_env is not None:
+        lines.append("# Only these %d variables survive into the program."
+                     % len(used_env))
+        lines.append("env-mode allowlist")
+        for var in sorted(used_env):
+            lines.append("env-allow %s" % var)
+    else:
+        lines.append("# Loader-injection vectors. compartment-user's built-in")
+        lines.append("# ai-agent profile strips a longer list — see")
+        lines.append("# examples/ai-agent.conf if you want all of it.")
+        for var in ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
+                    "GLIBC_TUNABLES", "PYTHONPATH", "PYTHONHOME",
+                    "PERL5LIB", "NODE_OPTIONS", "BASH_ENV", "ENV"):
+            lines.append("env-deny %s" % var)
+
+    lines += [
+        "",
+        "# ── Features ──",
+        "landlock on",
+        "seccomp on",
+        "no-new-privs on",
+        "env-sanitize on",
+        "",
+    ]
     return "\n".join(lines)
 
 
-def discover_env_vars(cmd, duration=None):
-    """Discover environment variables a program reads via strace."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.strace', delete=False) as tf:
-        trace_file = tf.name
+# Anything that looks like a credential never becomes an env-allow line.
+SECRET_ENV_RE = re.compile(
+    r'(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDS|AUTH|COOKIE|'
+    r'SESSION|PRIVATE|SIGNATURE|LICENSE)', re.I)
 
-    try:
-        # Trace getenv-like reads: openat of /proc/self/environ or
-        # the actual env access isn't visible via strace. Instead we
-        # capture the initial environ and report what's commonly needed.
-        # For a real discovery, we'd need LD_PRELOAD or eBPF.
-        #
-        # Practical approach: trace file opens to discover config paths,
-        # and provide a sensible default allow-list.
-        env_vars = {
-            "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL",
-            "LOGNAME", "HOSTNAME", "PWD", "OLDPWD", "TMPDIR", "TMP",
-            "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
-            "XDG_CACHE_HOME",
-        }
+# Variables a typical program needs.  Deliberately generic: this list must
+# never be widened with anything that carries a credential, because an
+# env-allow line re-admits it into a sandbox whose job is to strip it.
+BASE_ENV_VARS = {
+    "PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL",
+    "LOGNAME", "HOSTNAME", "PWD", "OLDPWD", "TMPDIR", "TMP",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+}
+PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                  "http_proxy", "https_proxy", "no_proxy")
 
-        # Add proxy vars if they exist (program likely needs them)
-        for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-                    "http_proxy", "https_proxy", "no_proxy",
-                    "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
-            if os.environ.get(var):
-                env_vars.add(var)
 
-        return env_vars
+def discover_env_vars(cmd=None, environ=None):
+    """Suggest an env allow-list.
 
-    finally:
-        try:
-            os.unlink(trace_file)
-        except OSError:
-            pass
+    This is a heuristic, not a discovery: a variable read through getenv(3)
+    leaves no syscall behind, so there is nothing to trace.  It returns the
+    generic set above plus any proxy variables that are set, and reports
+    separately the names it refused to emit because they look like secrets.
+
+    Returns (allow, skipped)."""
+    environ = os.environ if environ is None else environ
+    allow = set(BASE_ENV_VARS)
+    for var in PROXY_ENV_VARS:
+        if environ.get(var):
+            allow.add(var)
+    skipped = sorted({v for v in allow if SECRET_ENV_RE.search(v)})
+    allow -= set(skipped)
+    return allow, skipped
 
 
 # ── Check mode: what would a profile block that the program needs? ─
@@ -383,7 +742,8 @@ def check_against_profile(used_syscalls, profile_name):
             "mbind", "move_pages",
         }
     else:
-        print(f"Unknown profile: {profile_name}", file=sys.stderr)
+        print("Unknown profile: %s (known: ai-agent, strict)" % profile_name,
+              file=sys.stderr)
         sys.exit(1)
 
     would_break = blocked & used_syscalls
@@ -399,7 +759,7 @@ def main():
         description="Discover syscalls and generate compartment profiles",
         epilog="Examples:\n"
                "  syscall.py trace -- ls -la /tmp\n"
-               "  syscall.py profile --follow-forks -- claude\n"
+               "  syscall.py profile --follow-forks -- ./my-agent\n"
                "  syscall.py check --profile ai-agent -- ./my-program\n"
                "  syscall.py static /usr/bin/ls\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -429,7 +789,8 @@ def main():
                         help='deny=block dangerous not used (safe), '
                              'allow=only permit observed (strict)')
     p_prof.add_argument('--with-env', action='store_true',
-                        help='Include env-allow list in profile')
+                        help='Include an env allow-list (heuristic; never '
+                             'emits anything that looks like a credential)')
     p_prof.add_argument('cmd', nargs='+', help='Command to profile')
 
     # check mode
@@ -450,11 +811,12 @@ def main():
     if args.mode == 'static':
         numbers = static_analysis(args.binary)
         name_map = load_syscall_names()
-        names = sorted(name_map.get(n, f"syscall_{n}") for n in numbers)
-        print(f"Static analysis of {args.binary}: {len(numbers)} syscall(s) found\n")
+        names = sorted(name_map.get(n, "syscall_%d" % n) for n in numbers)
+        print("Static analysis of %s: %d syscall(s) found\n"
+              % (args.binary, len(numbers)))
         for name in names:
             danger = " [DANGEROUS]" if name in DANGEROUS_SYSCALLS else ""
-            print(f"  {name}{danger}")
+            print("  %s%s" % (name, danger))
         if not numbers:
             print("  (none found — program may use libc wrappers)")
             print("  Try: syscall.py trace -- " + args.binary)
@@ -472,60 +834,79 @@ def main():
 
     if args.mode == 'trace':
         if args.detailed:
-            syscalls, counts = trace_syscalls_detailed(
-                args.cmd, follow_forks=follow, duration=args.duration)
+            result = trace_detailed(args.cmd, follow_forks=follow,
+                                    duration=args.duration)
         else:
-            syscalls, counts = trace_syscalls(
-                args.cmd, follow_forks=follow, duration=args.duration)
+            result = trace_syscalls(args.cmd, follow_forks=follow,
+                                    duration=args.duration)
 
-        print(f"\nSyscalls used ({len(syscalls)} unique):\n")
-        for name in sorted(syscalls):
-            c = counts.get(name, 0)
+        print("\nSyscalls used (%d unique):\n" % len(result.attempted))
+        for name in sorted(result.attempted):
+            c = result.counts.get(name, 0)
+            ok = result.succeeded.get(name, 0)
             danger = " [DANGEROUS]" if name in DANGEROUS_SYSCALLS else ""
-            print(f"  {name:30s} {c:>8d} calls{danger}")
+            print("  %-30s %8d calls (%d ok)%s" % (name, c, ok, danger))
 
-        dangerous_used = syscalls & DANGEROUS_SYSCALLS
+        dangerous_used = result.attempted & DANGEROUS_SYSCALLS
         if dangerous_used:
-            print(f"\nWARNING: {len(dangerous_used)} dangerous syscall(s) used:")
+            print("\nWARNING: %d dangerous syscall(s) used:" % len(dangerous_used))
             for sc in sorted(dangerous_used):
-                print(f"  {sc}")
+                print("  %s (%d ok of %d attempts)"
+                      % (sc, result.succeeded.get(sc, 0),
+                         result.counts.get(sc, 0)))
+        if result.rc != 0 and not result.timed_out:
+            print("\nNOTE: the traced program exited with status %d — the trace"
+                  % result.rc, file=sys.stderr)
+            print("      may not cover its normal code paths.", file=sys.stderr)
 
     elif args.mode == 'profile':
-        syscalls, counts = trace_syscalls(
-            args.cmd, follow_forks=follow, duration=args.duration)
+        result = trace_detailed(args.cmd, follow_forks=follow,
+                                duration=args.duration)
+        if result.rc != 0 and not result.timed_out:
+            print("syscall.py: WARNING: the traced program exited with status "
+                  "%d;" % result.rc, file=sys.stderr)
+            print("            the generated profile may be incomplete.",
+                  file=sys.stderr)
         name = os.path.basename(args.cmd[0])
-        used_env = discover_env_vars(args.cmd) if args.with_env else None
-        profile = generate_profile(syscalls, name=name,
-                                   mode=args.seccomp_mode,
+        used_env = None
+        if args.with_env:
+            used_env, skipped = discover_env_vars(args.cmd)
+            if skipped:
+                print("syscall.py: not adding env-allow for credential-looking "
+                      "variables: %s" % ", ".join(skipped), file=sys.stderr)
+        profile = generate_profile(result, name=name, mode=args.seccomp_mode,
                                    used_env=used_env)
 
         if args.output:
             with open(args.output, 'w') as f:
                 f.write(profile)
-            print(f"Profile written to: {args.output}", file=sys.stderr)
+            print("Profile written to: %s" % args.output, file=sys.stderr)
         else:
             print(profile)
 
     elif args.mode == 'check':
-        print(f"Running under strace (profile: {args.profile})...",
+        print("Running under strace (profile: %s)..." % args.profile,
               file=sys.stderr)
-        syscalls, counts = trace_syscalls(
-            args.cmd, follow_forks=follow, duration=args.duration)
+        result = trace_syscalls(args.cmd, follow_forks=follow,
+                                duration=args.duration)
 
         would_break, safely_blocked = check_against_profile(
-            syscalls, args.profile)
+            result.attempted, args.profile)
 
-        print(f"\n=== Profile check: {args.profile} ===")
-        print(f"Syscalls observed: {len(syscalls)}")
-        print(f"Dangerous blocked safely: {len(safely_blocked)}")
+        print("\n=== Profile check: %s ===" % args.profile)
+        print("Syscalls observed: %d" % len(result.attempted))
+        print("Dangerous blocked safely: %d" % len(safely_blocked))
+        if result.rc != 0 and not result.timed_out:
+            print("NOTE: the traced program exited with status %d." % result.rc)
 
         if would_break:
-            print(f"\nBROKEN: {len(would_break)} syscall(s) would be blocked "
-                  f"that the program uses:")
+            print("\nBROKEN: %d syscall(s) would be blocked that the program "
+                  "uses:" % len(would_break))
             for sc in sorted(would_break):
-                c = counts.get(sc, 0)
-                print(f"  {sc:30s} ({c} calls)")
-            print(f"\nThe '{args.profile}' profile would BREAK this program.")
+                print("  %-30s (%d calls, %d ok)"
+                      % (sc, result.counts.get(sc, 0),
+                         result.succeeded.get(sc, 0)))
+            print("\nThe '%s' profile would BREAK this program." % args.profile)
             print("Options:")
             print("  1. Generate a custom profile: syscall.py profile -- " +
                   " ".join(args.cmd))
@@ -533,7 +914,8 @@ def main():
                   " ".join(args.cmd))
             sys.exit(1)
         else:
-            print(f"\nOK: The '{args.profile}' profile is safe for this program.")
+            print("\nOK: The '%s' profile is safe for this program."
+                  % args.profile)
             print("No dangerous syscalls used that would be blocked.")
 
 
