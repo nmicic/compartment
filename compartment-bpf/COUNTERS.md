@@ -28,7 +28,7 @@ this catalogue stay in parity (drift fails CI).
   add it to the `--stats` table, and add a row here — `telemetry-smoke.sh` enforces
   all three.
 
-## Catalogue (12 counters)
+## Catalogue (13 counters)
 
 All are `BPF_MAP_TYPE_PERCPU_ARRAY` (1 × u64), pinned at
 `/sys/fs/bpf/compartment/maps/<name>`, surfaced by `--stats`.
@@ -41,6 +41,7 @@ All are `BPF_MAP_TYPE_PERCPU_ARRAY` (1 × u64), pinned at
 | `strict_launch_missing_total` | (strict_launch_marker, exec, deny) | A strict actor was launched without the required launch marker → deny. |
 | `strict_launch_allowed_total` | (strict_launch_marker, exec, allow) | A strict actor launch was permitted (valid marker present). |
 | `marker_set_total` | (strict_launch_marker, set, commit) | A strict-launch marker was set for a task. |
+| `marker_set_fail_total` | (strict_launch_marker, set, fail) | `bprm_committed_creds` could not allocate the task-storage marker for a committed sealed-launcher exec. Fail-closed — the actor is denied at its first protected op with `DENY_STRICT_LAUNCH_MISSING` — but this counter is what tells an operator the root cause was allocation pressure rather than an attack on the launcher chain. Expected to stay 0. |
 | `marker_clear_foreign_exec_total` | (strict_launch_marker, exec, clear) | Marker cleared because a foreign (non-actor) binary exec'd over the task. |
 | `marker_copy_fork_total` | (strict_launch_marker, fork, copy) | Marker copied to a child across fork. |
 | `marker_stale_generation_total` | (strict_launch_marker, verify, deny) | Marker rejected because its policy generation was stale (policy reloaded). |
@@ -55,7 +56,7 @@ catalogue's mapping into the generic telemetry model, not a wire format.)
 ## Test coverage matrix (which test asserts each counter's accuracy)
 
 Every counter has an **exact-`==` delta** accuracy assertion. The 3 inode counters
-live in `counter-smoke.sh`; the 9 exec-domain counters in `strict-launch/run.sh`
+live in `counter-smoke.sh`; the 10 exec-domain counters in `strict-launch/run.sh`
 (per-witness `name=val` exact deltas). All three suites are gated by `make check`
 (`smoke-counters`, `check-strict-launch`, `smoke-telemetry`).
 
@@ -67,13 +68,14 @@ live in `counter-smoke.sh`; the 9 exec-domain counters in `strict-launch/run.sh`
 | `strict_launch_missing_total` | strict-launch SL-2/3/6/7b (miss `+1` per direct/foreign attempt) |
 | `strict_launch_allowed_total` | strict-launch SL-1/4 (allow `+2` per sanctioned launch) |
 | `marker_set_total` | strict-launch SL-1/3/4/5 (`=1`) |
+| `marker_set_fail_total` | strict-launch SL-11 (`=0`, **negative-only**: the marker allocation is a blocking `lsm.s/` task-storage alloc, so it must never fail on a healthy host; SL-11 asserts it never spuriously fires across the whole suite) |
 | `marker_clear_foreign_exec_total` | strict-launch SL-3/5 (`=1`) |
 | `marker_copy_fork_total` | strict-launch SL-4 (`=1`) |
 | `marker_stale_generation_total` | strict-launch SL-9 (`=0`, **negative-only**: v0.4 is fresh-load-only — the loader never bumps `policy_state.generation` in place, so the positive/stale path is unreachable by design; SL-9 asserts it never spuriously fires) |
 | `prctl_set_mm_exe_file_denied_total` | strict-launch SL-7a (PR_SET_MM_EXE_FILE `=1`), SL-7c (PR_SET_MM_MAP `=1`) |
 | `ptrace_access_denied_total` | strict-launch SL-8 (`+1`; falls back to KNOWN-GAP only if the kernel surfaces no ptrace event — on 7.0 it fires) |
 | `ptrace_traceme_denied_total` | strict-launch SL-8c (LSM-direct `+1`) |
-| *(all 12)* | telemetry-smoke TM-1 parity / TM-2 PERCPU type / TM-3 at-rest stability / TM-4 non-perturbing minimal-overhead polling / TM-5 catalogue coverage |
+| *(all 13)* | telemetry-smoke TM-1 parity / TM-2 PERCPU type / TM-3 at-rest stability / TM-4 non-perturbing minimal-overhead polling / TM-5 catalogue coverage |
 
 VM-verified 2026-06-06: counter-smoke 4/4, strict-launch 15/15, telemetry-smoke 7/7.
 

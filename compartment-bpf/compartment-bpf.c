@@ -2964,8 +2964,8 @@ static int pin_links(struct compartment_bpf *skel)
 	// KNOWN_LINK_NAMES is declared later in the file; if the PIN_LINK
 	// invocation count below grows, bump the literal here in lockstep.
 	char pinned[32][PATH_MAX];
-	_Static_assert(sizeof(pinned) / PATH_MAX >= 26,
-		       "pinned[] must hold all PIN_LINK invocations (currently 26: 16 v0.3 + 5 v0.4 + 5 v0.8)");
+	_Static_assert(sizeof(pinned) / PATH_MAX >= 27,
+		       "pinned[] must hold all PIN_LINK invocations (currently 27: 16 v0.3 + 5 v0.4 + 6 v0.8)");
 	int pinned_count = 0;
 
 	if (ensure_bpffs("/sys/fs/bpf") < 0 ||
@@ -3012,6 +3012,15 @@ static int pin_links(struct compartment_bpf *skel)
 	PIN_LINK(comp_inode_set_acl);
 	PIN_LINK(comp_inode_remove_acl);
 	PIN_LINK(comp_file_ioctl);
+	// file_ioctl_compat is autoload-gated on a BTF probe
+	// (select_file_ioctl_compat). When the running kernel has no
+	// security_file_ioctl_compat() the program is never loaded and libbpf
+	// leaves the link NULL, so skip the pin instead of failing: on such a
+	// kernel compat ioctls route through security_file_ioctl() and
+	// comp_file_ioctl already covers them. A NULL link with autoload
+	// enabled cannot reach here — compartment_bpf__attach() fails first.
+	if (skel->links.comp_file_ioctl_compat)
+		PIN_LINK(comp_file_ioctl_compat);
 	PIN_LINK(comp_sb_mount);
 	PIN_LINK(comp_move_mount);
 
@@ -3060,6 +3069,7 @@ static const char *const KNOWN_LINK_NAMES[] = {
 	"comp_inode_set_acl",
 	"comp_inode_remove_acl",
 	"comp_file_ioctl",
+	"comp_file_ioctl_compat",
 	"comp_sb_mount",
 	"comp_move_mount",
 };
@@ -3121,6 +3131,7 @@ static int pin_tree_exists(void)
 	"strict_launch_missing_total",
 	"strict_launch_allowed_total",
 	"marker_set_total",
+	"marker_set_fail_total",
 	"marker_clear_foreign_exec_total",
 	"marker_copy_fork_total",
 	"marker_stale_generation_total",
@@ -3421,6 +3432,7 @@ static int pin_counter_maps(struct compartment_bpf *skel)
 		{ "strict_launch_missing_total",      skel->maps.strict_launch_missing_total },
 		{ "strict_launch_allowed_total",      skel->maps.strict_launch_allowed_total },
 		{ "marker_set_total",                  skel->maps.marker_set_total },
+		{ "marker_set_fail_total",             skel->maps.marker_set_fail_total },
 		{ "marker_clear_foreign_exec_total",   skel->maps.marker_clear_foreign_exec_total },
 		{ "marker_copy_fork_total",            skel->maps.marker_copy_fork_total },
 		{ "marker_stale_generation_total",     skel->maps.marker_stale_generation_total },
@@ -3647,6 +3659,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		{ "strict_launch_missing_total",      skel->maps.strict_launch_missing_total },
 		{ "strict_launch_allowed_total",      skel->maps.strict_launch_allowed_total },
 		{ "marker_set_total",                 skel->maps.marker_set_total },
+		{ "marker_set_fail_total",            skel->maps.marker_set_fail_total },
 		{ "marker_clear_foreign_exec_total",  skel->maps.marker_clear_foreign_exec_total },
 		{ "marker_copy_fork_total",           skel->maps.marker_copy_fork_total },
 		{ "marker_stale_generation_total",    skel->maps.marker_stale_generation_total },
@@ -3655,11 +3668,11 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		{ "ptrace_traceme_denied_total",      skel->maps.ptrace_traceme_denied_total },
 	};
 	const size_t n = sizeof(entries) / sizeof(entries[0]);
-	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 = 17.
+	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 1 v0.8 = 18.
 	 * If you add a freezable map to compartment.bpf.c without extending
 	 * this table, the assert below catches it at build time. */
-	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 17,
-		"freeze_seal_maps entry count drift (expected: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 = 17)");
+	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 18,
+		"freeze_seal_maps entry count drift (expected: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 1 v0.8 = 18)");
 
 	for (size_t i = 0; i < n; i++) {
 		int fd = bpf_map__fd(entries[i].map);
@@ -3701,6 +3714,7 @@ static int stats_action(void)
 		{ "strict_launch_missing_total",      0, 0 },
 		{ "strict_launch_allowed_total",      0, 0 },
 		{ "marker_set_total",                 0, 0 },
+		{ "marker_set_fail_total",            0, 0 },
 		{ "marker_clear_foreign_exec_total",  0, 0 },
 		{ "marker_copy_fork_total",           0, 0 },
 		{ "marker_stale_generation_total",    0, 0 },
@@ -4222,8 +4236,10 @@ static int unpin_action(const char *requested)
 	// hard upper bound — one prog per link pin. Stack-sized array keeps
 	// the drain path allocation-free.
 	__u32 link_prog_ids[64];
-	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 21,
-		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id (currently 21)");
+	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 28,
+		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id "
+		       "(currently 28: 27 live pins + the legacy "
+		       "comp_bprm_check_security sweep entry)");
 	size_t n_link_prog_ids;
 
 	if (strcmp(cand, root) == 0) {
@@ -4476,6 +4492,58 @@ static int select_inode_setattr_variant(struct compartment_bpf *skel)
 	return 0;
 }
 
+// security_file_ioctl_compat() is the entry point a 32-bit process on a
+// 64-bit kernel reaches (fs/ioctl.c COMPAT_SYSCALL_DEFINE3(ioctl)); the
+// native SYSCALL_DEFINE3 calls security_file_ioctl() instead. Without the
+// compat program a 32-bit `chattr +i` bypasses the whole v0.8 ioctl gate.
+//
+// The hook was backported into stable 6.6.y, so `uname` cannot decide it:
+// probe vmlinux BTF for bpf_lsm_file_ioctl_compat and autoload the program
+// only when the symbol exists. On a kernel without it, attaching would fail
+// the whole load; skipping is correct because such a kernel routes compat
+// ioctls through security_file_ioctl(), which comp_file_ioctl already covers.
+// Must run after __open() and before __load(), like the setattr probe.
+static int select_file_ioctl_compat(struct compartment_bpf *skel)
+{
+	bool present = false;
+	int decided = 0;
+	struct btf *btf = btf__load_vmlinux_btf();
+
+	if (btf) {
+		__s32 id = btf__find_by_name_kind(btf, "bpf_lsm_file_ioctl_compat",
+		                                  BTF_KIND_FUNC);
+		present = (id >= 0);
+		decided = 1;
+		btf__free(btf);
+	}
+	if (!decided) {
+		// BTF absent: the hook has existed since 6.7 and is in every
+		// supported stable line, but we cannot prove it here. Disable
+		// rather than risk failing the entire load on a BTF-less host —
+		// the native comp_file_ioctl program still attaches, so the
+		// 64-bit gate stays live and only the compat residual reopens
+		// (the same residual documented in LIMITATIONS.md for kernels
+		// that genuinely lack the hook).
+		present = false;
+		fprintf(stderr,
+			"[probe] warn: vmlinux BTF unavailable; disabling the "
+			"file_ioctl_compat program. 32-bit ioctl callers are "
+			"NOT gated on this host.\n");
+	}
+
+	if (bpf_program__set_autoload(skel->progs.comp_file_ioctl_compat,
+	                              present)) {
+		fprintf(stderr,
+			"[probe] error: set_autoload(file_ioctl_compat) failed; "
+			"refusing to load.\n");
+		return -1;
+	}
+	fprintf(stderr, "[probe] file_ioctl_compat hook: %s.\n",
+		present ? "present (32-bit ioctl callers gated)"
+		        : "absent (compat ioctls route through file_ioctl)");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	/* Subcommand dispatch: `compartment-bpf observe [OPTIONS]` */
@@ -4710,6 +4778,11 @@ int main(int argc, char **argv)
 	// (6.8 has no mnt_idmap; 7.0+ does) before load, so the verifier only
 	// sees the correctly-shaped program.
 	if (select_inode_setattr_variant(skel) < 0) {
+		compartment_bpf__destroy(skel);
+		return 1;
+	}
+
+	if (select_file_ioctl_compat(skel) < 0) {
 		compartment_bpf__destroy(skel);
 		return 1;
 	}

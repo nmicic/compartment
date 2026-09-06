@@ -226,13 +226,22 @@ check-actor-hook: compartment.bpf.o
 	@# v0.8 gates: metadata + mount coverage hooks and the DENY_MOUNT code.
 	@grep -q 'ACTION_DENY_MOUNT' compartment-abi.h || { echo "error: ACTION_DENY_MOUNT missing in compartment-abi.h (ABI v0.8)"; exit 1; }
 	@grep -q 'case ACTION_DENY_MOUNT' compartment-bpf.c || { echo "error: action_name() lacks ACTION_DENY_MOUNT in compartment-bpf.c (ABI v0.8)"; exit 1; }
-	@for h in comp_inode_set_acl comp_inode_remove_acl comp_file_ioctl comp_sb_mount comp_move_mount; do \
+	@for h in comp_inode_set_acl comp_inode_remove_acl comp_file_ioctl \
+	          comp_file_ioctl_compat comp_sb_mount comp_move_mount; do \
 		grep -q "$$h" compartment.bpf.c || { echo "error: v0.8 hook $$h missing in compartment.bpf.c"; exit 1; }; \
 		grep -q "PIN_LINK($$h)" compartment-bpf.c || { echo "error: v0.8 hook $$h not pinned in compartment-bpf.c pin_links()"; exit 1; }; \
 		grep -q "\"$$h\"" compartment-bpf.c || { echo "error: v0.8 hook $$h missing from KNOWN_LINK_NAMES in compartment-bpf.c"; exit 1; }; \
 	done
+	@# The compat ioctl program is autoload-gated on a BTF probe; without the
+	@# probe it would fail the load on kernels that lack the hook.
+	@grep -q 'select_file_ioctl_compat' compartment-bpf.c || { echo "error: select_file_ioctl_compat BTF autoload gate missing in compartment-bpf.c (ABI v0.8)"; exit 1; }
+	@grep -q 'bpf_lsm_file_ioctl_compat' compartment-bpf.c || { echo "error: file_ioctl_compat BTF probe symbol missing in compartment-bpf.c (ABI v0.8)"; exit 1; }
+	@# sb_mount must mirror path_mount()'s dispatch order: MS_BIND is tested
+	@# before the propagation bits, so exempting on a propagation bit alone
+	@# reopens the MS_BIND|MS_PRIVATE bypass.
+	@grep -q 'MS_BIND' compartment.bpf.c || { echo "error: comp_sb_mount lacks the MS_BIND dispatch-order guard in compartment.bpf.c (ABI v0.8)"; exit 1; }
 	@for m in launcher_to_actor policy_state_map actor_marker_map \
-	          marker_set_total marker_copy_fork_total \
+	          marker_set_total marker_set_fail_total marker_copy_fork_total \
 	          marker_stale_generation_total marker_clear_foreign_exec_total \
 	          strict_launch_missing_total strict_launch_allowed_total \
 	          prctl_set_mm_exe_file_denied_total \

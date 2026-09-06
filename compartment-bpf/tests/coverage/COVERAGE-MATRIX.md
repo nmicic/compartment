@@ -31,6 +31,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `inode_set_acl` | witnessed |  |
 | `inode_remove_acl` | witnessed |  |
 | `file_ioctl` | witnessed |  |
+| `file_ioctl_compat` | witnessed |  |
 | `sb_mount` | witnessed |  |
 | `move_mount` | witnessed |  |
 ## observe-hook
@@ -77,6 +78,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `strict_launch_missing_total` | witnessed |  |
 | `strict_launch_allowed_total` | witnessed |  |
 | `marker_set_total` | witnessed |  |
+| `marker_set_fail_total` | witnessed |  |
 | `marker_clear_foreign_exec_total` | witnessed |  |
 | `marker_copy_fork_total` | witnessed |  |
 | `marker_stale_generation_total` | witnessed |  |

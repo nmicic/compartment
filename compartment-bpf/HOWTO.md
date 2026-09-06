@@ -547,6 +547,7 @@ ABI v0.4) the strict-launch-marker counters:
 | `strict_launch_missing_total`        | file-op denies emitted by `strict_launch_check_or_deny` (any failure mode)                    |
 | `strict_launch_allowed_total`        | file-op operations passed by `strict_launch_check_or_deny` (positive observability)           |
 | `marker_set_total`                   | tasks marker'd by `bprm_committed_creds` on a committed sealed-launcher exec                 |
+| `marker_set_fail_total`              | committed sealed-launcher execs whose task-storage marker could not be allocated (fail-closed; expect 0) |
 | `marker_clear_foreign_exec_total`    | tasks whose marker was cleared on a foreign exec (chain break — visibility signal)            |
 | `marker_copy_fork_total`             | child tasks that inherited a parent marker via `task_alloc` (G6 Outcome B)                    |
 | `marker_stale_generation_total`      | denies whose root cause was generation mismatch (always 0 in v0.4 fresh-load-only; see §3a)  |

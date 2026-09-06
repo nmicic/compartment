@@ -17,9 +17,10 @@
 //     moved here from bprm_check_security in v0.8 — see the hook comment),
 //     task_alloc (G6 marker copy on fork), task_prctl (PR_SET_MM deny),
 //     ptrace_access_check, ptrace_traceme
-//   v0.8 metadata + mount coverage (5):
+//   v0.8 metadata + mount coverage (6):
 //     inode_set_acl, inode_remove_acl (POSIX ACL writes bypass the xattr
-//     hooks), file_ioctl (FS_IOC_SETFLAGS / FSSETXATTR / SETVERSION),
+//     hooks), file_ioctl + file_ioctl_compat (FS_IOC_SETFLAGS /
+//     FSSETXATTR / SETVERSION, native and 32-bit compat entry points),
 //     sb_mount, move_mount (no new mount on or under a sealed path)
 //
 // v0.1 maps:
@@ -105,6 +106,9 @@ char LICENSE[] SEC("license") = "GPL";
 // in fs/namespace.c:path_mount().
 #ifndef MS_REMOUNT
 #define MS_REMOUNT     0x20
+#endif
+#ifndef MS_BIND
+#define MS_BIND        0x1000
 #endif
 #ifndef MS_UNBINDABLE
 #define MS_UNBINDABLE  (1 << 17)
@@ -270,6 +274,18 @@ struct {
 	__type(key, __u32);
 	__type(value, __u64);
 } marker_set_total SEC(".maps");
+
+// v0.8: bprm_committed_creds could not allocate the task-storage marker.
+// Fail-closed (the actor is later denied with DENY_STRICT_LAUNCH_MISSING),
+// but silent without this counter — an operator seeing strict-launch denies
+// with no policy change needs to be able to tell "allocation pressure" from
+// "someone is attacking the launcher chain".
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} marker_set_fail_total SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1568,14 +1584,27 @@ int BPF_PROG(comp_inode_removexattr, struct mnt_idmap *idmap,
 //      any existing marker (fail closed) and return.
 //   2. If target inode is a declared launcher (launcher_to_actor hit):
 //      create/overwrite current task marker with (target, slot, gen).
-//      marker_set_total++.
+//      marker_set_total++ (marker_set_fail_total++ if the task-storage
+//      allocation fails; the actor then fails closed at op time).
 //   3. Else if current task already has a marker:
 //      3a. If exec target == marker.target → keep (slm-actor exec from
 //          its sealed launcher; legitimate chain continuation).
 //      3b. Else → foreign exec. marker_clear_foreign_exec_total++ before
 //          clearing.
 //   4. Else nothing (no marker, not a launcher; ordinary process).
-SEC("lsm/bprm_committed_creds")
+// Attached sleepable (lsm.s/). bpf_lsm_bprm_committed_creds is in the
+// kernel's sleepable_lsm_hooks allowlist on every supported kernel (6.8 and
+// 7.0 both verified), and sleepable context is what makes the
+// bpf_task_storage_get(F_CREATE) below a blocking allocation. A plain lsm/
+// attach would work, but under memory pressure the marker allocation could
+// fail without blocking, silently costing an actor its identity. The
+// remaining failure is counted (marker_set_fail_total) rather than ignored.
+//
+// The hook is void (LSM_RET_VOID): the program is linked as BPF_TRAMP_FEXIT
+// and its return value is discarded, so nothing here can deny. Every return
+// is 0 and the BPF_PROG arity omits the trailing `int ret` — there is no
+// return slot to read.
+SEC("lsm.s/bprm_committed_creds")
 int BPF_PROG(comp_bprm_committed_creds, struct linux_binprm *bprm)
 {
 	struct task_struct *t;
@@ -1626,6 +1655,13 @@ int BPF_PROG(comp_bprm_committed_creds, struct linux_binprm *bprm)
 			am->state = 1;
 			am->_pad = 0;
 			bump_counter(&marker_set_total);
+		} else {
+			// Task-storage allocation failed. Fail-closed: without a
+			// marker the actor is denied by strict_launch_check_or_deny
+			// with DENY_STRICT_LAUNCH_MISSING. Count it so the deny has a
+			// distinguishable root cause instead of looking like an
+			// attack on the launcher chain.
+			bump_counter(&marker_set_fail_total);
 		}
 		return 0;
 	}
@@ -1849,16 +1885,17 @@ int BPF_PROG(comp_inode_remove_acl, struct mnt_idmap *idmap,
 // project quota / xfs_io (FS_IOC_FSSETXATTR) and FS_IOC_SETVERSION change
 // inode metadata through ->fileattr_set with no inode_setattr or xattr
 // hook in the path. Kernels >= 6.17 add security_inode_file_setattr();
-// the project floor is 6.6, so gate at security_file_ioctl(), which every
-// native ioctl(2) passes through. Only the five flag-writing commands are
-// inspected; every other ioctl returns after the compares below. Compat
-// (32-bit) callers on kernels >= 6.8 reach security_file_ioctl_compat()
-// instead — see LIMITATIONS.md.
-SEC("lsm/file_ioctl")
-int BPF_PROG(comp_file_ioctl, struct file *file, unsigned int cmd,
-	     unsigned long arg, int ret)
+// the project floor is 6.6, so gate at the ioctl hooks, which every
+// ioctl(2) passes through. Only the five flag-writing commands are
+// inspected; every other ioctl returns after the compares below.
+//
+// Data-writing ioctls (FICLONE / FICLONERANGE / FIDEDUPERANGE) are
+// deliberately NOT listed: fs/remap_range.c calls security_file_permission()
+// with MAY_WRITE on the destination, so comp_file_permission already covers
+// them under no-write. Do not re-litigate.
+static __always_inline int
+comp_file_ioctl_impl(struct file *file, unsigned int cmd, int ret)
 {
-	(void)arg;
 	if (ret != 0)
 		return ret;
 	if (cmd != COMP_FS_IOC_SETFLAGS && cmd != COMP_FS_IOC32_SETFLAGS &&
@@ -1876,6 +1913,34 @@ int BPF_PROG(comp_file_ioctl, struct file *file, unsigned int cmd,
 					ACTION_DENY_CHMOD_PARENT_DIR, &cid))
 		return -EACCES;
 	return 0;
+}
+
+// Native ioctl(2): fs/ioctl.c SYSCALL_DEFINE3(ioctl) -> security_file_ioctl().
+SEC("lsm/file_ioctl")
+int BPF_PROG(comp_file_ioctl, struct file *file, unsigned int cmd,
+	     unsigned long arg, int ret)
+{
+	(void)arg;
+	return comp_file_ioctl_impl(file, cmd, ret);
+}
+
+// Compat ioctl(2): a 32-bit process on a 64-bit kernel enters through
+// fs/ioctl.c COMPAT_SYSCALL_DEFINE3(ioctl), which calls
+// security_file_ioctl_compat() and NEVER security_file_ioctl(). Without this
+// program a 32-bit `chattr +i` walks straight past the gate above (the compat
+// switch handles FS_IOC32_SETFLAGS itself). Same body, same commands.
+//
+// The hook was added upstream and backported into stable 6.6.y, so a kernel
+// version test is unreliable; the loader BTF-probes for bpf_lsm_file_ioctl_compat
+// and autoload-gates this program (select_file_ioctl_compat() in
+// compartment-bpf.c). On a kernel without the hook, compat ioctls fall back
+// through security_file_ioctl() and comp_file_ioctl covers them.
+SEC("lsm/file_ioctl_compat")
+int BPF_PROG(comp_file_ioctl_compat, struct file *file, unsigned int cmd,
+	     unsigned long arg, int ret)
+{
+	(void)arg;
+	return comp_file_ioctl_impl(file, cmd, ret);
 }
 
 // Mount shadowing. A mount attached ON a sealed inode or anywhere INSIDE
@@ -1909,12 +1974,29 @@ deny_mount_on_dentry(struct dentry *mp, struct caller_id *cid)
 					     cid);
 }
 
-// mount(2). fs/namespace.c:path_mount() calls security_sb_mount() with
-// the caller's flags before dispatching. MS_REMOUNT and the propagation
-// changes (MS_SHARED / MS_PRIVATE / MS_SLAVE / MS_UNBINDABLE) modify an
-// existing mount and attach nothing at `path`, so they are exempt.
-// MS_BIND, MS_MOVE and a fresh filesystem mount all attach a new mount
-// object at `path` and are gated.
+// mount(2). fs/namespace.c:path_mount() calls security_sb_mount() with the
+// caller's flags before it dispatches, and the exemptions below must mirror
+// that dispatch order exactly, because the kernel tests the flag bits in a
+// fixed sequence and the FIRST match wins:
+//
+//   security_sb_mount(...)                      <- this hook
+//   may_mount()
+//   if ((flags & (MS_REMOUNT|MS_BIND)) == (MS_REMOUNT|MS_BIND)) ...
+//   if (flags & MS_REMOUNT)  -> do_remount()      attaches nothing
+//   if (flags & MS_BIND)     -> do_loopback()     ATTACHES A NEW MOUNT
+//   if (flags & (MS_SHARED|MS_PRIVATE|MS_SLAVE|MS_UNBINDABLE))
+//                            -> do_change_type()  attaches nothing
+//   if (flags & MS_MOVE)     -> do_move_mount_old() ATTACHES
+//   return do_new_mount(...)                       ATTACHES
+//
+// MS_BIND is tested BEFORE the propagation bits, so a caller that passes
+// `MS_BIND|MS_PRIVATE` (`mount --bind src dst -o private`) gets a bind mount,
+// not a propagation change. Exempting on any propagation bit — as the first
+// cut of this gate did — therefore let one extra flag bit attach a mount
+// inside a sealed subtree, and neither hook caught it: do_loopback() reaches
+// graft_tree() without ever calling security_move_mount(). Test the flags in
+// the kernel's own order instead. tests/bypass/17 W5 is the regression
+// witness.
 SEC("lsm/sb_mount")
 int BPF_PROG(comp_sb_mount, const char *dev_name, const struct path *path,
 	     const char *type, unsigned long flags, void *data, int ret)
@@ -1924,17 +2006,33 @@ int BPF_PROG(comp_sb_mount, const char *dev_name, const struct path *path,
 	(void)data;
 	if (ret != 0)
 		return ret;
-	if (flags & (MS_REMOUNT | MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE |
-		     MS_SHARED))
+	/* do_remount(): modifies an existing mount, attaches nothing.
+	 * MS_REMOUNT wins over MS_BIND in path_mount() (the combined
+	 * REMOUNT|BIND case is a bind-flag remount, still attaching nothing). */
+	if (flags & MS_REMOUNT)
 		return 0;
+	/* do_change_type(): propagation-only, attaches nothing — but ONLY when
+	 * MS_BIND is clear, because path_mount() dispatches MS_BIND first. */
+	if (!(flags & MS_BIND) &&
+	    (flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE)))
+		return 0;
+	/* MS_BIND (do_loopback), MS_MOVE (do_move_mount_old) and a fresh
+	 * filesystem mount (do_new_mount) all attach at `path`: gate them. */
 
 	struct dentry *mp = BPF_CORE_READ(path, dentry);
 	struct caller_id cid = {};
 	return deny_mount_on_dentry(mp, &cid);
 }
 
-// move_mount(2) (also the tail of open_tree()+fsmount() flows): the mount
-// at from_path is attached at to_path. Gate the destination the same way.
+// move_mount(2), including the tail of the new mount API flows
+// (open_tree(OPEN_TREE_CLONE) + move_mount, fsopen/fsmount + move_mount):
+// the mount at from_path is attached at to_path. Gate the destination the
+// same way. Note this hook is NOT on the MS_MOVE path: `mount --move` runs
+// do_move_mount_old(), which calls do_move_mount() directly and never
+// security_move_mount(), so MS_MOVE is covered by comp_sb_mount above and
+// only there. util-linux >= 2.39 increasingly uses the new mount API, so on
+// recent distributions a plain `mount` may never call security_sb_mount() at
+// all — both hooks are needed.
 SEC("lsm/move_mount")
 int BPF_PROG(comp_move_mount, const struct path *from_path,
 	     const struct path *to_path, int ret)

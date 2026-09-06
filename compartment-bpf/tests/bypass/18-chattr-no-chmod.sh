@@ -15,6 +15,12 @@
 #       returns EOPNOTSUPP); /tmp then /var/tmp; else SKIP
 #   W1  chattr +i on sealed target → DENY, lsattr shows no 'i'
 #   W2  chattr +a on sealed target → DENY, lsattr shows no 'a'
+#   W3  32-bit (i386) FS_IOC32_SETFLAGS on sealed target → DENY. A compat
+#       process enters COMPAT_SYSCALL_DEFINE3(ioctl), which calls
+#       security_file_ioctl_compat() and never security_file_ioctl(), so
+#       lsm/file_ioctl alone does not see it. This is the only witness for
+#       the lsm/file_ioctl_compat program. Skipped (not failed) when
+#       gcc-multilib is absent — the script still emits one label.
 #   C   chattr +a / -a on an unsealed sibling → ALLOW
 #   A   DENY_CHMOD audit line present
 set -u
@@ -77,6 +83,24 @@ if chattr +a "$TARGET" 2>/dev/null; then
 fi
 case "$(flags_of "$TARGET")" in *a*) bypass_fail "W2: 'a' flag present after denied chattr" ;; esac
 
+# W3: 32-bit compat ioctl. Needs a multilib toolchain; without one the
+# sub-witness reports "skipped" inside the PASS line rather than turning the
+# whole script into a SKIP (W1/W2 still prove the native gate).
+w3=77
+if command -v gcc >/dev/null 2>&1 &&
+   gcc -m32 -O2 -Wall "$(dirname "$0")/helpers/ioctl32_setflags.c" \
+       -o "$TMP/ioctl32" >"$TMP/m32-build.log" 2>&1; then
+	"$TMP/ioctl32" "$TARGET" >>"$DAEMON_LOG" 2>&1
+	w3=$?
+	[ "$w3" -eq 0 ] && chattr -i "$TARGET" 2>/dev/null
+fi
+case "$w3" in
+	1|77) ;;
+	0) bypass_fail "W3 BYPASS: 32-bit FS_IOC32_SETFLAGS set +i on a no-chmod sealed file (lsm/file_ioctl_compat not attached)" ;;
+	*) bypass_fail "W3 unexpected rc=$w3 (see $DAEMON_LOG and $TMP/m32-build.log)" ;;
+esac
+case "$(flags_of "$TARGET")" in *i*) bypass_fail "W3: 'i' flag present after the 32-bit ioctl" ;; esac
+
 # C: unsealed sibling still accepts flag changes.
 chattr +a "$CONTROL" 2>/dev/null \
 	|| bypass_fail "C: chattr +a on UNSEALED control failed — file_ioctl hook is over-denying"
@@ -91,4 +115,6 @@ for _ in $(seq 1 20); do
 done
 [ "$audit_ok" -eq 1 ] || bypass_fail "A: no DENY_CHMOD audit line for the ioctl denies"
 
-bypass_pass "chattr +i/+a denied on no-chmod seal (flags unchanged, DENY_CHMOD audited); control file still accepts chattr"
+w3msg="32-bit compat ioctl denied"
+[ "$w3" -eq 77 ] && w3msg="32-bit compat sub-witness skipped (no gcc-multilib)"
+bypass_pass "chattr +i/+a denied on no-chmod seal (flags unchanged, DENY_CHMOD audited); $w3msg (W3); control file still accepts chattr"
