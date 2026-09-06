@@ -422,6 +422,25 @@ packages:
   - aide
   - postgresql-common
   - postgresql
+  # Fixtures two bypass witnesses need, neither of which a cloud image or
+  # build-essential brings in:
+  #   acl          — tests/bypass/16-setfacl-no-chmod.sh SKIPs without
+  #                  setfacl/getfacl. That drops the bypass tally to 38,
+  #                  below the floor of 39 tracked in
+  #                  tests/release-totals.sh, so "sudo make check-release"
+  #                  on a guest built from this script FAILED with
+  #                  "bypass: 38, floor is 39 — the corpus shrank". The
+  #                  skip is not in tests/release-skip-allowlist.txt
+  #                  either, by design: a skip a package would close is a
+  #                  package problem, not a gate problem.
+  #   gcc-multilib — tests/bypass/18-chattr-no-chmod.sh builds its 32-bit
+  #                  compat-ioctl witness (W3) with "gcc -m32". Without a
+  #                  multilib toolchain that sub-witness is quietly not
+  #                  exercised: the script still prints one PASS label, so
+  #                  no tally moves and nothing fails — the FS_IOC_SETFLAGS
+  #                  compat path simply stops being tested.
+  - acl
+  - gcc-multilib
 
 write_files:
   - path: /etc/ssh/sshd_config.d/99-allow-root.conf
