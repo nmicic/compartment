@@ -34,6 +34,17 @@
 #      while the pin directory stays unguarded, so the row (and this
 #      witness) now names the real surface.
 #
+#   1b. The `CAP_BPF + direct map mutation` row states the corrected
+#      freeze fact. That row used to say the seal maps were "already
+#      immune" because `freeze_seal_maps()` freezes them. Measured on
+#      6.8.0-139 and 7.0.0-31, that is wrong: `bpf_map_freeze()` gates the
+#      syscall path only, and a `CAP_BPF` caller holding any fd to a frozen
+#      map — `BPF_F_RDONLY` is enough — splices it into a BPF program of its
+#      own with `bpf_map__reuse_fd()` and writes it from program context.
+#      The witness fails if the reassuring wording comes back, and fails if
+#      the row stops naming the syscall/program distinction or the
+#      primitive.
+#
 #   2. Baseline: `compartment-bpf --dry-run` on a well-formed profile
 #      exits 0. The LIMITATIONS row's premise is that *enforcement* can be
 #      detached at runtime; this baseline confirms the loader itself
@@ -82,6 +93,25 @@ if ! grep -qE 'SIEM|enforcement-stop|ringbuf' "$LIMITATIONS"; then
 	bypass_fail "LIMITATIONS.md link-removal row lost its SIEM/ringbuf alerting guidance"
 fi
 
+# ----- Witness 1b: the map-mutation row states the corrected freeze fact. -----
+# The row said the seal maps were "already immune" because they are frozen.
+# That was wrong: bpf_map_freeze() gates the syscall path only, and a CAP_BPF
+# caller holding any fd (BPF_F_RDONLY included) writes the map from a BPF
+# program of its own. Measured on 6.8.0-139 and 7.0.0-31. A doc sweep that
+# restores the reassuring wording tells operators their seals are protected
+# when they are not, so it fails here.
+if grep -qE 'CAP_BPF \+ direct map mutation.*already immune' "$LIMITATIONS"; then
+	bypass_fail "LIMITATIONS.md map-mutation row claims the seal maps are 'already immune' again; bpf_map_freeze() gates the syscall path only and a CAP_BPF holder writes a frozen map from program context (measured on 6.8.0-139 and 7.0.0-31)"
+fi
+if ! grep -qE 'CAP_BPF \+ direct map mutation.*bpf_map_freeze.*syscall.*program' "$LIMITATIONS"; then
+	echo "--- LIMITATIONS.md map-mutation context ---" >&2
+	grep -n 'direct map mutation' "$LIMITATIONS" >&2 || true
+	bypass_fail "LIMITATIONS.md map-mutation row no longer distinguishes the syscall path bpf_map_freeze() closes from the program path it does not"
+fi
+if ! grep -qE 'CAP_BPF \+ direct map mutation.*bpf_map__reuse_fd' "$LIMITATIONS"; then
+	bypass_fail "LIMITATIONS.md map-mutation row lost the primitive that makes the program-context write work (bpf_map__reuse_fd on a BPF_F_RDONLY fd)"
+fi
+
 # ----- Witness 2: baseline --dry-run on a well-formed profile rc=0. -----
 ACTOR=$(ed_create_actor actor)
 TARGET="$TMP/target"
@@ -100,4 +130,4 @@ if [ "$rc" -ne 0 ]; then
 	bypass_fail "baseline --dry-run on a well-formed profile failed (rc=$rc); the link-removal threat row's premise (a working loader) is not satisfied"
 fi
 
-bypass_pass "LIMITATIONS.md link-removal row text intact (BPF_LINK_DETACH correctly documented as -EOPNOTSUPP); --dry-run baseline rc=0 (parse-time witness; runtime pin-unlink deferred to RT-* suite)"
+bypass_pass "LIMITATIONS.md link-removal row text intact (BPF_LINK_DETACH correctly documented as -EOPNOTSUPP) and map-mutation row states the corrected freeze fact (syscall path gated, program path not; no 'already immune' claim); --dry-run baseline rc=0 (parse-time witness; runtime pin-unlink deferred to RT-* suite)"

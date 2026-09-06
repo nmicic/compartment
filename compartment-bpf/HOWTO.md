@@ -413,7 +413,16 @@ v0 brief originally used. The honest threat-model framing:
   pin tree, and can `unlink()` the link pins (note `bpf(BPF_LINK_DETACH)`
   does not work on an LSM link — it returns `-EOPNOTSUPP`; the pin tree is
   the surface). The recovery path in
-  §3.4 documents this directly.
+  §3.4 documents this directly. They can also rewrite the policy maps
+  without touching the pin tree at all: `freeze_seal_maps()` calls
+  `bpf_map_freeze()` after load, but freeze gates only the **syscall**
+  path. Measured on 6.8.0-139 and 7.0.0-31, a `CAP_BPF` caller that
+  obtains any fd to a frozen compartment map — `BPF_F_RDONLY` is enough
+  — can splice it into a BPF program of its own and write it from
+  program context, so wiping `sealed_inodes` removes policy with no
+  unlink, no umount and no audit event. Do not read the freeze as map
+  integrity; it is not, and the `CAP_BPF + direct map mutation` row in
+  `LIMITATIONS.md` carries the measurement.
 * **Against a non-CAP_BPF-restricted root attacker** (an
   unconfined process running as uid 0 but without CAP_BPF /
   CAP_SYS_ADMIN — e.g. a setuid binary, a confined container

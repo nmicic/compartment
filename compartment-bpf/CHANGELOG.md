@@ -199,8 +199,13 @@ and reserved) is the principled fix and is a follow-up, not part of v0.8.
 - `LIMITATIONS.md` gains rows for ACL/xattr coverage, ioctl/`chattr` (with
   the compat residual), timestamps (with the behaviour-change warning),
   pre-existing writable fds, and `mount_setattr(2)`/`open_tree_attr(2)`
-  (unhooked upstream). Three factual corrections: frozen maps are already
-  immune to `BPF_MAP_UPDATE_ELEM`; `bpf(BPF_LINK_DETACH)` returns
+  (unhooked upstream). Three factual corrections: `bpf_map_freeze()` closes
+  the `BPF_MAP_UPDATE_ELEM` **syscall** path but is **not** map integrity —
+  a `CAP_BPF` holder with any fd to a frozen map, `BPF_F_RDONLY` included,
+  writes it from a BPF program of its own (measured on 6.8.0-139 and
+  7.0.0-31), so every compartment map is mutable by an unconfined root and
+  the row no longer claims the seal maps are immune;
+  `bpf(BPF_LINK_DETACH)` returns
   `-EOPNOTSUPP` for an LSM link (the removal path is `unlink()` of the bpffs
   pin); and `fallocate(2)` — which v0.8 recorded as *not* covered by
   `security_file_permission()`, corrected in 1.4 after
