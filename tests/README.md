@@ -52,7 +52,7 @@ filter).
 |-------|--------|---------------|
 | **Filesystem/seccomp/env matrix** | `run_compartment_user_matrix.sh` | Landlock (ro/rw), seccomp deny-list, env sanitization, profiles, dry-run, verify, FD inheritance, and self-tests of the harness's own assertion helpers |
 | **Child inheritance** | `run_child_inheritance_tests.sh` | Sandbox restrictions survive fork/exec across 2 levels |
-| **Sandbox proxy/network** | `run_sandbox_proxy_matrix.sh` | sandbox.sh HARD/SOFT modes, network isolation, proxy bridge |
+| **Sandbox proxy/network** | `run_sandbox_proxy_matrix.sh` | sandbox.sh HARD mode against a real namespace, via `lib/sandbox-hard.sh`: the interface list, loopback, the routing table, an off-host connect, mapped-root identity, the proxy bridge. Counts a skip per assertion when the host has no unprivileged user namespace — `root.d/sandbox-hard.sh` runs the same assertions there |
 | **External CLI smoke** | `run_claude_smoke.sh` | A third-party CLI under compartment-user; skipped when the CLI is missing or unauthenticated, or with `--no-external` |
 
 Discovered suites — every executable script in these two directories is run
@@ -68,9 +68,20 @@ as its own suite, in glob order, with no runner edit:
 | **Profile trust** | `rootless.d/profile-trust.sh` | Profile search order and file trust, transactional parsing, one-way switches, `$HOME` validation, `COMPARTMENT_SHELL_DIR`, audit-log hardening, environment deny-list, `--dump-profile` |
 | **sandbox.sh** | `rootless.d/sandbox.sh` | `sandbox.sh` HARD-mode shell intercept, dependency checks and `--verify`, driven through stubbed `unshare`/`ip`/`mount` so the path runs without a usable user namespace |
 | **Discovery smoke (root)** | `root.d/00-discovery-smoke.sh` | That the root runner refuses to run unprivileged and discovers `root.d/` |
-| **compartment-root** | `root.d/compartment-root.sh` | A real container: start-up, `/dev` nodes, default seccomp deny-list, privilege and capability drop, `/proc` and `/sys` masking, escape attempts, PID 1 reaper, netns, uid/gid maps, cgroup confinement, reporting |
+| **compartment-root** | `root.d/compartment-root.sh` | A real container: start-up, `/dev` nodes, default seccomp deny-list, privilege and capability drop, `/proc` and `/sys` masking (all 15 masks, by the mechanism that implements them), user-namespace credential hardening (`setgroups deny`, the id maps, `PR_SET_DUMPABLE`), escape attempts, PID 1 reaper, netns, uid/gid maps, cgroup confinement, reporting |
 | **compartment-root Landlock** | `root.d/compartment-root-landlock.sh` | The exec allow-list inside a container, shared libraries vs the ELF interpreter, `mount-ro`/`-noexec`/`-nosuid`, `rootdir-flags`, `rootdir` ownership refusals, the `--netns` join, devpts and `/dev/shm`, TCP port rules inside the container, and `container.conf`'s network block |
-| **Profile trust (root)** | `root.d/profile-trust-root.sh` | compartment-root never reads `$HOME`; `/etc/compartment` ownership and mode checks; every `--profile` spelling; root audit directory |
+| **Profile trust (root)** | `root.d/profile-trust-root.sh` | compartment-root never reads `$HOME`; `/etc/compartment` ownership and mode checks; every `--profile` spelling; root audit directory; profile search **precedence** (`/etc` beats `$HOME`, and `inherit` from `/etc` cannot reach it); the group-writable half of file trust, which needs a group the caller is not in |
+| **sandbox.sh HARD (root)** | `root.d/sandbox-hard.sh` | Clears `kernel.apparmor_restrict_unprivileged_userns` for the duration, restores it from a trap, and runs `lib/sandbox-hard.sh` as the invoking user — the only place the HARD-mode namespace is exercised for real |
+
+Two gates keep this table honest. `make check-orphans` fails when a tracked
+`tests/**/*.sh` with a shebang is named by no runner, no Makefile target and
+no workflow — a suite nothing runs still reads as coverage in this file.
+And every suite declares its own assertion count with `harness_expect_total`,
+so a block that quietly stops running changes the total and fails, instead
+of reporting a smaller number nobody compares against anything. One `skip`
+standing in for a block counts the assertions it replaces (`skip_group`),
+which is what makes the total the same on a developer host, on the test
+guests and in a bare container.
 
 `compartment-root` used to have no automated coverage at all. It now has a
 runner (`run_root_tests.sh`, refuses to run unprivileged) and a discovery
@@ -132,7 +143,7 @@ tests/
 │   ├── run_child_inheritance_tests.sh
 │   ├── run_sandbox_proxy_matrix.sh
 │   ├── run_claude_smoke.sh
-│   └── run_kernel_matrix.sh    — virtme-ng kernel matrix, run by hand
+│   └── run_kernel_matrix.sh    — virtme-ng kernel matrix, `make test-kernels`
 ├── output/                     — test output files (git-ignored)
 └── README.md                   — this file
 ```
