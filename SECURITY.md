@@ -57,13 +57,16 @@ documented limitations, including:
   `/proc/1/root`, a pre-opened host directory fd, a setuid-root binary
   inside `rootdir`), the PID 1 reaper and signal handling, the network
   namespace, uid/gid mapping, cgroup path confinement and policy reporting
-  — 61 assertions in 1.4.0, all passing on Ubuntu 24.04
+  — 101 assertions in 1.4.0, all passing on Ubuntu 24.04
   (kernel 6.8.0, gcc 13.3) and Ubuntu 26.04 (kernel 7.0.0, gcc 15.2).
-  `tests/scripts/root.d/compartment-root-landlock.sh` adds 55 more for
+  `tests/scripts/root.d/compartment-root-landlock.sh` adds 56 more for
   Landlock inside the container, the `exec` binary allow-list, the mount
   hardening, `rootdir` ownership, the `--netns` join and devpts/`/dev/shm`;
-  `tests/scripts/root.d/profile-trust-root.sh` adds 32 for profile trust
-  under root; 152 in total with the discovery smoke suite. Those counts
+  `tests/scripts/root.d/limited-root.sh` adds 67 for the limited-root
+  deployment over a real sshd login;
+  `tests/scripts/root.d/profile-trust-root.sh` adds 46 for profile trust
+  under root; `tests/scripts/root.d/sandbox-hard.sh` adds 10; 285 in total
+  with the discovery smoke suite. Those counts
   move as suites are added: what is covered is whatever
   `tests/scripts/root.d/` contains, and the runner prints the totals it
   measured — run it rather than trusting this paragraph. The
@@ -143,3 +146,34 @@ documented limitations, including:
   it, and an attacker can probe the filter one call at a time because every
   denial returns cleanly. `seccomp-default kill` changes that to
   `SECCOMP_RET_KILL_PROCESS`; the default stays `errno` for compatibility
+- **`compartment-bpf`: `bpf_map_freeze()` is not map integrity, and
+  `CAP_BPF` is the boundary.** Corrected in v0.8.0 — the previous text
+  claimed the frozen seal maps were immune to mutation, and that was wrong
+  in the reassuring direction. Freezing strips `FMODE_CAN_WRITE` on the
+  **syscall** path only; it does not gate the **program** path. Measured on
+  6.8.0-139 and 7.0.0-31: a caller holding `CAP_BPF` that obtains any fd to
+  a frozen map — `BPF_MAP_GET_FD_BY_ID` with `BPF_F_RDONLY` is enough — can
+  splice it into a BPF program of its own and update or delete entries from
+  program context. Every compartment map is reachable that way, and wiping
+  the seal entries removes policy with no unlink, no umount and **no audit
+  event at all**. The load-bearing control is keeping `CAP_BPF` (and
+  `CAP_SYS_ADMIN`) off every workload and every root login — systemd
+  `CapabilityBoundingSet=`, or the limited-root deployment above — plus
+  ingesting the `audit_event` ringbuf and alerting on enforcement stopping.
+  `tests/bypass/26-frozen-map-honesty.sh` re-measures the gap on every run,
+  so it cannot quietly return to prose
+- **`compartment-bpf --pin --self-protect` closes that at the kernel, opt-in,
+  and leaves three known edges.** The flag gates `bpf_map_new_fd()` and the
+  pin tree so only an authorised loader image can obtain a map fd, unlink or
+  rename a pin, or unmount the bpffs holding it. It is off by default because
+  it changes the upgrade ceremony: a successor loader at a different inode
+  cannot `--unpin` what this one pinned unless it was named with
+  `--authorize-loader` (see `compartment-bpf/HOWTO.md` §3.6). Residuals with
+  the flag on: a task that inherits a map fd from a *running* loader via
+  `pidfd_getfd(2)` or `SCM_RIGHTS` never calls `bpf_map_new_fd()` and is not
+  gated (it needs `PTRACE_MODE_ATTACH` on the loader, and daemonless `--pin`
+  leaves no loader running); `mount --move` of the pin bpffs has no LSM hook
+  and orphans the pins while enforcement stays live; and the ED-11 unpin
+  sentinel lives on `/run`, not on bpffs, so it is not covered — deleting it
+  downgrades `--unpin` to the legacy path but does not remove enforcement.
+  `compartment-bpf/LIMITATIONS.md` carries the full table

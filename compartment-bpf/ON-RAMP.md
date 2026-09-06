@@ -106,7 +106,7 @@ Headline tallies inside `make check`:
 | `check-observe` | PASS=21 FAIL=0 SKIP=1 (T12, AIDE not installed) |
 | `check-dir-matrix` | 40/40 PASS |
 | `check-wrapper` | PASS=21 FAIL=0 |
-| `check-profiles` | 19/19 profiles parsed cleanly |
+| `check-profiles` | 20/20 profiles parsed cleanly |
 | `check-profile-e2e` | 2 SKIP (aide, postgres not installed) |
 
 Two suites are NOT part of `make check` and have preconditions of their

@@ -174,6 +174,7 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 | `tests/actor-wrapper/run.sh` | 21 wrapper/actor-identity witnesses (`make check-wrapper`) |
 | `tests/matrix.sh` | file-flag matrix, 4 flags x every op the runner lists (28 cells today; the gate reads the op list rather than a literal) |
 | `tests/bench-runner.sh` | three-mode performance bench with 2σ confidence intervals |
+| `tests/bench/bpf-syscall-overhead.sh` | what `--self-protect` costs `bpf(2)`: three legs (no policy / `--pin` / `--pin --self-protect`), `make bench-bpf-syscall` |
 | `tests/stability/` | pin/unpin churn stability: 8 witnesses quick, 1024 cycles full |
 | `tests/fuzz.sh` | 10 000-iteration fuzz with reproducible seeds |
 

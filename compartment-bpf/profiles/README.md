@@ -172,6 +172,29 @@ strict mode requires every actor binary to be `full`-sealed at its
 declared path). See HOWTO.md §2 for the syntax reference and worked
 examples.
 
+## Auth-path profile (the kernel half of limited root over SSH)
+
+- **`profiles/limited-root-authpath.conf`** — not a daemon profile and
+  deliberately **not** part of `all-daemons.conf`. It is the inode half of
+  the deployment `HOWTO.md` "Limited root over SSH" describes: the session
+  half lives in the core repo as `examples/limited-root.conf` and binds the
+  confined *session* with Landlock, seccomp and a capability bounding set,
+  while this file binds the *inodes* on the login path — sshd and its
+  config, PAM, `/etc/ld.so.preload`, the shells, `passwd`/`shadow`/`sudoers`
+  — so a uid-0 process that was never in the session (cron, a unit, a
+  package hook) cannot edit the confinement out from under itself. Neither
+  half is sufficient alone; the profile's own header says which adversary
+  each one answers.
+
+  Load it with `--pin`, never as a daemon: a daemon can be signalled by any
+  same-uid process, and below Landlock ABI v6 the confined session can send
+  that signal. Against an account that has had `CAP_BPF` dropped — which is
+  exactly what `limited-root.conf` does — the ED-11 passphrase is the wall
+  in front of `--unpin`. Adding `--self-protect` to the same `--pin` closes
+  the `CAP_BPF` path as well; read HOWTO.md §3.6 for the upgrade rule that
+  comes with it. Witnessed end to end by
+  `tests/scripts/root.d/limited-root.sh` (group 6) in the core repo.
+
 ## Limits
 
 - **Does not block exec.** A malicious binary placed *somewhere else*
