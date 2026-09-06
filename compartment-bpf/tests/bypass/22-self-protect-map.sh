@@ -52,6 +52,10 @@ printf 'seal %s full\n' "$TARGET" > "$TMP/policy.conf"
 	|| { cat "$TMP/dry.log" >&2; bypass_fail "baseline --dry-run failed"; }
 
 # C: over-deny guard, before anything is pinned and again after.
+# Clear any leftover first: this pin lives OUTSIDE PIN_ROOT, so --unpin never
+# sweeps it, and one left behind by an earlier interrupted run would make the
+# create fail EEXIST and this witness SKIP forever on a misleading reason.
+rm -f /sys/fs/bpf/bx22ctl
 bpftool map create /sys/fs/bpf/bx22ctl type array key 4 value 8 entries 1 \
 	name bx22ctl >"$TMP/ctl.log" 2>&1 \
 	|| bypass_skip "cannot create a control bpf map (need CAP_BPF): $(head -1 "$TMP/ctl.log")"
@@ -91,9 +95,9 @@ cc -O2 -Wall "$(dirname "$0")/helpers/bpf_map_fd_sweep.c" -o "$SWEEP" \
 sweep=$("$SWEEP")
 echo "$sweep" >>"$TMP/sweep.log"
 denied=$(printf '%s' "$sweep" | sed -n 's/.*denied=\([0-9]*\).*/\1/p')
-ok_ro=$(printf '%s'  "$sweep" | sed -n 's/.*ok_ro=\([0-9]*\).*/\1/p')
+ro_leak=$(printf '%s' "$sweep" | sed -n 's/.*ro_leak=\([0-9]*\).*/\1/p')
 protected=$(sed -n 's/^\[self-protect\] \([0-9]*\) map ids protected$/\1/p' "$TMP/daemon.err")
-[ -n "$denied" ] && [ -n "$protected" ] \
+[ -n "$denied" ] && [ -n "$ro_leak" ] && [ -n "$protected" ] \
 	|| bypass_fail "W1: could not parse the sweep ($sweep) or the loader's protected-map count"
 
 # Every map the loader protected must have refused. More is fine only if
@@ -105,10 +109,18 @@ protected=$(sed -n 's/^\[self-protect\] \([0-9]*\) map ids protected$/\1/p' "$TM
 # program from writing a map it holds any fd to, measured on 6.8 and 7.0, so
 # allowing read-only fds would leave actor_marker_map and every seal map
 # writable through a one-instruction BPF program.
-[ "$ok_ro" -eq 0 ] || [ "$ok_ro" -lt "$denied" ] \
-	|| bypass_fail "W3 BYPASS: $ok_ro protected maps handed out a read-only fd ($sweep)"
-ro_leak=$("$SWEEP" | sed -n 's/.*ok_ro=\([0-9]*\).*/\1/p')
-[ "${ro_leak:-0}" -le "$ok_ro" ] || bypass_fail "W3: sweep is not reproducible"
+#
+# ro_leak is the sweep's count of maps that refused READ-WRITE and then handed
+# out READ-ONLY — the hole, and nothing else. It must be exactly 0. The sweep's
+# ok_ro is a different number (every unrelated map on the box opens read-only,
+# and there are dozens); comparing against it would make this assertion depend
+# on how much unrelated BPF the guest happens to be running.
+[ "$ro_leak" -eq 0 ] \
+	|| bypass_fail "W3 BYPASS: $ro_leak compartment maps refused a read-write fd and then handed out a READ-ONLY one; a read-only fd is a complete attack ($sweep)"
+sweep2=$("$SWEEP")
+ro_leak2=$(printf '%s' "$sweep2" | sed -n 's/.*ro_leak=\([0-9]*\).*/\1/p')
+[ "${ro_leak2:-1}" -eq 0 ] \
+	|| bypass_fail "W3: the second sweep found $ro_leak2 read-only leaks; the gate is not deterministic ($sweep2)"
 
 # W2: BPF_OBJ_GET on a pinned compartment map, via bpftool's pinned path.
 w2=$(bpftool map dump pinned "$SP_PIN/maps/deny_total" 2>&1 | head -1)
@@ -120,7 +132,7 @@ esac
 # A: audit line, with the caller's exe identity.
 sp_audit_wait "$TMP/daemon.err" 'DENY_BPF_SELF' \
 	|| bypass_fail "A: no DENY_BPF_SELF audit line for the denied map opens"
-grep -q 'DENY_BPF_SELF .*caller_dev=[0-9]* caller_ino=[0-9]*' "$TMP/daemon.err" \
+grep -q 'DENY_BPF_SELF .*caller_dev=[0-9]\+ caller_ino=[0-9]\+' "$TMP/daemon.err" \
 	|| bypass_fail "A: DENY_BPF_SELF audit line carries no caller exe identity"
 
 # K: the counter must have moved, and it must be a subset of deny_total.

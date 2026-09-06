@@ -49,6 +49,7 @@ before=$(sp_npins)
 
 # C: an unrelated object on the same bpffs must stay removable. If the gate
 # keyed on the filesystem instead of the individual inodes, this would fail.
+rm -f /sys/fs/bpf/bx23ctl   # see the note in witness 22: --unpin never sweeps it
 bpftool map create /sys/fs/bpf/bx23ctl type array key 4 value 8 entries 1 \
 	name bx23ctl >"$TMP/ctl.log" 2>&1 \
 	|| bypass_skip "cannot create a control bpf map: $(head -1 "$TMP/ctl.log")"
@@ -86,10 +87,20 @@ after=$(sp_npins)
 [ "$after" -eq "$before" ] \
 	|| bypass_fail "W4 BYPASS: rm -rf of the pin root removed $((before - after)) pins (was $before, now $after)"
 
-# W5
-if rmdir "$SP_PIN/links" 2>/dev/null; then
-	bypass_fail "W5 BYPASS: the links pin directory could be removed"
-fi
+# W5. Asserting only "rmdir failed" proves nothing here: the pin directory is
+# never empty, so a build with the inode_rmdir pin-tamper branch deleted still
+# fails the rmdir, with ENOTEMPTY from the filesystem instead of EACCES from
+# the gate. vfs_rmdir() calls security_inode_rmdir() BEFORE the filesystem's
+# ->rmdir, so the two are distinguishable by errno and only one of them means
+# the gate fired.
+w5=$(rmdir "$SP_PIN/links" 2>&1)
+case "$w5" in
+	*"Permission denied"*|*"Operation not permitted"*) : ;;
+	"") bypass_fail "W5 BYPASS: rmdir of the links pin directory succeeded" ;;
+	*"not empty"*)
+		bypass_fail "W5 BYPASS: rmdir of the links pin directory was refused with ENOTEMPTY, not by the gate — security_inode_rmdir() runs before ->rmdir, so the pin-tamper branch did not fire. Empty the directory and it would be removable ($w5)" ;;
+	*) bypass_fail "W5: rmdir of the links pin directory failed for an unexpected reason ($w5)" ;;
+esac
 
 # S: still enforcing.
 if { echo tampered > "$TARGET"; } 2>/dev/null; then
@@ -99,7 +110,7 @@ fi
 # A
 sp_audit_wait "$TMP/daemon.err" 'DENY_PIN_TAMPER' \
 	|| bypass_fail "A: no DENY_PIN_TAMPER audit line for the denied pin removals"
-grep -q 'DENY_PIN_TAMPER .*caller_dev=[0-9]* caller_ino=[0-9]*' "$TMP/daemon.err" \
+grep -q 'DENY_PIN_TAMPER .*caller_dev=[0-9]\+ caller_ino=[0-9]\+' "$TMP/daemon.err" \
 	|| bypass_fail "A: DENY_PIN_TAMPER audit line carries no caller exe identity"
 
 # K

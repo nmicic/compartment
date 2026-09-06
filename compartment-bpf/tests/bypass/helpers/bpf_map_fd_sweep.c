@@ -10,7 +10,15 @@
 // a map spliced into a BPF program with bpf_map__reuse_fd() can be written
 // from program context regardless of bpf_map_freeze().
 //
-// Output, one line: SWEEP total=<n> ok_rw=<n> ok_ro=<n> denied=<n> other=<n>
+// Output, one line:
+//   SWEEP total=<n> ok_rw=<n> ok_ro=<n> ro_leak=<n> denied=<n> other=<n>
+//
+// ok_ro counts read-only fds granted for maps that ALSO granted read-write —
+// i.e. every unrelated map on the box, which is dozens. ro_leak counts
+// read-only fds granted for maps that REFUSED read-write, which is the hole
+// this helper exists to find and must be 0. Keeping them apart is the whole
+// point: one number is noise, the other is a bypass.
+//
 // Exit 0 always (the caller asserts on the numbers).
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -39,7 +47,7 @@ static int get_fd(uint32_t id, int rdonly)
 int main(void)
 {
 	uint32_t id = 0;
-	int total = 0, ok_rw = 0, ok_ro = 0, denied = 0, other = 0;
+	int total = 0, ok_rw = 0, ok_ro = 0, ro_leak = 0, denied = 0, other = 0;
 
 	for (;;) {
 		union bpf_attr n;
@@ -57,11 +65,17 @@ int main(void)
 		} else if (errno == EACCES || errno == EPERM) {
 			denied++;
 			/* A read-only fd must be refused too: it is a complete
-			 * attack on its own. Count it as "other" if it slips
-			 * through, so the caller can tell the two apart. */
+			 * attack on its own. This is the ONLY interesting
+			 * number in the whole sweep, so it gets a counter of
+			 * its own: a map that refused read-write and then
+			 * handed out read-only is a hole. Counting it in
+			 * ok_ro instead would bury it among the dozens of
+			 * unrelated maps on the box that legitimately open
+			 * read-only, and the caller could not tell one from
+			 * the other. */
 			fd = get_fd(id, 1);
 			if (fd >= 0) {
-				ok_ro++;
+				ro_leak++;
 				close(fd);
 			}
 			continue;
@@ -78,7 +92,7 @@ int main(void)
 			close(fd);
 		}
 	}
-	printf("SWEEP total=%d ok_rw=%d ok_ro=%d denied=%d other=%d\n",
-	       total, ok_rw, ok_ro, denied, other);
+	printf("SWEEP total=%d ok_rw=%d ok_ro=%d ro_leak=%d denied=%d other=%d\n",
+	       total, ok_rw, ok_ro, ro_leak, denied, other);
 	return 0;
 }
