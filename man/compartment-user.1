@@ -11,24 +11,52 @@ compartment-user \- userspace process isolation with Landlock, seccomp, and envi
 applies kernel-enforced restrictions to a process before executing it.
 No root required. Zero dependencies.
 .PP
-Restrictions are applied in order and are all inherited by child processes:
-.IP 1. 4
+Three of the mechanisms are enforced by the kernel. Once set they are
+inherited across
+.BR fork (2)
+and
+.BR execve (2)
+and cannot be removed by the sandboxed process or any of its descendants:
+.IP \(bu 4
 .B PR_SET_NO_NEW_PRIVS
 \- prevents privilege escalation via setuid binaries.
-.IP 2.
+.IP \(bu
 .B Landlock
 \- filesystem path restrictions (read-only system paths, writable working directory).
-.IP 3.
+.IP \(bu
 .B seccomp BPF
 \- blocks dangerous syscalls (ptrace, mount, bpf, io_uring, etc.).
-.IP 4.
-.B Environment sanitization
-\- strips LD_PRELOAD, cloud credentials, SSH agent socket, etc.
-.IP 5.
-.B Audit logging
-\- file-per-day log with PPID chain and user identity.
 .PP
-All restrictions are irreversible \(em a sandboxed process cannot remove them.
+The rest is applied once, immediately before
+.BR execve (2),
+and is
+.B not
+a kernel restriction:
+.IP \(bu 4
+.B Environment sanitization
+\- strips LD_PRELOAD, cloud credentials, SSH agent socket, etc. from the
+environment handed to the command.
+A sandboxed process may re-export any of these variables for its own
+children, and the loader will honour them; nothing in the kernel prevents
+that.
+Durable environment policy needs
+.BR compartment-bpf .
+.IP \(bu
+.B Working directory
+and
+.B file-descriptor cleanup
+\- both are one-time actions, not ongoing restrictions.
+.IP \(bu
+.B Audit logging
+\- a record, not a restriction. File-per-day log with PPID chain and
+user identity.
+.PP
+The actual order at run time is: audit log opened, preflight check,
+.BR PR_SET_NO_NEW_PRIVS ,
+environment sanitization, Landlock, seccomp,
+.BR chdir (2),
+hardening,
+.BR execve (2).
 .SH OPTIONS
 .SS Profiles
 .TP
@@ -39,10 +67,39 @@ Built-in profiles:
 .BR strict ", "
 .BR none .
 File search order:
-.IR ~/.config/compartment/NAME.conf ,
-.IR /etc/compartment/NAME.conf .
+.IR /etc/compartment/NAME.conf ,
+then
+.I ~/.config/compartment/NAME.conf
+but only with
+.BR \-\-user\-profiles .
 An explicit file path (containing \fB/\fR) loads directly.
+Every profile file must be a regular file owned by root or by the real uid of
+the caller, must not be group- or world-writable, and its containing directory
+must satisfy the same conditions.
+A profile that exists but does not parse is fatal; the built-in is used only
+when no file was found.
+.TP
+.B \-\-user\-profiles
+Also search
+.I ~/.config/compartment/NAME.conf
+for profiles.
+Off by default: the sandboxed process usually has write access to
+.IR $HOME ,
+so a profile found there could switch its own sandbox off.
+Never honoured in shell-replacement mode.
 .SS "Filesystem (Landlock)"
+.PP
+The built-in profiles add
+.I $HOME
+as a read-write-execute Landlock root.
+.I $HOME
+must therefore be an absolute path, must not be
+.IR / ,
+and must name an existing directory owned by the real uid of the caller;
+compartment-user refuses to start otherwise.
+The same applies to
+.I $HOME
+expanded inside a profile value.
 .TP
 .BI \-\-ro " PATH"
 Grant read-only + execute access to \fIPATH\fR.
@@ -62,13 +119,55 @@ Disable Landlock filesystem restrictions.
 .TP
 .BI \-\-block " SYSCALL"
 Block a syscall by name or number. Repeatable.
+Up to 256 entries; the built-in
+.B ai-agent
+profile already uses 43 of them, and overflowing the limit is a fatal
+error rather than a silent truncation.
+.TP
+.BI \-\-allow " SYSCALL"
+Switch seccomp to allow-list mode and permit
+.IR SYSCALL .
+Everything not named by an
+.B \-\-allow
+flag or an
+.B allow
+profile directive returns
+.BR EPERM .
+Repeatable.
 .TP
 .B \-\-no\-seccomp
 Disable seccomp filtering.
 .SS Environment
 .TP
+.BI \-\-env\-allow " VAR"
+Switch environment handling to allow-list mode and keep
+.IR VAR .
+Everything not named by an
+.B \-\-env\-allow
+flag or an
+.B env-allow
+profile directive is removed. Repeatable.
+.TP
 .BI \-\-env\-deny " VAR"
 Strip an environment variable. Repeatable.
+A trailing \fB*\fR makes the entry a prefix match, so
+.B \-\-env\-deny
+.I LD_*
+strips the whole loader family.
+The same applies to
+.BR \-\-env\-allow .
+.PP
+The built-in profile strips the loader, shell-startup, interpreter and
+git-helper families along with cloud, VCS and database credentials.
+It deliberately does
+.B not
+strip the
+.I *_API_KEY
+variables an agent authenticates its model provider with: removing the
+credential the sandboxed agent needs in order to start would defeat the
+tool's main purpose.
+Environment sanitization removes what the sandboxed process should not
+have; it cannot protect a secret deliberately handed to it.
 .TP
 .B \-\-no\-env\-sanitize
 Do not strip dangerous environment variables.
@@ -76,16 +175,96 @@ Do not strip dangerous environment variables.
 .TP
 .B \-\-dry\-run
 Show what restrictions would be applied without executing the command.
+Implies
+.BR \-\-verbose .
+.TP
+.BI \-\-dump\-profile " NAME"
+Resolve
+.I NAME
+the way a real run would and print the effective policy as
+.B .conf
+syntax on standard output, then exit.
+No command is needed.
+Use it to generate a profile file that is guaranteed to match what the
+binary enforces:
+.RS
+.nf
+
+compartment-user \-\-dump\-profile ai\-agent | sudo tee /etc/compartment/my\-agent.conf
+
+.fi
+.RE
 .TP
 .B \-\-verbose
-Print actions to stderr.
+Print actions to stderr, including the resolved profile and its source.
 .TP
 .B \-\-audit
 Log events to stderr and to a file.
 .TP
 .BI \-\-audit\-log " DIR"
 Set audit log directory (implies \fB\-\-audit\fR).
-Default: \fI/var/tmp/compartment-audit-$UID/\fR.
+The directory must be owned by the effective uid and must not be group- or
+world-writable; it is opened with
+.B O_DIRECTORY
+and
+.B O_NOFOLLOW
+and the daily file is created relative to that descriptor, so neither the
+directory nor the file may be a symlink.
+If auditing was requested and cannot be set up safely,
+.B compartment-user
+refuses to run.
+.PP
+An operator-chosen directory that lies inside a granted
+.B rw
+or
+.B rwx
+path is reachable by the sandboxed process, which can then read and
+rewrite the trail. Choose one that no path rule covers.
+.PP
+Without
+.BR \-\-audit\-log ,
+the default is chosen in this order:
+.RS
+.IP 1. 4
+.IR /var/lib/compartment/audit/ UID ,
+if an administrator provisioned it. It is used only when the parent
+.I /var/lib/compartment/audit
+is owned by root and is not group- or world-writable, and the per-uid
+directory is a real directory owned by the caller's real uid with mode
+0700. Provision it with:
+.RS
+.nf
+
+install \-d \-m 0755 \-o root \-g root /var/lib/compartment/audit
+install \-d \-m 0700 \-o USER /var/lib/compartment/audit/UID
+
+.fi
+.RE
+.IP 2.
+.IR /var/tmp/compartment\-audit\- UID ,
+created mode 0700. Because
+.I /var/tmp
+is sticky and world-writable, another user can create that name first:
+if the directory is found with a different owner or a mode other than
+0700,
+.B compartment-user
+refuses to run rather than appending to it.
+.IP 3.
+.I /var/log/compartment
+when running as root, created mode 0700.
+.RE
+.PP
+Neither default is inside a path the built-in profiles grant for writing,
+so the sandboxed process cannot rewrite its own audit trail. Note that
+.I /var/lib
+is granted
+.B ro
+by the built-in
+.B ai-agent
+profile, so a log kept there is readable — though not writable or
+removable — from inside the sandbox;
+.I /var/tmp
+is covered by no rule at all and is therefore neither.
 .TP
 .B \-\-unsecure
 Allow execution when enforcement is degraded.
@@ -149,8 +328,31 @@ shell), the program enters shell-replacement mode:
 it applies the
 .B ai-agent
 profile and execs the real shell from the stash directory
-(compile-time \fBREAL_SHELL_DIR\fR or the \fBCOMPARTMENT_SHELL_DIR\fR
-environment variable).
+(compile-time \fBREAL_SHELL_DIR\fR, or the \fBCOMPARTMENT_SHELL_DIR\fR
+environment variable when that names a directory worth trusting).
+The profile is read from
+.I /etc/compartment/ai-agent.conf
+or the compiled-in default;
+.I $HOME
+is never searched in this mode.
+.PP
+.B COMPARTMENT_SHELL_DIR
+is caller-supplied, so it is honoured only when it is an absolute path
+with no \fB..\fR component and both the directory and the shell binary
+inside it are owned by root or by the real uid of the caller and are
+neither group- nor world-writable.
+Otherwise it is ignored with a warning on standard error and the
+compile-time
+.B REAL_SHELL_DIR
+is used instead.
+Either way the sandbox is applied before the exec: an accepted
+.B COMPARTMENT_SHELL_DIR
+changes which binary runs, never whether it is confined.
+.PP
+Shell-replacement mode performs the same preflight check, ambient
+capability clearing,
+.BR PR_SET_DUMPABLE (2)
+reset and file-descriptor cleanup as the normal path.
 .PP
 .B "IMPORTANT:"
 Shell-replacement mode
@@ -192,7 +394,7 @@ block ptrace
 block mount
 
 # Environment
-env-deny LD_PRELOAD
+env-deny LD_*
 
 # Features
 landlock on
@@ -250,7 +452,7 @@ Preview the policy:
 .B compartment-user \-\-dry\-run \-\- claude
 .TP
 Read-only SSH client:
-.B compartment-user \-\-profile ssh.conf \-\- ssh user@host
+.B compartment-user \-\-profile ./examples/ssh.conf \-\- ssh user@host
 .TP
 Check kernel support:
 .B compartment-user \-\-verify
@@ -263,7 +465,10 @@ Command executed successfully under sandbox.
 Configuration error, missing command, or profile load failure.
 .TP
 .B 126
-Shell-replacement mode failed (enforcement error or path traversal rejected).
+Reserved. Shell-replacement mode no longer refuses to run: a rejected
+.B COMPARTMENT_SHELL_DIR
+is a warning and a fall back to the compile-time stash directory, and an
+enforcement failure is logged to syslog.
 .TP
 .B 127
 Command not found or not executable under Landlock restrictions.
@@ -275,8 +480,12 @@ Per-user profile files.
 .I /etc/compartment/*.conf
 System-wide profile files.
 .TP
-.I /var/tmp/compartment-audit-$UID/
-Default audit log directory (one file per day).
+.IR /var/lib/compartment/audit/ UID /
+Preferred audit log directory when an administrator has provisioned it
+(one file per day).
+.TP
+.IR /var/tmp/compartment\-audit\- UID /
+Fallback audit log directory.
 .SH REQUIREMENTS
 Linux >= 5.13 (Landlock). seccomp BPF requires >= 3.17.
 No external libraries.

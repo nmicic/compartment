@@ -9,10 +9,11 @@ tests/probes/deny_probe
 *.a
 *.so
 
-# ...but the test discovery directories are not build artifacts. Without
-# these, "*.d" silently swallows every suite dropped into them.
-!tests/scripts/root.d/
-!tests/scripts/rootless.d/
+# ...but the test discovery directories are not build artifacts: "*.d" above
+# matches the directory names tests/scripts/root.d and tests/scripts/rootless.d,
+# and git will not descend into an excluded directory, so every suite dropped
+# into them would be silently untracked. Re-include the directories themselves.
+!tests/scripts/*.d/
 
 # Generated headers (config.py output)
 config.h

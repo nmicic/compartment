@@ -44,6 +44,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <pwd.h>
+#include <grp.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -56,7 +57,7 @@
 /* ── Constants ─────────────────────────────────────────────────────── */
 
 #define MAX_PATHS         64
-#define MAX_BLOCKED_SC    64
+#define MAX_BLOCKED_SC    256
 #define MAX_ALLOWED_SC    512
 #define MAX_ENV_VARS      64
 #define MAX_LINE          1024
@@ -498,6 +499,100 @@ static inline int resolve_cap(const char *name)
     return -1;
 }
 
+/* ── Allocation helper ──────────────────────────────────────────── */
+
+/* A sandboxing tool must never continue with a partially materialised
+ * policy: a NULL path or environment-variable name silently drops a rule
+ * (or is dereferenced later). Fail loudly instead of degrading. */
+static inline char *xstrdup(const char *s)
+{
+    char *p = strdup(s);
+    if (!p) {
+        fputs("compartment: out of memory\n", stderr);
+        exit(1);
+    }
+    return p;
+}
+
+/* ── Policy array appends (fail closed, never silently truncate) ── */
+
+/* Each helper returns 0 on success, or prints a diagnostic and returns -1
+ * when the fixed-size array is full. Silent truncation drops rules the
+ * operator explicitly asked for: with the old 64-entry blocked-syscall
+ * array, adding a handful of --block flags on top of the built-in
+ * ai-agent profile deleted pidfd_getfd, mount_setattr, ioperm and iopl
+ * from the policy with no output at all. */
+static inline int policy_full(const char *where, const char *what,
+                              const char *item, int limit)
+{
+    fprintf(stderr, "compartment: %s: %s limit (%d) reached adding '%s' — "
+            "refusing to run with a truncated policy\n",
+            where, what, limit, item);
+    return -1;
+}
+
+/* dup != 0 duplicates the string; use it whenever the source is a parse
+ * buffer rather than argv or a string literal. */
+static inline int cfg_add_path(Config *c, const char *where,
+                               const char *path, PathMode mode, int dup)
+{
+    if (c->path_count >= MAX_PATHS)
+        return policy_full(where, "path", path, MAX_PATHS);
+    c->paths[c->path_count].path = dup ? xstrdup(path) : path;
+    c->paths[c->path_count].mode = mode;
+    c->path_count++;
+    return 0;
+}
+
+static inline int cfg_add_blocked(Config *c, const char *where,
+                                  const char *name, int nr)
+{
+    if (c->blocked_count >= MAX_BLOCKED_SC)
+        return policy_full(where, "blocked-syscall", name, MAX_BLOCKED_SC);
+    c->blocked_syscalls[c->blocked_count++] = nr;
+    return 0;
+}
+
+static inline int cfg_add_allowed(Config *c, const char *where,
+                                  const char *name, int nr)
+{
+    if (c->allowed_sc_count >= MAX_ALLOWED_SC)
+        return policy_full(where, "allowed-syscall", name, MAX_ALLOWED_SC);
+    c->allowed_syscalls[c->allowed_sc_count++] = nr;
+    c->seccomp_allow_mode = 1;
+    return 0;
+}
+
+static inline int cfg_add_env_deny(Config *c, const char *where,
+                                   const char *name, int dup)
+{
+    if (c->env_deny_count >= MAX_ENV_VARS)
+        return policy_full(where, "env-deny", name, MAX_ENV_VARS);
+    c->env_deny[c->env_deny_count++] = dup ? xstrdup(name) : name;
+    return 0;
+}
+
+static inline int cfg_add_env_allow(Config *c, const char *where,
+                                    const char *name, int dup)
+{
+    if (c->env_allow_count >= MAX_ENV_VARS)
+        return policy_full(where, "env-allow", name, MAX_ENV_VARS);
+    c->env_allow[c->env_allow_count++] = dup ? xstrdup(name) : name;
+    c->env_allow_mode = 1;
+    return 0;
+}
+
+/* Generic string-array append (cgroup, cap-allow, mount-mask). */
+static inline int cfg_add_str(const char **arr, int *count, int limit,
+                              const char *where, const char *what,
+                              const char *val, int dup)
+{
+    if (*count >= limit)
+        return policy_full(where, what, val, limit);
+    arr[(*count)++] = dup ? xstrdup(val) : val;
+    return 0;
+}
+
 /* ── Boolean value parsing (case-insensitive, fail-closed) ──────── */
 
 static inline int parse_bool(const char *val, int *out)
@@ -515,22 +610,76 @@ static inline int parse_bool(const char *val, int *out)
     return -1; /* unrecognized value */
 }
 
+/* ── One-way security switches ──────────────────────────────────── */
+
+/* landlock, seccomp, no-new-privs and env-sanitize are one-way: a profile
+ * may turn a mechanism on, never off. A profile file is data — it may sit
+ * in a directory the sandboxed process can reach, and "seccomp off" in it
+ * would be a complete escape. Only the invoking user, on the command line,
+ * may disable enforcement.
+ *
+ * cli_flag names the command-line escape hatch, or is NULL when the
+ * mechanism cannot be disabled at all. */
+static inline int profile_switch(const char *where, const char *name,
+                                 const char *cli_flag, const char *val,
+                                 int *out)
+{
+    int on;
+    if (parse_bool(val, &on) != 0) {
+        fprintf(stderr, "compartment: %s: invalid value for %s: '%s' "
+                "(use on/off)\n", where, name, val);
+        return -1;
+    }
+    if (!on) {
+        fprintf(stderr, "compartment: %s: '%s off' is not allowed in a "
+                "profile — a profile may only tighten policy.\n",
+                where, name);
+        if (cli_flag)
+            fprintf(stderr, "  Pass %s on the command line if you really "
+                    "need to disable it.\n", cli_flag);
+        else
+            fprintf(stderr, "  %s cannot be disabled.\n", name);
+        return -1;
+    }
+    *out = 1;
+    return 0;
+}
+
+/* ── $HOME sanity ───────────────────────────────────────────────── */
+
+/* $HOME reaches the policy twice: the built-in ai-agent profile adds it as
+ * a read-write-execute Landlock root, and profiles expand it inside path
+ * values. It is entirely caller-supplied, and Landlock is additive, so
+ * HOME=/ used to grant "rwx /" — every path not named by a narrower rule
+ * became writable, bounded only by DAC.
+ *
+ * Returns home on success, or NULL with *why set to a short reason. */
+static inline const char *home_dir_usable(const char *home, const char **why)
+{
+    struct stat st;
+    if (!home || home[0] == '\0')  { *why = "not set";                 return NULL; }
+    if (home[0] != '/')            { *why = "not an absolute path";    return NULL; }
+    if (strcmp(home, "/") == 0)    { *why = "the filesystem root";     return NULL; }
+    if (stat(home, &st) != 0)      { *why = strerror(errno);           return NULL; }
+    if (!S_ISDIR(st.st_mode))      { *why = "not a directory";         return NULL; }
+    if (st.st_uid != getuid())     { *why = "not owned by you";        return NULL; }
+    return home;
+}
+
 /* ── Variable expansion ($HOME, $USER only) ─────────────────────── */
 
 static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
 {
     if (!strchr(input, '$')) return input;
 
-    const char *home = getenv("HOME");
+    const char *why = NULL;
+    const char *home = home_dir_usable(getenv("HOME"), &why);
     const char *user = getenv("USER");
     if (!user) {
         struct passwd *pw = getpwuid(getuid());
         user = pw ? pw->pw_name : NULL;
     }
 
-    /* Treat empty values same as unset — prevents "$HOME/.ssh"
-     * from resolving to "/.ssh" (filesystem root) when HOME="" */
-    if (home && home[0] == '\0') home = NULL;
     if (user && user[0] == '\0') user = NULL;
 
     size_t pos = 0;
@@ -564,14 +713,181 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
 
 /* ── Profile file loading ───────────────────────────────────────── */
 
-/* Forward declaration needed because load_profile_file calls
- * resolve_and_load_profile for "inherit" directives. */
-static inline int resolve_and_load_profile(Config *cfg, const char *name, int depth);
+/* Resolution flags. A profile file is policy: whoever can write it
+ * decides what the sandbox does, so where we are willing to look for one
+ * and who we are willing to accept it from are explicit choices. */
+#define PROFILE_SEARCH_USER  (1u << 0)  /* also search $HOME/.config/compartment */
+#define PROFILE_OWNER_ROOT   (1u << 1)  /* file and directory must be root-owned */
 
-static inline int load_profile_file(Config *cfg, const char *path, int depth)
+/* Three-way result. "not found" lets the caller keep searching or fall
+ * back to a built-in; "error" means the file exists but its contents are
+ * not trustworthy, and nothing may run. Collapsing the two was how a
+ * rejected profile still got its already-parsed lines applied. */
+#define PROFILE_OK         0
+#define PROFILE_NOT_FOUND  1
+#define PROFILE_ERROR    (-1)
+
+
+/* ── Profile file trust ─────────────────────────────────────────── */
+
+/* umask 002 plus user-private groups — the default for interactive users
+ * on Debian/Ubuntu and Fedora — leaves everything you create at 0664 or
+ * 0775. Group-write is then no wider than owner-write, because the group
+ * has exactly one member: you. Tolerate that single case and nothing
+ * else. A root-owned object never qualifies, so /etc policy files and
+ * every compartment-root profile keep the strict rule. */
+static inline int group_is_private(uid_t owner, gid_t gid)
 {
-    FILE *fp = fopen(path, "re");  /* "e" = O_CLOEXEC */
-    if (!fp) return -1;
+    if (owner == 0 || owner != getuid() || gid != getgid())
+        return 0;
+    struct group *gr = getgrgid(gid);
+    if (!gr || !gr->gr_mem)
+        return 0;
+    struct passwd *pw = getpwuid(owner);
+    for (char **m = gr->gr_mem; *m; m++)
+        if (!pw || strcmp(*m, pw->pw_name) != 0)
+            return 0;   /* somebody else is in the group */
+    return 1;
+}
+
+/* Check the object behind an already-open fd, so the thing we validate
+ * and the thing we read are the same inode. A policy source must be the
+ * expected type, must be owned by root or by the real uid of the caller
+ * (root only when PROFILE_OWNER_ROOT is set), and must not be writable by
+ * group or other. */
+static inline int profile_fd_trusted(int fd, unsigned flags, mode_t want_type,
+                                     const char *what, const char *path)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "compartment: %s %s: %s\n", what, path, strerror(errno));
+        return -1;
+    }
+    if ((st.st_mode & S_IFMT) != want_type) {
+        fprintf(stderr, "compartment: %s %s: not a %s\n", what, path,
+                want_type == S_IFDIR ? "directory" : "regular file");
+        return -1;
+    }
+    if (st.st_uid != 0 &&
+        ((flags & PROFILE_OWNER_ROOT) || st.st_uid != getuid())) {
+        fprintf(stderr, "compartment: %s %s is owned by uid %u — it must be "
+                "owned by root%s\n", what, path, (unsigned)st.st_uid,
+                (flags & PROFILE_OWNER_ROOT) ? "" : " or by you");
+        return -1;
+    }
+    /* A sticky directory (/tmp, /var/tmp) may be world-writable: the
+     * sticky bit is exactly what stops anyone but the owner from
+     * unlinking or renaming the file inside it, which is the only way a
+     * third party could swap the policy we just validated. Regular files
+     * get no such exemption. */
+    mode_t bad = st.st_mode & (S_IWGRP | S_IWOTH);
+    if ((bad & S_IWGRP) && group_is_private(st.st_uid, st.st_gid))
+        bad &= (mode_t)~S_IWGRP;
+    if ((want_type == S_IFDIR) && (st.st_mode & S_ISVTX))
+        bad = 0;
+    if (bad) {
+        fprintf(stderr, "compartment: %s %s is mode %04o — group- or "
+                "world-writable policy is not trusted\n",
+                what, path, (unsigned)(st.st_mode & 07777));
+        fprintf(stderr, "  fix with: chmod go-w %s\n", path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Anyone who can write the containing directory can replace the file, or
+ * repoint a symlink at one they own, so the directory needs the same
+ * check as the file. */
+static inline int profile_dir_trusted(const char *path, unsigned flags)
+{
+    char dir[PATH_MAX];
+    size_t plen = strlen(path);
+    if (plen >= sizeof(dir)) {
+        fprintf(stderr, "compartment: profile path too long: %s\n", path);
+        return -1;
+    }
+    memcpy(dir, path, plen + 1);
+
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        dir[0] = '.'; dir[1] = '\0';
+    } else if (slash == dir) {
+        dir[1] = '\0';               /* "/x.conf" -> "/" */
+    } else {
+        *slash = '\0';
+    }
+
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        fprintf(stderr, "compartment: profile directory %s: %s\n",
+                dir, strerror(errno));
+        return -1;
+    }
+    int r = profile_fd_trusted(dfd, flags, S_IFDIR, "profile directory", dir);
+    close(dfd);
+    return r;
+}
+
+/* Open a profile file for reading, refusing anything an untrusted user
+ * could have written. Symlinks are followed — /etc/alternatives-style
+ * indirection is legitimate — but the target, the directory named by the
+ * path, and (when they differ) the directory the target really lives in
+ * all have to pass. On failure *rc carries PROFILE_NOT_FOUND or
+ * PROFILE_ERROR. */
+static inline FILE *profile_fopen_trusted(const char *path, unsigned flags,
+                                          int *rc)
+{
+    *rc = PROFILE_ERROR;
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            *rc = PROFILE_NOT_FOUND;
+            return NULL;
+        }
+        fprintf(stderr, "compartment: profile %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+
+    if (profile_fd_trusted(fd, flags, S_IFREG, "profile", path) != 0) {
+        close(fd);
+        return NULL;
+    }
+    if (profile_dir_trusted(path, flags) != 0) {
+        close(fd);
+        return NULL;
+    }
+
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved) && strcmp(resolved, path) != 0 &&
+        profile_dir_trusted(resolved, flags) != 0) {
+        close(fd);
+        return NULL;
+    }
+
+    FILE *fp = fdopen(fd, "r");
+    if (!fp) {
+        fprintf(stderr, "compartment: profile %s: %s\n", path, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    *rc = PROFILE_OK;
+    return fp;
+}
+
+/* Forward declaration needed because the loader calls
+ * resolve_and_load_profile for "inherit" directives. */
+static inline int resolve_and_load_profile(Config *cfg, const char *name,
+                                           int depth, unsigned flags);
+static inline int load_profile_file(Config *cfg, const char *path, int depth,
+                                    unsigned flags);
+
+static inline int load_profile_into(Config *cfg, const char *path, int depth,
+                                    unsigned flags)
+{
+    int orc;
+    FILE *fp = profile_fopen_trusted(path, flags, &orc);
+    if (!fp) return orc;
 
     char line[MAX_LINE];
     char expanded[PATH_MAX];
@@ -591,13 +907,30 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             fprintf(stderr, "compartment: %s:%d: error: line too long "
                     "(max %d chars)\n", path, lineno, MAX_LINE - 2);
             fclose(fp);
-            return -1;
+            return PROFILE_ERROR;
         }
 
-        /* Skip blank lines and comments */
+        /* Strip an inline comment, then right-trim.
+         *
+         * A '#' that begins a whitespace-separated token starts a comment;
+         * a '#' inside a token stays literal, so a path such as
+         * "/tmp/issue#42" still works. Without this, "ro /usr  # libs"
+         * became the literal path "/usr  # libs" (no rule installed) and
+         * "env-deny LD_PRELOAD  # injection" stripped nothing. */
+        for (char *q = line; *q; q++) {
+            if (*q == '#' && (q == line || q[-1] == ' ' || q[-1] == '\t')) {
+                *q = '\0';
+                break;
+            }
+        }
+        len = strlen(line);
+        while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t'))
+            line[--len] = '\0';
+
+        /* Skip blank lines and comment-only lines */
         const char *s = line;
         while (*s == ' ' || *s == '\t') s++;
-        if (*s == '\0' || *s == '#') continue;
+        if (*s == '\0') continue;
 
         char directive[64] = "";
         char value[MAX_LINE] = "";
@@ -606,65 +939,39 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
 
         const char *val = expand_var(value, expanded, sizeof(expanded));
         if (!val) {
-            fprintf(stderr, "compartment: %s:%d: path too long after "
-                    "variable expansion\n", path, lineno);
+            fprintf(stderr, "compartment: %s:%d: cannot expand '%s' "
+                    "($HOME or $USER unset or unusable, or the result is "
+                    "too long)\n", path, lineno, value);
             fclose(fp);
-            return -1;
+            return PROFILE_ERROR;
         }
 
+        /* Location prefix for policy-limit diagnostics */
+        char where[PATH_MAX + 24];
+        snprintf(where, sizeof(where), "%s:%d", path, lineno);
+
         if (strcmp(directive, "ro") == 0) {
-            if (cfg->path_count < MAX_PATHS) {
-                cfg->paths[cfg->path_count].path = strdup(val);
-                cfg->paths[cfg->path_count].mode = PATH_RO;
-                cfg->path_count++;
-            } else {
-                fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",
-                        path, lineno, MAX_PATHS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_path(cfg, where, val, PATH_RO, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "rw") == 0) {
-            if (cfg->path_count < MAX_PATHS) {
-                cfg->paths[cfg->path_count].path = strdup(val);
-                cfg->paths[cfg->path_count].mode = PATH_RW;
-                cfg->path_count++;
-            } else {
-                fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",
-                        path, lineno, MAX_PATHS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_path(cfg, where, val, PATH_RW, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "exec") == 0) {
-            if (cfg->path_count < MAX_PATHS) {
-                cfg->paths[cfg->path_count].path = strdup(val);
-                cfg->paths[cfg->path_count].mode = PATH_EXEC;
-                cfg->path_count++;
-            } else {
-                fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",
-                        path, lineno, MAX_PATHS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_path(cfg, where, val, PATH_EXEC, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "rwx") == 0) {
-            if (cfg->path_count < MAX_PATHS) {
-                cfg->paths[cfg->path_count].path = strdup(val);
-                cfg->paths[cfg->path_count].mode = PATH_RWX;
-                cfg->path_count++;
-            } else {
-                fprintf(stderr, "compartment: %s:%d: error: path limit (%d) reached, refusing to weaken policy\n",
-                        path, lineno, MAX_PATHS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_path(cfg, where, val, PATH_RWX, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "block") == 0) {
             int nr = resolve_syscall(val);
-            if (nr >= 0 && cfg->blocked_count < MAX_BLOCKED_SC)
-                cfg->blocked_syscalls[cfg->blocked_count++] = nr;
-            else if (nr >= 0) {
-                fprintf(stderr, "compartment: %s:%d: error: blocked syscall limit (%d) reached, refusing to weaken policy\n",
-                        path, lineno, MAX_BLOCKED_SC);
-                fclose(fp);
-                return -1;
+            if (nr >= 0) {
+                if (cfg_add_blocked(cfg, where, val, nr) != 0) {
+                    fclose(fp); return PROFILE_ERROR;
+                }
             } else {
                 /* Cannot distinguish arch-absent syscalls (e.g. ioperm on
                  * aarch64) from genuine typos — both return -1. Warn loudly
@@ -676,14 +983,10 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             }
         } else if (strcmp(directive, "allow") == 0) {
             int nr = resolve_syscall(val);
-            if (nr >= 0 && cfg->allowed_sc_count < MAX_ALLOWED_SC) {
-                cfg->allowed_syscalls[cfg->allowed_sc_count++] = nr;
-                cfg->seccomp_allow_mode = 1;
-            } else if (nr >= 0) {
-                fprintf(stderr, "compartment: %s:%d: error: allowed syscall limit (%d) reached, refusing to weaken policy\n",
-                        path, lineno, MAX_ALLOWED_SC);
-                fclose(fp);
-                return -1;
+            if (nr >= 0) {
+                if (cfg_add_allowed(cfg, where, val, nr) != 0) {
+                    fclose(fp); return PROFILE_ERROR;
+                }
             } else {
                 fprintf(stderr, "compartment: %s:%d: warning: unknown syscall '%s' "
                         "— allow NOT applied (typo? or arch-specific syscall)\n",
@@ -695,23 +998,12 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             else
                 cfg->seccomp_allow_mode = 0;
         } else if (strcmp(directive, "env-deny") == 0) {
-            if (cfg->env_deny_count < MAX_ENV_VARS)
-                cfg->env_deny[cfg->env_deny_count++] = strdup(val);
-            else {
-                fprintf(stderr, "compartment: %s:%d: error: env-deny limit (%d) reached, refusing to weaken policy\n",
-                        path, lineno, MAX_ENV_VARS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_env_deny(cfg, where, val, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "env-allow") == 0) {
-            if (cfg->env_allow_count < MAX_ENV_VARS) {
-                cfg->env_allow[cfg->env_allow_count++] = strdup(val);
-                cfg->env_allow_mode = 1;
-            } else {
-                fprintf(stderr, "compartment: %s:%d: error: env-allow limit (%d) reached, refusing to weaken policy\n",
-                        path, lineno, MAX_ENV_VARS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_env_allow(cfg, where, val, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "env-mode") == 0) {
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
@@ -719,48 +1011,44 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             else
                 cfg->env_allow_mode = 0;
         } else if (strcmp(directive, "workdir") == 0) {
-            cfg->workdir = strdup(val);
+            cfg->workdir = xstrdup(val);
         } else if (strcmp(directive, "landlock") == 0) {
-            if (parse_bool(val, &cfg->use_landlock) != 0) {
-                fprintf(stderr, "compartment: %s:%d: invalid value for landlock: '%s' (use on/off)\n", path, lineno, val);
-                fclose(fp); return -1;
+            if (profile_switch(where, "landlock", "--no-landlock", val, &cfg->use_landlock) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "seccomp") == 0) {
-            if (parse_bool(val, &cfg->use_seccomp) != 0) {
-                fprintf(stderr, "compartment: %s:%d: invalid value for seccomp: '%s' (use on/off)\n", path, lineno, val);
-                fclose(fp); return -1;
+            if (profile_switch(where, "seccomp", "--no-seccomp", val, &cfg->use_seccomp) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "no-new-privs") == 0) {
-            if (parse_bool(val, &cfg->use_no_new_privs) != 0) {
-                fprintf(stderr, "compartment: %s:%d: invalid value for no-new-privs: '%s' (use on/off)\n", path, lineno, val);
-                fclose(fp); return -1;
+            if (profile_switch(where, "no-new-privs", NULL, val, &cfg->use_no_new_privs) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "env-sanitize") == 0) {
-            if (parse_bool(val, &cfg->use_env_sanitize) != 0) {
-                fprintf(stderr, "compartment: %s:%d: invalid value for env-sanitize: '%s' (use on/off)\n", path, lineno, val);
-                fclose(fp); return -1;
+            if (profile_switch(where, "env-sanitize", "--no-env-sanitize", val, &cfg->use_env_sanitize) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "audit") == 0) {
             if (parse_bool(val, &cfg->audit) != 0) {
                 fprintf(stderr, "compartment: %s:%d: invalid value for audit: '%s' (use on/off)\n", path, lineno, val);
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "audit-log") == 0) {
-            cfg->audit_log_dir = strdup(val);
+            cfg->audit_log_dir = xstrdup(val);
             cfg->audit = 1;
         } else if (strcmp(directive, "inherit") == 0) {
             if (depth >= MAX_INHERIT_DEPTH) {
                 fprintf(stderr, "compartment: %s:%d: inherit depth limit reached\n",
                         path, lineno);
                 fclose(fp);
-                return -1;
+                return PROFILE_ERROR;
             }
             /* Try loading the inherited profile. Search order:
              * 1. Same directory as the current profile file
              * 2. Standard search paths (~/.config/compartment/, /etc/compartment/)
              * This ensures "inherit ai-agent" works when strict.conf and
              * ai-agent.conf sit in the same directory. */
-            int found = -1;
+            int found = PROFILE_NOT_FOUND;
             if (!strchr(val, '/')) {
                 /* Extract directory from current profile path */
                 char dir_copy[PATH_MAX];
@@ -772,21 +1060,30 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                     int n = snprintf(sibling, sizeof(sibling),
                                      "%s/%s.conf", dir_copy, val);
                     if (n > 0 && (size_t)n < sizeof(sibling))
-                        found = load_profile_file(cfg, sibling, depth + 1);
+                        found = load_profile_file(cfg, sibling, depth + 1, flags);
                 }
             }
-            if (found != 0)
-                found = resolve_and_load_profile(cfg, val, depth + 1);
-            if (found != 0) {
+            if (found == PROFILE_NOT_FOUND)
+                found = resolve_and_load_profile(cfg, val, depth + 1, flags);
+            if (found == PROFILE_NOT_FOUND) {
                 fprintf(stderr, "compartment: %s:%d: inherited profile '%s' "
                         "not found\n", path, lineno, val);
                 fclose(fp);
-                return -1;
+                return PROFILE_ERROR;
+            }
+            if (found != PROFILE_OK) {
+                /* Diagnostic already printed by the inner load. */
+                fprintf(stderr, "compartment: %s:%d: inherited profile '%s' "
+                        "was rejected\n", path, lineno, val);
+                fclose(fp);
+                return PROFILE_ERROR;
             }
         /* ── Root-specific directives (compartment-root only) ─────── */
         } else if (strcmp(directive, "rootdir") == 0) {
-            free(cfg->rootdir);
-            cfg->rootdir = strdup(val);
+            /* No free(): on a failed transaction the caller still owns
+             * the previous value. A few bytes leak per overridden
+             * directive, which a short-lived launcher can afford. */
+            cfg->rootdir = xstrdup(val);
         } else if (strcmp(directive, "uid") == 0) {
             char *endptr;
             errno = 0;
@@ -796,7 +1093,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 fprintf(stderr, "compartment: %s:%d: invalid uid: %s\n",
                         path, lineno, val);
                 fclose(fp);
-                return -1;
+                return PROFILE_ERROR;
             }
             cfg->uid = (uid_t)v;
         } else if (strcmp(directive, "gid") == 0) {
@@ -808,46 +1105,35 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 fprintf(stderr, "compartment: %s:%d: invalid gid: %s\n",
                         path, lineno, val);
                 fclose(fp);
-                return -1;
+                return PROFILE_ERROR;
             }
             cfg->gid = (gid_t)v;
         } else if (strcmp(directive, "username") == 0) {
-            free(cfg->username);
-            cfg->username = strdup(val);
+            /* No free(): on a failed transaction the caller still owns
+             * the previous value. A few bytes leak per overridden
+             * directive, which a short-lived launcher can afford. */
+            cfg->username = xstrdup(val);
         } else if (strcmp(directive, "netns") == 0) {
-            free(cfg->netns);
-            cfg->netns = strdup(val);
+            /* No free(): on a failed transaction the caller still owns
+             * the previous value. A few bytes leak per overridden
+             * directive, which a short-lived launcher can afford. */
+            cfg->netns = xstrdup(val);
         } else if (strcmp(directive, "cgroup") == 0) {
-            if (cfg->cgroups_count < MAX_PATHS)
-                cfg->cgroups[cfg->cgroups_count++] = strdup(val);
-            else {
-                fprintf(stderr, "compartment: %s:%d: error: cgroup limit (%d) reached\n",
-                        path, lineno, MAX_PATHS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_str(cfg->cgroups, &cfg->cgroups_count, MAX_PATHS, where, "cgroup", val, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "cap-allow") == 0) {
-            if (cfg->cap_allowed_count < MAX_ENV_VARS)
-                cfg->cap_allowed_names[cfg->cap_allowed_count++] = strdup(val);
-            else {
-                fprintf(stderr, "compartment: %s:%d: error: cap-allow limit (%d) reached\n",
-                        path, lineno, MAX_ENV_VARS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_str(cfg->cap_allowed_names, &cfg->cap_allowed_count, MAX_ENV_VARS, where, "cap-allow", val, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "loopback") == 0) {
             if (parse_bool(val, &cfg->loopback) != 0) {
                 fprintf(stderr, "compartment: %s:%d: invalid value for loopback: '%s' (use on/off)\n", path, lineno, val);
-                fclose(fp); return -1;
+                fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "mount-mask") == 0) {
-            if (cfg->mount_mask_count < MAX_PATHS)
-                cfg->mount_masks[cfg->mount_mask_count++] = strdup(val);
-            else {
-                fprintf(stderr, "compartment: %s:%d: error: mount-mask limit (%d) reached\n",
-                        path, lineno, MAX_PATHS);
-                fclose(fp);
-                return -1;
+            if (cfg_add_str(cfg->mount_masks, &cfg->mount_mask_count, MAX_PATHS, where, "mount-mask", val, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
             }
         } else {
             /* Warn on unknown directives — typos silently weakening
@@ -857,39 +1143,101 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         }
     }
     fclose(fp);
-    return 0;
+    return PROFILE_OK;
 }
 
-static inline int resolve_and_load_profile(Config *cfg, const char *name, int depth)
+/* Transactional wrapper: parse into a scratch Config and commit only if
+ * the whole file (including anything it inherits) parsed cleanly.
+ * Without this, a profile rejected on line N had already applied lines
+ * 1..N-1 — and the caller then layered the built-in on top and reported
+ * the result as "(built-in)". */
+static inline int load_profile_file(Config *cfg, const char *path, int depth,
+                                    unsigned flags)
+{
+    Config tmp = *cfg;   /* arrays are by value; strings added to tmp and
+                          * then discarded leak, which is fine because a
+                          * rejected profile always ends the process */
+    int rc = load_profile_into(&tmp, path, depth, flags);
+    if (rc == PROFILE_OK)
+        *cfg = tmp;
+    return rc;
+}
+
+/* Print, for a name that could not be resolved, exactly where we looked.
+ * An explicit path is not a search — say so instead of inventing
+ * "~/.config/compartment//abs/path.conf". */
+static inline void profile_print_search_path(FILE *out, const char *name,
+                                             unsigned flags)
+{
+    if (strchr(name, '/')) {
+        fprintf(out, "  looked for the file: %s\n", name);
+        return;
+    }
+    size_t nl = strlen(name);
+    if (nl > 5 && strcmp(name + nl - 5, ".conf") == 0)
+        fprintf(out, "  '%s' has no '/', so it was treated as a profile name "
+                "and '.conf' was appended.\n  To load a file in the current "
+                "directory, write ./%s\n", name, name);
+    fprintf(out, "  searched: /etc/compartment/%s.conf", name);
+    if (flags & PROFILE_SEARCH_USER)
+        fprintf(out, ", ~/.config/compartment/%s.conf", name);
+    else if (!(flags & PROFILE_OWNER_ROOT))
+        fprintf(out, "  (pass --user-profiles to also search "
+                "~/.config/compartment/)");
+    fputc('\n', out);
+}
+
+/* Search order:
+ *   1. an explicit --profile /path/file.conf (a name containing '/')
+ *   2. /etc/compartment/<name>.conf
+ *   3. $HOME/.config/compartment/<name>.conf — compartment-user only, and
+ *      only when the caller passed --user-profiles
+ *   4. the caller's built-in
+ *
+ * $HOME used to come first, which meant the sandboxed process could write
+ * its own next-run policy: the built-in ai-agent profile grants RWX on
+ * $HOME, so an agent could drop a file there and un-sandbox every future
+ * invocation of the same command line. A profile loaded from /etc also
+ * drops PROFILE_SEARCH_USER, so a system profile can never pull in a user
+ * file through 'inherit'. */
+static inline int resolve_and_load_profile(Config *cfg, const char *name,
+                                           int depth, unsigned flags)
 {
     /* If it contains a slash, treat as explicit path */
     if (strchr(name, '/')) {
-        int r = load_profile_file(cfg, name, depth);
-        if (r == 0) cfg->profile_source = strdup(name);
+        int r = load_profile_file(cfg, name, depth, flags);
+        if (r == PROFILE_OK) cfg->profile_source = xstrdup(name);
         return r;
     }
 
-    /* Search: ~/.config/compartment/<name>.conf, /etc/compartment/<name>.conf */
-    const char *home = getenv("HOME");
     char path[PATH_MAX];
+    int r;
 
-    if (home) {
-        int n = snprintf(path, sizeof(path), "%s/.config/compartment/%s.conf", home, name);
-        if (n > 0 && (size_t)n < sizeof(path)) {
-            if (load_profile_file(cfg, path, depth) == 0) {
-                cfg->profile_source = strdup(path);
-                return 0;
+    int n = snprintf(path, sizeof(path), "/etc/compartment/%s.conf", name);
+    if (n > 0 && (size_t)n < sizeof(path)) {
+        r = load_profile_file(cfg, path, depth, flags & ~PROFILE_SEARCH_USER);
+        if (r != PROFILE_NOT_FOUND) {
+            if (r == PROFILE_OK) cfg->profile_source = xstrdup(path);
+            return r;
+        }
+    }
+
+    if (flags & PROFILE_SEARCH_USER) {
+        const char *home = getenv("HOME");
+        if (home && home[0] == '/') {
+            n = snprintf(path, sizeof(path),
+                         "%s/.config/compartment/%s.conf", home, name);
+            if (n > 0 && (size_t)n < sizeof(path)) {
+                r = load_profile_file(cfg, path, depth, flags);
+                if (r != PROFILE_NOT_FOUND) {
+                    if (r == PROFILE_OK) cfg->profile_source = xstrdup(path);
+                    return r;
+                }
             }
         }
     }
 
-    snprintf(path, sizeof(path), "/etc/compartment/%s.conf", name);
-    if (load_profile_file(cfg, path, depth) == 0) {
-        cfg->profile_source = strdup(path);
-        return 0;
-    }
-
-    return -1;  /* not found — caller falls back to built-in */
+    return PROFILE_NOT_FOUND;  /* caller falls back to a built-in */
 }
 
 /* ── PPID chain (who launched us?) ─────────────────────────────── */
@@ -924,6 +1272,22 @@ static inline int get_ppid_chain(pid_t pid, pid_t chain[], int max_len)
 
 /* ── Audit logging ───────────────────────────────────────────────── */
 
+/* Every field below is interpolated into a single-line record, and some
+ * of them (the command path, the profile name, the cwd) are chosen by
+ * whoever runs the tool. A newline in any of them forges a log record.
+ * Replace everything outside printable ASCII with '_'. */
+static inline const char *audit_scrub(const char *in, char *buf, size_t bufsz)
+{
+    size_t i = 0;
+    if (!in) in = "";
+    for (; in[i] && i + 1 < bufsz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        buf[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '_';
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
 static inline void audit_log(Config *cfg, const char *event, const char *detail)
 {
     if (!cfg->audit) return;
@@ -953,100 +1317,276 @@ static inline void audit_log(Config *cfg, const char *event, const char *detail)
     /* Get TTY */
     const char *tty = ttyname(STDIN_FILENO);
 
+    char s_user[128], s_event[128], s_cwd[PATH_MAX], s_tty[256], s_detail[1024];
+    audit_scrub(user, s_user, sizeof(s_user));
+    audit_scrub(event, s_event, sizeof(s_event));
+    audit_scrub(cwd, s_cwd, sizeof(s_cwd));
+    audit_scrub(tty ? tty : "none", s_tty, sizeof(s_tty));
+    audit_scrub(detail, s_detail, sizeof(s_detail));
+
     fprintf(stderr,
             "compartment: [%s] user=%s uid=%u event=%s ppid_chain=%s "
             "cwd=%s tty=%s %s\n",
-            ts, user, uid, event,
+            ts, s_user, uid, s_event,
             chain_str[0] ? chain_str : "?",
-            cwd, tty ? tty : "none",
-            detail ? detail : "");
+            s_cwd, s_tty, s_detail);
 
     /* Also write to audit log file if open */
     if (cfg->audit_log_fd >= 0) {
         dprintf(cfg->audit_log_fd,
                 "[%s] user=%s uid=%u event=%s ppid_chain=%s "
                 "cwd=%s tty=%s %s\n",
-                ts, user, uid, event,
+                ts, s_user, uid, s_event,
                 chain_str[0] ? chain_str : "?",
-                cwd, tty ? tty : "none",
-                detail ? detail : "");
+                s_cwd, s_tty, s_detail);
     }
 }
 
 /* ── Audit log file (must be opened BEFORE Landlock — fd survives) ── */
 
+/* ── Audit log directory ─────────────────────────────────────────── */
+
+/* Where the default log goes matters as much as how it is opened: the
+ * built-in ai-agent profile grants the sandboxed process read, write and
+ * execute on $HOME, so an audit trail under $HOME (or under
+ * $XDG_STATE_HOME, which normally is $HOME) is one the confined process
+ * can rewrite. Neither of the defaults below is inside any path the
+ * built-in profiles grant for writing.
+ *
+ * An administrator can provision a per-user directory that is outside the
+ * ruleset entirely:
+ *
+ *     install -d -m 0755 -o root -g root /var/lib/compartment/audit
+ *     install -d -m 0700 -o alice        /var/lib/compartment/audit/1000
+ */
+#define AUDIT_VARLIB_PARENT "/var/lib/compartment/audit"
+
+/* The per-uid directory is only trustworthy if nobody but root can
+ * replace it, which means the parent must be root-owned and not group- or
+ * world-writable. A parent that simply does not exist is not an error —
+ * the feature is opt-in. */
+static inline int audit_varlib_parent_ok(void)
+{
+    int pfd = open(AUDIT_VARLIB_PARENT,
+                   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (pfd < 0)
+        return 0;                       /* not provisioned; stay quiet */
+
+    struct stat st;
+    int ok = (fstat(pfd, &st) == 0 && st.st_uid == 0 &&
+              !(st.st_mode & (S_IWGRP | S_IWOTH)));
+    close(pfd);
+    if (!ok)
+        fprintf(stderr, "compartment: %s must be root-owned and not group- "
+                "or world-writable — ignoring it\n", AUDIT_VARLIB_PARENT);
+    return ok;
+}
+
+/* Choose the default audit directory. No side effects: nothing is created
+ * and nothing is opened, so --dry-run can report the same answer a real
+ * run would use. */
+static inline int audit_default_dir(char *dir, size_t dirsz)
+{
+    int n;
+
+    if (geteuid() == 0) {
+        n = snprintf(dir, dirsz, "/var/log/compartment");
+        return (n > 0 && (size_t)n < dirsz) ? 0 : -1;
+    }
+
+    uid_t uid = getuid();
+
+    if (audit_varlib_parent_ok()) {
+        n = snprintf(dir, dirsz, AUDIT_VARLIB_PARENT "/%u", (unsigned)uid);
+        if (n > 0 && (size_t)n < dirsz) {
+            struct stat st;
+            if (lstat(dir, &st) == 0 && S_ISDIR(st.st_mode) &&
+                st.st_uid == uid && (st.st_mode & 07777) == 0700)
+                return 0;
+        }
+    }
+
+    n = snprintf(dir, dirsz, "/var/tmp/compartment-audit-%u", (unsigned)uid);
+    return (n > 0 && (size_t)n < dirsz) ? 0 : -1;
+}
+
+/* Open a directory that must be exactly ours: a real directory rather
+ * than a symlink, owned by want_uid, mode 0700 and nothing looser.
+ * /var/tmp is sticky and world-writable, so another user can create
+ * compartment-audit-<uid> before we do; that has to be fatal, not a
+ * directory we quietly append to. */
+static inline int audit_open_private_dir(const char *path, uid_t want_uid)
+{
+    int dfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dfd < 0) {
+        fprintf(stderr, "compartment: audit dir %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    struct stat st;
+    if (fstat(dfd, &st) != 0) {
+        fprintf(stderr, "compartment: audit dir %s: %s\n",
+                path, strerror(errno));
+        close(dfd);
+        return -1;
+    }
+    if (st.st_uid != want_uid || (st.st_mode & 07777) != 0700) {
+        fprintf(stderr, "compartment: audit dir %s is uid %u mode %04o — "
+                "expected uid %u mode 0700\n", path, (unsigned)st.st_uid,
+                (unsigned)(st.st_mode & 07777), (unsigned)want_uid);
+        close(dfd);
+        return -1;
+    }
+    return dfd;
+}
+
 static inline int audit_log_open(Config *cfg)
 {
     char dir[PATH_MAX - 32];  /* leave room for /YYYY-MM-DD.log */
+    int dfd;
 
     if (cfg->audit_log_dir) {
-        snprintf(dir, sizeof(dir), "%s", cfg->audit_log_dir);
+        /* Operator's choice: created if missing, then checked for owner
+         * and write bits. Note that an operator-chosen directory inside a
+         * granted rw/rwx path IS reachable by the sandboxed process. */
+        int n = snprintf(dir, sizeof(dir), "%s", cfg->audit_log_dir);
+        if (n < 0 || (size_t)n >= sizeof(dir)) {
+            fprintf(stderr, "compartment: audit log dir path too long\n");
+            return -1;
+        }
+        if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+            fprintf(stderr, "compartment: mkdir %s: %s\n", dir, strerror(errno));
+            return -1;
+        }
+        /* Validate the directory on its own fd, then create the day file
+         * relative to it. O_NOFOLLOW on the final component alone left
+         * the directory component followable: a symlink at the audit path
+         * redirected every record somewhere else. */
+        dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (dfd < 0) {
+            fprintf(stderr, "compartment: audit dir %s: %s\n",
+                    dir, strerror(errno));
+            return -1;
+        }
+        struct stat st;
+        if (fstat(dfd, &st) != 0) {
+            fprintf(stderr, "compartment: audit dir %s: %s\n",
+                    dir, strerror(errno));
+            close(dfd);
+            return -1;
+        }
+        mode_t bad = st.st_mode & (S_IWGRP | S_IWOTH);
+        if ((bad & S_IWGRP) && group_is_private(st.st_uid, st.st_gid))
+            bad &= (mode_t)~S_IWGRP;
+        if (st.st_uid != geteuid() || bad) {
+            fprintf(stderr, "compartment: audit dir %s is not a private, "
+                    "self-owned directory (uid %u, mode %04o)\n",
+                    dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777));
+            close(dfd);
+            return -1;
+        }
     } else {
-        snprintf(dir, sizeof(dir), "/var/tmp/compartment-audit-%u",
-                 (unsigned)getuid());
-    }
-
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
-        fprintf(stderr, "compartment: mkdir %s: %s\n", dir, strerror(errno));
-        return -1;
+        if (audit_default_dir(dir, sizeof(dir)) != 0) {
+            fprintf(stderr, "compartment: cannot determine an audit log "
+                    "directory — use --audit-log DIR\n");
+            return -1;
+        }
+        /* The admin-provisioned directory is never created here; the two
+         * fallbacks are, mode 0700 (umask cannot widen that). */
+        if (strncmp(dir, AUDIT_VARLIB_PARENT "/",
+                    sizeof(AUDIT_VARLIB_PARENT)) != 0 &&
+            mkdir(dir, 0700) != 0 && errno != EEXIST) {
+            fprintf(stderr, "compartment: mkdir %s: %s\n", dir, strerror(errno));
+            return -1;
+        }
+        dfd = audit_open_private_dir(dir, getuid());
+        if (dfd < 0) {
+            fprintf(stderr, "compartment: refusing to write the audit log "
+                    "to %s\n", dir);
+            return -1;
+        }
     }
 
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
+    char name[32];
+    strftime(name, sizeof(name), "%Y-%m-%d.log", tm);
 
-    char path[PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/", dir);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
-        fprintf(stderr, "compartment: audit log dir path too long\n");
-        return -1;
-    }
-    strftime(path + n, sizeof(path) - (size_t)n, "%Y-%m-%d.log", tm);
-
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    int fd = openat(dfd, name,
+                    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    close(dfd);
     if (fd < 0) {
-        fprintf(stderr, "compartment: open %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "compartment: open %s/%s: %s\n",
+                dir, name, strerror(errno));
         return -1;
     }
 
     cfg->audit_log_fd = fd;
     if (cfg->verbose)
-        fprintf(stderr, "compartment: audit log: %s\n", path);
+        fprintf(stderr, "compartment: audit log: %s/%s\n", dir, name);
     return 0;
 }
 
 /* ── Environment sanitize ────────────────────────────────────────── */
 
+/* A trailing '*' makes an entry a prefix, so one "LD_*" covers the whole
+ * loader family — including the variables that did not exist when the
+ * list was written. Anything else is an exact name. */
+static inline int env_name_matches(const char *pattern, const char *name)
+{
+    size_t plen = strlen(pattern);
+    if (plen > 0 && pattern[plen - 1] == '*')
+        return strncmp(pattern, name, plen - 1) == 0;
+    return strcmp(pattern, name) == 0;
+}
+
 static inline void sanitize_env(Config *cfg)
 {
+    const char **pats;
+    int npats, keep_on_match;
+
     if (cfg->env_allow_mode) {
-        /* Allow-list: save allowed values, clear everything, restore */
-        char *saved[MAX_ENV_VARS];
-        for (int i = 0; i < cfg->env_allow_count; i++) {
-            const char *val = getenv(cfg->env_allow[i]);
-            saved[i] = val ? strdup(val) : NULL;
-        }
-
-        clearenv();
-
-        for (int i = 0; i < cfg->env_allow_count; i++) {
-            if (saved[i]) {
-                setenv(cfg->env_allow[i], saved[i], 1);
-                if (cfg->verbose)
-                    fprintf(stderr, "compartment: keep %s\n",
-                            cfg->env_allow[i]);
-                free(saved[i]);
-            }
-        }
+        pats = cfg->env_allow;
+        npats = cfg->env_allow_count;
+        keep_on_match = 1;   /* allow-list: drop everything unmatched */
     } else {
-        /* Deny-list: strip specific dangerous vars */
-        for (int i = 0; i < cfg->env_deny_count; i++) {
-            if (getenv(cfg->env_deny[i])) {
-                if (cfg->verbose)
-                    fprintf(stderr, "compartment: unset %s\n",
-                            cfg->env_deny[i]);
-                unsetenv(cfg->env_deny[i]);
+        pats = cfg->env_deny;
+        npats = cfg->env_deny_count;
+        keep_on_match = 0;   /* deny-list: drop everything matched */
+    }
+
+    /* unsetenv() rebuilds environ, so find one victim, remove it, and
+     * start over. At most one pass per variable. */
+    for (;;) {
+        char *victim = NULL;
+        for (char **e = environ; *e && !victim; e++) {
+            const char *eq = strchr(*e, '=');
+            /* An entry with no '=' cannot be removed: unsetenv() reports
+             * success but leaves it in place, which would spin this loop
+             * forever. Such an entry is also invisible to getenv(), so
+             * skipping it costs nothing. A caller can only produce one by
+             * crafting envp for execve() by hand. */
+            if (!eq) continue;
+            size_t nlen = (size_t)(eq - *e);
+            if (nlen == 0) continue;
+            char *name = strndup(*e, nlen);
+            if (!name) {
+                fputs("compartment: out of memory\n", stderr);
+                exit(1);
             }
+            int matched = 0;
+            for (int i = 0; i < npats && !matched; i++)
+                matched = env_name_matches(pats[i], name);
+            if (matched == keep_on_match)
+                free(name);
+            else
+                victim = name;
         }
+        if (!victim) break;
+        if (cfg->verbose)
+            fprintf(stderr, "compartment: unset %s\n", victim);
+        unsetenv(victim);
+        free(victim);
     }
 }
 

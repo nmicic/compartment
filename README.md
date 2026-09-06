@@ -179,13 +179,25 @@ This pattern applies to any network client:
 
 **compartment-user** applies kernel-enforced restrictions before exec:
 
+Kernel-enforced, inherited across `fork`/`exec`, and impossible for the
+sandboxed process or its descendants to remove:
+
 1. `PR_SET_NO_NEW_PRIVS` — prevent privilege escalation
 2. **Landlock** — filesystem path restrictions (read-only system paths, writable workdir)
 3. **seccomp BPF** — block dangerous syscalls (ptrace, mount, kexec, bpf, io_uring, ...)
-4. **Environment sanitize** — strip LD_PRELOAD, LD_LIBRARY_PATH, etc.
-5. **Audit logging** — file-per-day log with PPID chain
 
-All restrictions are inherited by child processes and cannot be removed.
+Applied once, immediately before `exec`, and *not* kernel restrictions:
+
+4. **Environment sanitize** — strip `LD_*`, cloud credentials, SSH agent
+   socket, etc. from the environment handed to the command. A sandboxed
+   process can re-export any of them for its own children and the loader
+   will honour it; use `compartment-bpf` for durable environment policy.
+5. **Working directory** and **file-descriptor cleanup** — one-time actions.
+6. **Audit logging** — a record, not a restriction: file-per-day log with
+   PPID chain.
+
+Run-time order: audit log → preflight → no_new_privs → environment →
+Landlock → seccomp → `chdir` → hardening → `exec`.
 
 **compartment-root** creates a fully isolated container:
 
@@ -212,38 +224,63 @@ but do not yet include direct-bypass resistance tests.)
 
 ## Profile Files
 
-Both tools share the same `.conf` format:
+Both tools read the same `.conf` syntax, but each ignores the other's
+directives: `ro`/`rw`/`rwx`/`exec`/`landlock`/`workdir` mean nothing to
+compartment-root (it has no Landlock code), and
+`rootdir`/`uid`/`gid`/`username`/`netns`/`cgroup`/`cap-allow`/`loopback`/`mount-mask`
+mean nothing to compartment-user. They are parsed and silently ignored,
+not reported as unknown directives, so keep the two kinds in separate
+files.
 
 ```conf
-# Filesystem (compartment-user: Landlock)
+# compartment-user: filesystem (Landlock)
 ro /usr
-rw $HOME
-
-# Filesystem (compartment-root: namespaces)
-rootdir /srv/containers/default
-uid 1000
-gid 1000
-username svc
-loopback on
+rwx $HOME
 
 # Syscalls
 block ptrace
 block mount
 # Or allow-list mode:
+# seccomp-mode allow
 # allow read
 # allow write
 
-# Environment
-env-deny LD_PRELOAD
+# Environment ('*' at the end is a prefix match)
+env-deny LD_*
+# Or allow-list mode:
+# env-mode allow
+# env-allow PATH
 
-# Features
+# Features — a profile may only turn these on; use --no-landlock,
+# --no-seccomp or --no-env-sanitize on the command line to disable them
+landlock on
 seccomp on
 no-new-privs on
 env-sanitize on
 audit on
 ```
 
-Search order: `--profile /path/file.conf` → `~/.config/compartment/<name>.conf` → `/etc/compartment/<name>.conf` → built-in.
+```conf
+# compartment-root: namespace container
+rootdir /srv/containers/default
+uid 1000
+gid 1000
+username svc
+loopback on
+cap-allow net_bind_service
+mount-mask /proc/keys
+```
+
+Print the effective policy at any time with
+`compartment-user --dump-profile <name>`.
+
+Search order: `--profile /path/file.conf` → `/etc/compartment/<name>.conf` →
+`~/.config/compartment/<name>.conf` (compartment-user with `--user-profiles`
+only) → built-in. compartment-root searches `/etc/compartment/` only.
+
+Every profile file must be a regular file owned by root or by you (root only
+for compartment-root), in a directory with the same ownership, and neither
+may be group- or world-writable.
 
 See [HOWTO.md](HOWTO.md) for full format reference.
 

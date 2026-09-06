@@ -242,24 +242,26 @@ expect_rc  "env-deny-limit overflow refused" 1
 expect_out "env-deny-limit overflow refuses to weaken policy" "env-deny limit (64) reached"
 
 # inherit: two levels are allowed (MAX_INHERIT_DEPTH 2), three are not.
-printf 'block ptrace\nlandlock off\n'              > "${SCRATCH}/conf/c3.conf"
-printf 'inherit c3\nblock unshare\nlandlock off\n' > "${SCRATCH}/conf/c2.conf"
-printf 'inherit c2\nblock setns\nlandlock off\n'   > "${SCRATCH}/conf/c1.conf"
-printf 'inherit c1\nblock chroot\nlandlock off\n'  > "${SCRATCH}/conf/c0.conf"
+# These fixtures carry syscall rules only, so --no-landlock is passed on the
+# command line: a profile may no longer say 'landlock off' (one-way switches).
+printf 'block ptrace\n'              > "${SCRATCH}/conf/c3.conf"
+printf 'inherit c3\nblock unshare\n' > "${SCRATCH}/conf/c2.conf"
+printf 'inherit c2\nblock setns\n'   > "${SCRATCH}/conf/c1.conf"
+printf 'inherit c1\nblock chroot\n'  > "${SCRATCH}/conf/c0.conf"
 
-cu --profile "${SCRATCH}/conf/c1.conf" --dry-run -- /bin/true
+cu --profile "${SCRATCH}/conf/c1.conf" --no-landlock --dry-run -- /bin/true
 expect_rc  "inherit depth 2 accepted" 0
 expect_out "inherit depth 2 merges all three profiles" "DENY-LIST (3 blocked)"
 
-cu --profile "${SCRATCH}/conf/c0.conf" --dry-run -- /bin/true
+cu --profile "${SCRATCH}/conf/c0.conf" --no-landlock --dry-run -- /bin/true
 expect_rc  "inherit depth 3 refused" 1
 expect_out "inherit depth 3 names the depth limit" "inherit depth limit reached"
 
 # An inherit cycle must terminate rather than recurse forever.
-printf 'inherit cyc_b\nlandlock off\n' > "${SCRATCH}/conf/cyc_a.conf"
-printf 'inherit cyc_a\nlandlock off\n' > "${SCRATCH}/conf/cyc_b.conf"
+printf 'inherit cyc_b\n' > "${SCRATCH}/conf/cyc_a.conf"
+printf 'inherit cyc_a\n' > "${SCRATCH}/conf/cyc_b.conf"
 CYCLE_RC=0
-timeout 20 "${CU}" --profile "${SCRATCH}/conf/cyc_a.conf" --dry-run -- /bin/true \
+timeout 20 "${CU}" --profile "${SCRATCH}/conf/cyc_a.conf" --no-landlock --dry-run -- /bin/true \
     > /dev/null 2>&1 || CYCLE_RC=$?
 if [ "${CYCLE_RC}" -eq 124 ]; then
     fail "inherit cycle terminates (timed out — infinite recursion)"

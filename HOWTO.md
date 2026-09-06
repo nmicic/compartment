@@ -60,13 +60,56 @@ Instead of CLI flags, profiles can be defined in `.conf` files.
 compartment-user searches for them in order:
 
 1. **Explicit path** — `--profile /path/to/file.conf`
-2. **User config** — `~/.config/compartment/<name>.conf`
-3. **System config** — `/etc/compartment/<name>.conf`
+2. **System config** — `/etc/compartment/<name>.conf`
+3. **User config** — `~/.config/compartment/<name>.conf`, **only** when
+   `--user-profiles` is given, and never in shell-replacement mode
 4. **Built-in** — `ai-agent` and `strict` (compiled in)
 
-If a file is found, it is loaded. Otherwise the built-in profile is used
-(if one exists with that name). This means you can override the built-in
-`ai-agent` profile by placing a file at `~/.config/compartment/ai-agent.conf`.
+If a file is found, it is loaded. If it exists but does not parse, nothing
+runs and the exit status is non-zero — the built-in is used only when no
+file was found at all.
+
+compartment-root never looks in `$HOME`; it searches `/etc/compartment/`
+only, and requires the file to be owned by root.
+
+### Why `$HOME` is not searched by default
+
+The built-in `ai-agent` profile grants the sandboxed process read, write
+**and execute** on `$HOME`. If `~/.config/compartment/` outranked `/etc`,
+an agent could write its own next-run policy and the following invocation
+of the same command line would run unconfined. `--user-profiles` is the
+opt-in for deployments where the invoking user is trusted to write their
+own policy — an interactive developer sandboxing a build, say — and it is
+never honoured when compartment-user is standing in for a login shell.
+
+### Profile file trust
+
+Every profile file is checked on the file descriptor it is read from:
+
+* it must be a regular file;
+* it must be owned by **root** or by **you** (by root only for
+  compartment-root);
+* it must not be group- or world-writable — with one exception: a file or
+  directory that **you** own, in **your own primary group**, may be
+  group-writable when that group has no other members, because
+  `umask 002` plus user-private groups is the default on Debian, Ubuntu
+  and Fedora and group-write there is no wider than owner-write. A
+  root-owned file never qualifies, so `/etc/compartment/` and every
+  compartment-root profile keep the strict rule;
+* its containing directory must pass the same ownership and write check.
+
+Symlinks are followed, so `/etc/alternatives`-style indirection works, but
+the target and the directory the target really lives in are checked too. A
+sticky directory (`/tmp`, `/var/tmp`) may be world-writable: the sticky bit
+is what prevents anyone but the owner from replacing the file.
+
+A violation is fatal and names the fix:
+
+```
+compartment: profile /home/you/.config/compartment/ai-agent.conf is mode 0664
+— group- or world-writable policy is not trusted
+  fix with: chmod go-w /home/you/.config/compartment/ai-agent.conf
+```
 
 ### Format
 
@@ -74,7 +117,7 @@ One directive per line. Blank lines and `#` comments are ignored.
 `$HOME` and `$USER` are expanded in values.
 
 ```conf
-# ~/.config/compartment/ai-agent.conf
+# /etc/compartment/my-agent.conf
 
 # Inherit another profile (loads it first, then applies these rules on top)
 # inherit ai-agent
@@ -83,58 +126,28 @@ One directive per line. Blank lines and `#` comments are ignored.
 ro /usr
 ro /lib
 ro /lib64
-ro /lib32
 ro /etc
 ro /bin
-ro /sbin
 ro /proc
 ro /dev
-ro /sys
-ro /run
-ro /var/lib
 rw /tmp
-rw $HOME
+rwx $HOME
 
 # Syscall blocklist (seccomp)
 block ptrace
 block mount
-block umount2
-block reboot
-block kexec_load
-block kexec_file_load
-block init_module
-block finit_module
-block delete_module
-block pivot_root
-block chroot
 block unshare
-block setns
-block keyctl
-block add_key
-block request_key
 block bpf
-block userfaultfd
-block perf_event_open
-block process_vm_readv
-block process_vm_writev
-block acct
-block swapon
-block swapoff
-block settimeofday
-block clock_settime
-block clock_adjtime
-block adjtimex
 
-# Environment deny list
-env-deny LD_PRELOAD
-env-deny LD_LIBRARY_PATH
-env-deny LD_AUDIT
-env-deny DYLD_INSERT_LIBRARIES
-env-deny DYLD_LIBRARY_PATH
-env-deny _JAVA_OPTIONS
+# Environment deny list ('*' at the end is a prefix match)
+env-deny LD_*
+env-deny GLIBC_TUNABLES
+env-deny PYTHON*
+env-deny PROMPT_COMMAND
+env-deny GIT_SSH_COMMAND
 env-deny JAVA_TOOL_OPTIONS
 
-# Feature toggles (on/off)
+# Feature toggles — these may only be turned on from a profile
 landlock on
 seccomp on
 no-new-privs on
@@ -142,29 +155,148 @@ env-sanitize on
 
 # Audit logging
 audit on
-audit-log /var/tmp/compartment-audit-$USER
+audit-log /srv/audit/compartment
 
 # Working directory
 # workdir $HOME/projects
 ```
 
+That is a sketch, not the shipped policy. **Do not transcribe the
+built-in profile into a file by hand** — earlier releases of this guide
+did, and the copy drifted to 28 syscall blocks and 7 environment entries
+against a built-in that had 43 and 34, quietly dropping every
+container-escape block and all credential stripping from anyone who
+followed it.
+
+Print the real thing instead:
+
+```bash
+# See exactly what the tool would apply
+compartment-user --dump-profile ai-agent
+
+# Start a system profile from it
+compartment-user --dump-profile ai-agent | sudo tee /etc/compartment/my-agent.conf
+sudo chmod 644 /etc/compartment/my-agent.conf
+```
+
+`--dump-profile` serialises the resolved policy — built-in, file, and
+anything inherited — back into `.conf` syntax, so what you edit is what
+the binary actually enforces. `examples/ai-agent.conf` is generated the
+same way and is equivalent to the built-in.
+
 ### Directives
+
+Used by **compartment-user**:
 
 | Directive | Value | Example |
 |-----------|-------|---------|
 | `ro` | path | `ro /usr` |
-| `rw` | path | `rw $HOME` |
-| `exec` | path | `exec /opt/bin` |
-| `block` | syscall name | `block ptrace` |
-| `env-deny` | variable name | `env-deny LD_PRELOAD` |
-| `landlock` | on/off | `landlock on` |
-| `seccomp` | on/off | `seccomp on` |
-| `no-new-privs` | on/off | `no-new-privs on` |
-| `env-sanitize` | on/off | `env-sanitize on` |
-| `audit` | on/off | `audit on` |
-| `audit-log` | directory path | `audit-log /var/tmp/my-audit` |
+| `rw` | path (read + write, no execute) | `rw /tmp` |
+| `rwx` | path (read + write + execute) | `rwx $HOME` |
+| `exec` | path (alias for `ro`) | `exec /opt/bin` |
 | `workdir` | path | `workdir $HOME/projects` |
+| `landlock` | `on` only | `landlock on` |
+
+Used by **both** tools:
+
+| Directive | Value | Example |
+|-----------|-------|---------|
+| `block` | syscall name | `block ptrace` |
+| `allow` | syscall name (switches to allow-list) | `allow read` |
+| `seccomp-mode` | `allow` or `deny` | `seccomp-mode allow` |
+| `env-deny` | variable name or `PREFIX*` | `env-deny LD_*` |
+| `env-allow` | variable name or `PREFIX*` (switches to allow-list) | `env-allow PATH` |
+| `env-mode` | `allow` or `deny` | `env-mode allow` |
+| `seccomp` | `on` only | `seccomp on` |
+| `no-new-privs` | `on` only | `no-new-privs on` |
+| `env-sanitize` | `on` only | `env-sanitize on` |
+| `audit` | on/off | `audit on` |
+| `audit-log` | directory path (outside every granted path) | `audit-log /srv/audit/compartment` |
 | `inherit` | profile name | `inherit ai-agent` |
+
+Used by **compartment-root** only:
+
+| Directive | Value | Example | CLI equivalent |
+|-----------|-------|---------|----------------|
+| `rootdir` | path | `rootdir /srv/jail` | `--rootdir` |
+| `uid` | number | `uid 1000` | `--uid` |
+| `gid` | number | `gid 1000` | `--gid` |
+| `username` | user name | `username svc` | `--username` |
+| `netns` | namespace name | `netns sandbox` | `--netns` |
+| `cgroup` | cgroup path | `cgroup /sys/fs/cgroup/svc` | `--cgroup` |
+| `cap-allow` | capability name | `cap-allow net_bind_service` | `--cap-allowed` |
+| `loopback` | on/off | `loopback on` | `--loopback` |
+| `mount-mask` | path | `mount-mask /proc/keys` | `--mount-mask` |
+
+Note the one name that differs between the two spellings: the profile
+directive is `cap-allow`, the command-line flag is `--cap-allowed`.
+Writing `cap-allowed` in a profile produces only an "unknown directive"
+warning and the capability is dropped.
+
+Each tool silently ignores the other's directives — they are recognised
+by the shared parser, so no "unknown directive" warning appears. Keep
+compartment-user and compartment-root policy in separate files.
+
+### Environment name patterns
+
+A trailing `*` in an `env-deny` or `env-allow` entry makes it a prefix
+match; anything else is an exact variable name. `env-deny LD_*` covers
+`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `LD_DEBUG`, `LD_PROFILE`,
+`LD_ORIGIN_PATH` and whatever the loader grows next — which is the point,
+because an exhaustive list of injection variables goes stale the moment
+it is written. The built-in profile uses `LD_*`, `DYLD_*`, `BASH_FUNC_*`,
+`PYTHON*`, `PERL5*` and `GIT_CONFIG_*` for exactly that reason.
+
+### What the built-in profile does *not* strip
+
+The `*_API_KEY` variables an agent authenticates its model provider with
+are **deliberately left in place**. compartment-user exists to run those
+agents; stripping the key the agent needs in order to start would make
+the tool useless for its main job.
+
+Cloud, VCS and database credentials (`AWS_*` keys,
+`GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_CLIENT_SECRET`, `GITHUB_TOKEN`,
+`GH_TOKEN`, `GITLAB_TOKEN`, `NPM_TOKEN`, `DATABASE_URL`, `PGPASSWORD`,
+`MYSQL_PWD`, `SSH_AUTH_SOCK`) *are* stripped, because an agent that needs
+them is the exception rather than the rule.
+
+The honest rule: **environment sanitization removes what the sandboxed
+process should not have; it cannot protect a secret you hand it on
+purpose.** If a key must not reach the agent, do not export it into the
+agent's environment — use `--env-allow` to name exactly what should
+survive, or keep the credential in a file the Landlock ruleset does not
+grant.
+
+### Security switches are one-way
+
+`landlock`, `seccomp`, `no-new-privs` and `env-sanitize` may only be
+turned **on** from a profile. Writing `seccomp off` (or `no`, `false`,
+`0`) in a profile is a fatal parse error and nothing runs:
+
+```
+compartment: /etc/compartment/x.conf:12: 'seccomp off' is not allowed in a
+profile — a profile may only tighten policy.
+  Pass --no-seccomp on the command line if you really need to disable it.
+```
+
+A profile file is data. It may live somewhere the sandboxed process can
+reach, so it must never be able to switch enforcement off. Only the
+invoking user can, with `--no-landlock`, `--no-seccomp` or
+`--no-env-sanitize` on the command line. `no_new_privs` has no
+command-line escape hatch: it is always on.
+
+### Comments
+
+`#` starts a comment when it begins a whitespace-separated token, and
+trailing whitespace is trimmed, so both of these work:
+
+```conf
+# a whole-line comment
+ro /usr           # and a trailing one
+```
+
+A `#` inside a token is literal, so a path such as `rw /srv/build#3`
+still means what it says.
 
 ### Inheritance
 
@@ -173,7 +305,7 @@ The inherited profile is loaded first, then the current file's directives
 are applied on top (additive — paths and blocks accumulate).
 
 ```conf
-# ~/.config/compartment/strict.conf
+# /etc/compartment/strict.conf
 inherit ai-agent
 
 # Add extra syscall blocks on top of ai-agent defaults
@@ -186,6 +318,10 @@ block move_pages
 ```
 
 Inheritance depth is limited to 2 levels to prevent loops.
+`inherit` resolves through the same search order and the same trust
+checks as `--profile`, so a system profile can never pull in a file
+from `$HOME`. If the inherited profile exists but does not parse,
+the whole load is rejected and nothing runs.
 
 ---
 
@@ -196,7 +332,7 @@ compartment-user logs events to stderr and to daily log files.
 ### Enable
 
 ```bash
-# Stderr + default log dir (/var/tmp/compartment-audit-$UID/)
+# Stderr + default log dir (see "Log Location" below)
 ./compartment-user --audit -- claude
 
 # Stderr + custom log dir
@@ -204,18 +340,56 @@ compartment-user logs events to stderr and to daily log files.
 
 # Via profile file
 audit on
-audit-log /var/tmp/my-audit-dir
+audit-log /srv/audit/compartment
 ```
 
 ### Log Location
 
-Default: `/var/tmp/compartment-audit-<UID>/YYYY-MM-DD.log`
+The default must be somewhere the sandboxed process cannot rewrite, so
+it is deliberately **not** under `$HOME`: the built-in `ai-agent` profile
+grants the confined process read, write *and* execute there.
 
-Why `/var/tmp`?
-- **World-writable** with sticky bit — any user can create dirs, no root needed
-- **Survives reboot** — unlike `/tmp` on tmpfs distros
-- **Not in the Landlock allowed set** — the sandboxed child process cannot
-  see, read, or tamper with audit logs
+Without `--audit-log`, the directory is chosen in this order:
+
+1. **`/var/lib/compartment/audit/<uid>/`** — used only if an
+   administrator provisioned it. The parent must be root-owned and not
+   group- or world-writable, and the per-uid directory must be a real
+   directory owned by your real uid with mode `0700`:
+
+   ```bash
+   sudo install -d -m 0755 -o root -g root /var/lib/compartment/audit
+   sudo install -d -m 0700 -o "$USER" "/var/lib/compartment/audit/$(id -u)"
+   ```
+
+   If the parent is writable by anyone but root, compartment-user says so
+   and moves on to step 2 rather than trusting it.
+
+2. **`/var/tmp/compartment-audit-<uid>/`** — created mode `0700`.
+   `/var/tmp` is sticky and world-writable, so another user can create
+   that name first. If the directory is found with a different owner or
+   any mode other than `0700`, compartment-user **refuses to run** rather
+   than appending to it:
+
+   ```
+   compartment: audit dir /var/tmp/compartment-audit-1000 is uid 1 mode 0777
+   — expected uid 1000 mode 0700
+   compartment: refusing to write the audit log to /var/tmp/compartment-audit-1000
+   ```
+
+3. **`/var/log/compartment/`** when running as root, created mode `0700`.
+
+Whichever directory is used, it must be owned by the effective uid and
+must not be group- or world-writable. It is opened with
+`O_DIRECTORY` + `O_NOFOLLOW` and the daily file is created relative to
+that descriptor with `O_NOFOLLOW`, so neither the directory nor the file
+may be a symlink someone else controls. Every field written to a record
+has control characters replaced with `_`, so a command path containing a
+newline cannot forge a log line. If auditing was requested and cannot be
+set up safely, compartment-user and compartment-root refuse to run.
+
+Release 1.3.3 defaulted to `/var/tmp/compartment-audit-$UID/` with no
+ownership or mode check at all, and followed a symlink planted at that
+path.
 
 The log file is opened **before** Landlock is applied. The file descriptor
 has `O_CLOEXEC`, so it does not leak to the exec'd child. This gives us:
@@ -223,12 +397,36 @@ has `O_CLOEXEC`, so it does not leak to the exec'd child. This gives us:
 ```
 1. audit_log_open()    ← opens fd (no restrictions yet)
 2. audit_log()         ← writes COMPARTMENT_START event
-3. apply_landlock()    ← from here, /var/tmp is inaccessible
+3. apply_landlock()    ← from here, the log directory is inaccessible
 4. apply_seccomp()
 5. execv(child)        ← child inherits restrictions, fd is closed
 ```
 
-The child literally cannot `open()`, `stat()`, or `ls` the audit directory.
+The fd is closed across the exec, so the child cannot write to the open
+log file.
+
+Neither default is inside a path the built-in profiles grant for writing,
+so the confined process cannot rewrite or delete its own trail. Verified:
+
+```
+$ compartment-user --audit -- /bin/sh -c ': > /var/tmp/compartment-audit-1000/2026-09-06.log'
+/bin/sh: 1: cannot create …/2026-09-06.log: Permission denied
+```
+
+Two caveats, both about *reading* rather than writing:
+
+* `/var/lib` is granted `ro` by the built-in `ai-agent` profile (dpkg,
+  apt, node modules live there), so a log under
+  `/var/lib/compartment/audit/` is **readable** from inside the sandbox.
+  `/var/tmp` is covered by no rule at all, so a log there is not.
+* the handled mask carries no metadata-read right, so `stat()` and
+  `access()` on any path still succeed regardless.
+
+**An operator-chosen `--audit-log` directory inside a granted `rw` or
+`rwx` path is fully reachable by the sandboxed process** — it can read
+the trail and rewrite it. `--audit-log /tmp/x`, for instance, sits inside
+the `ai-agent` profile's `rw /tmp` rule. Pick a directory that no path
+rule covers, or ship the records off the host.
 
 ### File Permissions
 
@@ -241,7 +439,7 @@ The child literally cannot `open()`, `stat()`, or `ls` the audit directory.
 One line per event, structured for grep:
 
 ```
-[2026-03-31 01:27:10] user=claude uid=1000 event=COMPARTMENT_START ppid_chain=1234->5678->1 cwd=/home/claude/project tty=/dev/pts/0 command=/bin/echo profile=ai-agent landlock=1 seccomp=1 paths=14 blocked=30
+[2026-03-31 01:27:10] user=dev uid=1000 event=COMPARTMENT_START ppid_chain=1234->5678->1 cwd=/home/dev/project tty=/dev/pts/0 command=/bin/echo profile=ai-agent source=built-in landlock=1 seccomp=1 paths=14 blocked=43
 ```
 
 Fields: timestamp, user, uid, event type, PPID chain (who launched us),
@@ -253,7 +451,7 @@ No rotation logic needed — the date **is** the rotation. One file per day.
 Clean up old logs with cron:
 
 ```bash
-find /var/tmp/compartment-audit-$(id -u) -name '*.log' -mtime +30 -delete
+find "/var/tmp/compartment-audit-$(id -u)" -name '*.log' -mtime +30 -delete
 ```
 
 ---
@@ -280,6 +478,23 @@ The real shell directory defaults to `/bin/shells` and can be overridden:
 - Via `make hardened`: generates a random 12-char suffix (e.g.
   `/bin/.shells_a7f3b2c1e4cc`) so the path isn't guessable.
   `sandbox.sh` also randomizes the path per invocation.
+
+`COMPARTMENT_SHELL_DIR` comes from the caller — in a login-shell
+deployment, from the very user being confined — so it is honoured only
+when it is an absolute path with no `..` component and both the directory
+and the shell binary inside it are owned by root or by you and are
+neither group- nor world-writable. Otherwise compartment-user prints a
+warning and uses the compile-time `REAL_SHELL_DIR`.
+
+**The sandbox is applied before the exec either way.** An accepted
+`COMPARTMENT_SHELL_DIR` changes *which binary* runs, never *whether* it
+is confined. For a hardened deployment, do not set the variable at all
+and rely on `make hardened`.
+
+In shell-replacement mode the profile is read from
+`/etc/compartment/ai-agent.conf` or the compiled-in default;
+`~/.config/compartment/` is never searched, and `--user-profiles` does
+not apply.
 
 ---
 

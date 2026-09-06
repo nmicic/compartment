@@ -6,6 +6,10 @@
 Integration tests for `compartment-user`, `compartment-root` and
 `sandbox.sh`.
 
+Note: compartment-root needs root, so its checks are not part of the
+unprivileged run. They live in `tests/scripts/root.d/` and must be started
+explicitly, as root (`sudo make test-root`).
+
 ## Quick Start
 
 ```bash
@@ -44,11 +48,23 @@ filter).
 | **Discovered root suites** | `root.d/*.sh` | Root-only paths; run by `sudo make test-root` |
 | **Sandbox proxy/network** | `run_sandbox_proxy_matrix.sh` | sandbox.sh HARD/SOFT modes, network isolation, proxy bridge |
 | **External CLI smoke** | `run_claude_smoke.sh` | A third-party CLI under compartment-user; skipped when the CLI is missing or unauthenticated, or with `--no-external` |
+| **Profile trust** | `rootless.d/profile-trust.sh` | Profile search order and file trust, transactional parsing, one-way switches, `$HOME` validation, `COMPARTMENT_SHELL_DIR`, audit-log hardening, environment deny-list, `--dump-profile` |
+| **Profile trust (root)** | `root.d/profile-trust-root.sh` | compartment-root never reads `$HOME`; `/etc/compartment` ownership and mode checks; every `--profile` spelling; root audit directory |
 
 `compartment-root` used to have no automated coverage at all. It now has a
 runner (`run_root_tests.sh`, refuses to run unprivileged) and a discovery
 directory; what that directory contains is what is actually covered — run
 `sudo make test-root` to see.
+
+Both profile-trust suites accept `COMPARTMENT_USER` and `COMPARTMENT_ROOT`
+environment overrides, so the same assertions can be pointed at an older
+build to confirm they fail there:
+
+```bash
+COMPARTMENT_USER=/path/to/old/compartment-user \
+COMPARTMENT_ROOT=/path/to/old/compartment-root \
+  bash tests/scripts/rootless.d/profile-trust.sh
+```
 
 ## Adding a test
 
@@ -63,7 +79,8 @@ directory:
 In short: independent, executable with a shebang, one
 `SUMMARY <name>: pass=N fail=N skip=N` line, non-zero exit on any failure,
 cleans up after itself including on failure, and skips rather than fails
-when a precondition is missing.
+when a precondition is missing. `root.d/` scripts additionally skip
+themselves with exit 0 when not run as uid 0.
 
 `tests/scripts/lib/harness.sh` is optional and provides `pass`/`fail`/`skip`,
 `harness_summary`, `harness_fixtures`, `harness_profile` and

@@ -51,9 +51,19 @@ or fallback loop).
 .TP
 .BI \-p ", " \-\-profile " NAME|FILE"
 Load policy from a profile file.
-Search order:
-.IR ~/.config/compartment/NAME.conf ,
-.IR /etc/compartment/NAME.conf .
+Only
+.I /etc/compartment/NAME.conf
+is searched;
+.I $HOME
+is never consulted.
+An explicit file path (containing \fB/\fR) loads directly.
+The file and its containing directory must be owned by root and must not be
+group- or world-writable.
+Both the
+.BI \-\-profile= FILE
+and
+.BI \-\-profile " FILE"
+forms are accepted.
 .SS Namespace
 .TP
 .BI \-c ", " \-\-rootdir " DIR"
@@ -195,11 +205,15 @@ Command executed successfully inside the container.
 Configuration error, namespace creation failure, or privilege drop failure.
 .SH FILES
 .TP
-.I ~/.config/compartment/*.conf
-Per-user profile files.
-.TP
 .I /etc/compartment/*.conf
 System-wide profile files.
+compartment-root reads no other location.
+.TP
+.I /var/log/compartment/
+Default audit log directory when running as root (one file per day),
+created mode 0700.
+It must be owned by root and mode 0700; compartment-root refuses to run
+if auditing was requested and the directory cannot be used safely.
 .SH REQUIREMENTS
 Linux >= 4.6 (CLONE_NEWCGROUP). Requires root or equivalent capabilities.
 No external libraries (no libseccomp, no libcap).

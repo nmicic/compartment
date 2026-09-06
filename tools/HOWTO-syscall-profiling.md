@@ -17,7 +17,7 @@ python3 tools/syscall.py check --profile ai-agent -- ./my-program
 
 # 3. If not safe: generate a custom profile
 python3 tools/syscall.py profile -o my-program.conf -- ./my-program
-./compartment-user --profile my-program.conf -- ./my-program
+./compartment-user --profile ./my-program.conf -- ./my-program
 ```
 
 ## Two Modes: Deny vs Allow
@@ -150,18 +150,23 @@ mkdir -p ~/.config/compartment
 cp custom.conf ~/.config/compartment/my-program.conf
 
 # Step 4: Use it
-compartment-user --profile my-program -- ./my-program
+compartment-user --user-profiles --profile my-program -- ./my-program
 ```
 
 ## Deploying Profiles
 
 Profiles are searched in order:
-1. `~/.config/compartment/<name>.conf` (user override)
+1. an explicit path — `--profile /path/to/file.conf`
 2. `/etc/compartment/<name>.conf` (system default)
+3. `~/.config/compartment/<name>.conf`, only with `--user-profiles`
+
+Profile files must be owned by root or by you and must not be group- or
+world-writable; the same goes for the directory holding them.
 
 ```bash
-# User profile
+# User profile (needs --user-profiles at run time)
 mkdir -p ~/.config/compartment
+chmod go-w ~/.config/compartment
 python3 syscall.py profile -m allow --with-env \
     -o ~/.config/compartment/claude.conf -- claude
 

@@ -82,6 +82,9 @@ static void join_netns(const char *netns_name);
 static void set_rlimits(void);
 static void print_help(const char *prog_name);
 
+/* Location label used by the fail-closed policy-append helpers. */
+#define CLI_WHERE "command line"
+
 /* ── main ────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
@@ -94,25 +97,6 @@ int main(int argc, char *argv[])
     config.use_seccomp      = 1;
     config.use_no_new_privs = 1;
     config.use_env_sanitize = 1;
-
-    /* ── Pre-scan for --profile (loads BEFORE CLI so CLI overrides) ── */
-    for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "--profile") == 0 || strcmp(argv[i], "-p") == 0)
-            && i + 1 < argc) {
-            config.profile = argv[i + 1];
-            if (resolve_and_load_profile(&config, config.profile, 0) != 0) {
-                fprintf(stderr, "compartment-root: unknown profile: %s\n",
-                        config.profile);
-                fprintf(stderr, "  searched: ~/.config/compartment/%s.conf, "
-                        "/etc/compartment/%s.conf\n",
-                        config.profile, config.profile);
-                return 1;
-            }
-            break;
-        }
-    }
-
-    /* ── Parse CLI (overrides profile values) ───────────────────────── */
 
     static struct option long_options[] = {
         {"profile",         required_argument, 0, 'p'},
@@ -141,14 +125,62 @@ int main(int argc, char *argv[])
         {0, 0, 0, 0}
     };
 
+    static const char *optstring =
+        "+p:c:u:g:a:B:n:C:A:E:e:M:L:U:lSNdvDVh";
+
+    /* ── Pass 1: resolve --profile only ─────────────────────────────
+     *
+     * The profile has to load before the rest of the command line so that
+     * CLI options override it. This used to be a hand-rolled pre-scan
+     * that matched only the exact tokens "--profile" and "-p", so
+     * "--profile=FILE" and "-pFILE" fell through to a no-op getopt case
+     * and the entire policy was discarded with no error and exit 0. Let
+     * getopt_long do the parsing, twice. */
     int opt;
-    while ((opt = getopt_long(argc, argv, "+p:c:u:g:a:B:n:C:A:E:e:M:L:U:lSNdvDVh",
-                              long_options, NULL)) != -1) {
+    opterr = 0;
+    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL)) != -1) {
+        if (opt == 'p') { config.profile = optarg; break; }
+        if (opt == '?' || opt == ':') break;   /* pass 2 reports it */
+    }
+    optind = 0;   /* glibc: full reinitialisation for the second pass */
+    opterr = 1;
+
+    if (config.profile) {
+        /* PROFILE_OWNER_ROOT and no $HOME search: this process is root,
+         * and the profile decides rootdir, username, cap-allow and the
+         * seccomp policy. */
+        int pr = resolve_and_load_profile(&config, config.profile, 0,
+                                          PROFILE_OWNER_ROOT);
+        if (pr == PROFILE_ERROR) {
+            fprintf(stderr, "compartment-root: profile '%s' was rejected "
+                    "— refusing to run\n", config.profile);
+            return 1;
+        }
+        if (pr == PROFILE_NOT_FOUND) {
+            fprintf(stderr, "compartment-root: unknown profile: %s\n",
+                    config.profile);
+            profile_print_search_path(stderr, config.profile, PROFILE_OWNER_ROOT);
+            return 1;
+        }
+    }
+
+    /* ── Pass 2: everything else (overrides profile values) ────────── */
+
+    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL)) != -1) {
         switch (opt) {
-        case 'p': /* already handled in pre-scan */ break;
+        case 'p':
+            /* Resolved in pass 1. A different value here means --profile
+             * was given more than once. */
+            if (!config.profile || strcmp(config.profile, optarg) != 0) {
+                fprintf(stderr, "compartment-root: --profile given more than "
+                        "once ('%s' after '%s') — refusing to guess\n",
+                        optarg, config.profile ? config.profile : "(none)");
+                return 1;
+            }
+            break;
         case 'c':
             free(config.rootdir);
-            config.rootdir = strdup(optarg);
+            config.rootdir = xstrdup(optarg);
             break;
         case 'u': {
             char *endptr;
@@ -176,7 +208,7 @@ int main(int argc, char *argv[])
         }
         case 'U':
             free(config.username);
-            config.username = strdup(optarg);
+            config.username = xstrdup(optarg);
             break;
         case 'a': { /* --seccomp-allowed */
             int nr = resolve_syscall(optarg);
@@ -184,10 +216,8 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "compartment-root: unknown syscall: %s\n", optarg);
                 return 1;
             }
-            if (config.allowed_sc_count < MAX_ALLOWED_SC) {
-                config.allowed_syscalls[config.allowed_sc_count++] = nr;
-                config.seccomp_allow_mode = 1;
-            }
+            if (cfg_add_allowed(&config, CLI_WHERE, optarg, nr) != 0)
+                return 1;
             break;
         }
         case 'B': { /* --block */
@@ -196,36 +226,37 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "compartment-root: unknown syscall: %s\n", optarg);
                 return 1;
             }
-            if (config.blocked_count < MAX_BLOCKED_SC)
-                config.blocked_syscalls[config.blocked_count++] = nr;
+            if (cfg_add_blocked(&config, CLI_WHERE, optarg, nr) != 0)
+                return 1;
             break;
         }
         case 'n':
             free(config.netns);
-            config.netns = strdup(optarg);
+            config.netns = xstrdup(optarg);
             break;
         case 'C':
-            if (config.cgroups_count < MAX_PATHS)
-                config.cgroups[config.cgroups_count++] = strdup(optarg);
+            if (cfg_add_str(config.cgroups, &config.cgroups_count, MAX_PATHS,
+                            CLI_WHERE, "cgroup", optarg, 1) != 0)
+                return 1;
             break;
         case 'A':
-            if (config.cap_allowed_count < MAX_ENV_VARS)
-                config.cap_allowed_names[config.cap_allowed_count++] = strdup(optarg);
+            if (cfg_add_str(config.cap_allowed_names, &config.cap_allowed_count,
+                            MAX_ENV_VARS, CLI_WHERE, "cap-allow", optarg, 1) != 0)
+                return 1;
             break;
         case 'E':
-            if (config.env_deny_count < MAX_ENV_VARS)
-                config.env_deny[config.env_deny_count++] = optarg;
+            if (cfg_add_env_deny(&config, CLI_WHERE, optarg, 0) != 0)
+                return 1;
             break;
         case 'e':
-            if (config.env_allow_count < MAX_ENV_VARS) {
-                config.env_allow[config.env_allow_count++] = optarg;
-                config.env_allow_mode = 1;
-                config.use_env_sanitize = 1;
-            }
+            if (cfg_add_env_allow(&config, CLI_WHERE, optarg, 0) != 0)
+                return 1;
+            config.use_env_sanitize = 1;
             break;
         case 'M':
-            if (config.mount_mask_count < MAX_PATHS)
-                config.mount_masks[config.mount_mask_count++] = strdup(optarg);
+            if (cfg_add_str(config.mount_masks, &config.mount_mask_count,
+                            MAX_PATHS, CLI_WHERE, "mount-mask", optarg, 1) != 0)
+                return 1;
             break;
         case 'L': config.audit_log_dir = optarg; config.audit = 1; break;
         case 'l': config.loopback = 1; break;
@@ -353,7 +384,11 @@ int main(int argc, char *argv[])
     /* ── Audit log (open BEFORE clone — fd is on host filesystem) ──── */
 
     if (config.audit) {
-        audit_log_open(&config);
+        if (audit_log_open(&config) != 0) {
+            fprintf(stderr, "compartment-root: audit logging was requested "
+                    "but could not be set up safely — refusing to run\n");
+            return 1;
+        }
 
         char detail[512];
         snprintf(detail, sizeof(detail),
