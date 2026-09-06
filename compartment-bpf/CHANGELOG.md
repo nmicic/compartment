@@ -3,10 +3,34 @@
 All notable changes to compartment-bpf are documented here.
 Format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
-## [v0.8] — 2026-09-05
+## [v0.8.0] — 2026-09-06
 
 Security review pass over the BPF enforcement surface: four coverage gaps
-closed, one strict-launch design flaw fixed. No struct layout change.
+closed, one strict-launch design flaw fixed, and one behaviour change (see
+below). No struct layout change.
+
+### Behaviour change — timestamp writes are now `no-chmod`-class
+
+**Read this before upgrading a host with `no-chmod` seals in the field.**
+
+`inode_setattr` now treats `ATTR_ATIME|ATTR_MTIME` without `ATTR_SIZE` as a
+chmod-class operation on a **directly sealed** inode. That is correct
+anti-forensics hardening — rewriting mtime on a sealed file is exactly what an
+attacker does to defeat an integrity baseline, and the v0.5 parent-dir rule
+had classified it this way for DD-sealed children since v0.5 — but it changes
+the meaning of every existing `no-chmod` seal.
+
+Concretely, on a directly `no-chmod`-sealed file a non-actor now gets
+`EACCES` from `touch`, `touch -d`, `touch -a`, `utimensat(2)`, and from the
+timestamp-restoring tail of `cp -p`, `rsync -a`, `tar -x`, `install -p` and
+`unzip`. Any liveness sentinel that `touch`es a sealed file will start
+failing. Truncation is unaffected: `ATTR_SIZE` stays write-class, so a
+`no-chmod`-only seal still permits `truncate` (regression-guarded by
+`tests/bypass/19` R).
+
+If you need the old behaviour for a specific path, add the writer to that
+seal's `actor=` list. A dedicated `no-times` seal flag (SEAL bit 4 is free
+and reserved) is the principled fix and is a follow-up, not part of v0.8.
 
 ### ABI bump 0x0007 → 0x0008
 
@@ -30,11 +54,22 @@ closed, one strict-launch design flaw fixed. No struct layout change.
 - A new mount whose mountpoint is a sealed inode, or lies inside a
   recursively sealed subtree, is denied with `ACTION_DENY_MOUNT`. Covers
   `mount --bind`, `mount --move` / `MS_MOVE`, `move_mount(2)`,
-  `fsmount`+`move_mount` and fresh filesystem mounts. `MS_REMOUNT` and
-  propagation-only changes attach nothing and pass. Actor-bound seals keep
-  their allowlist (an actor may mount inside its own tree). Bind-mounting
-  *from* a sealed path elsewhere stays allowed — the alias shares dentries,
-  so every seal still applies through it.
+  `open_tree(OPEN_TREE_CLONE)`+`move_mount`, `fsmount`+`move_mount` and fresh
+  filesystem mounts. `MS_REMOUNT` and propagation-only changes attach nothing
+  and pass. Actor-bound seals keep their allowlist (an actor may mount inside
+  its own tree). Bind-mounting *from* a sealed path elsewhere stays allowed —
+  the alias shares dentries, so every seal still applies through it.
+- The flag exemptions mirror `path_mount()`'s dispatch order exactly. The
+  kernel tests `MS_BIND` **before** the propagation bits, so exempting on any
+  propagation bit would let `MS_BIND|MS_PRIVATE` attach a bind mount inside a
+  sealed subtree — and `do_loopback()` reaches `graft_tree()` without calling
+  `security_move_mount()`, so the second hook would not catch it either.
+  Witnessed by `tests/bypass/17` W5 through a raw `mount(2)`.
+- `mount --move` is dispatched by `sb_mount` and **only** there:
+  `do_move_mount_old()` calls `do_move_mount()` directly and never
+  `security_move_mount()`. `tests/bypass/17` W6 therefore drives
+  `open_tree(OPEN_TREE_CLONE)`+`move_mount(2)`, the only shape that reaches
+  the `move_mount` hook without first passing `sb_mount`.
 - Retires the LIMITATIONS rows "bind-mount-OVER sealed path" and
   "Mount-inside-sealed-subtree bypass"; a residual row lists what is still
   open (umount of a sealed-inode-hosting filesystem, `pivot_root`, mounts on
@@ -47,44 +82,83 @@ closed, one strict-launch design flaw fixed. No struct layout change.
 
 - New `file_ioctl` program gates `FS_IOC_SETFLAGS` / `FS_IOC32_SETFLAGS` /
   `FS_IOC_FSSETXATTR` / `FS_IOC_SETVERSION` (`chattr +i/+a`, project ids) on
-  `no-chmod` seals; every other ioctl returns after a few compares. Compat
-  (32-bit) callers on kernels ≥ 6.8 use `file_ioctl_compat`, which is not
-  hooked — see LIMITATIONS. Witness: `tests/bypass/18-chattr-no-chmod.sh`.
+  `no-chmod` seals; every other ioctl returns after a few compares.
+- A companion `file_ioctl_compat` program covers 32-bit callers. A compat
+  process enters `COMPAT_SYSCALL_DEFINE3(ioctl)`, which calls
+  `security_file_ioctl_compat()` and **never** `security_file_ioctl()`, so
+  without it an i386 `chattr +i` walked past the gate. The hook was
+  backported into stable 6.6.y, so the loader BTF-probes
+  `bpf_lsm_file_ioctl_compat` and autoload-gates the program rather than
+  testing the kernel version. Witness: `tests/bypass/18-chattr-no-chmod.sh`
+  (W1/W2 native, W3 via `gcc -m32`).
 - `inode_setattr` per-inode rule: `ATTR_ATIME|ATTR_MTIME` without
   `ATTR_SIZE` (`utimensat`, `touch -d`) is now chmod-class, matching the
-  v0.5 parent-dir rule. Truncation stays write-class (regression-guarded).
+  v0.5 parent-dir rule. See the Behaviour change section above.
   Witness: `tests/bypass/19-utimes-no-chmod.sh`.
 
 ### Fixed: strict-launch marker written before the exec point of no return
 
-- The marker was set in `bprm_check_security`, which fires from
-  `search_binary_handler()` before `begin_new_exec()`. An exec of the sealed
-  launcher that failed afterwards (`dup_fd` ENOMEM under a memcg limit with a
-  `CLONE_FILES` sibling alive, `exec_mmap`, `de_thread`) returned to the
-  caller's old image with a valid marker whose target matched its exe — a
-  task already running the actor under `LD_PRELOAD` could satisfy every
-  strict-launch condition. Marker set/keep/clear now lives in
-  `bprm_committed_creds`, which runs only for a committed image; an
-  unresolvable exec target drops any existing marker (fail closed).
+- The marker was set in `bprm_check_security`, which `search_binary_handler()`
+  calls immediately before `fmt->load_binary()`. Every failure inside
+  `load_elf_binary()` **before** `begin_new_exec()` returns `-errno` to the
+  caller's original image, which keeps running its old code with whatever the
+  check hook already wrote. The most usable of those failures is
+  `open_exec(elf_interpreter)` → `-ENOENT`: an attacker who controls a mount
+  namespace shadows the path in the launcher's `PT_INTERP` and forces it
+  deterministically, with no race. A task already running the actor target
+  under `LD_PRELOAD` could `execve()` the sealed launcher, force that
+  failure, and return to its own code holding a valid marker whose target
+  matched its exe — satisfying every strict-launch condition.
+- (Failures *inside* `begin_new_exec()` and later — `de_thread()`,
+  `unshare_files()`/`dup_fd()`, `exec_mmap()` — are past
+  `bprm->point_of_no_return`, and `bprm_execve()` converts them to a fatal
+  `SIGSEGV`. They never return to the caller and were never the window.)
+- Marker set/keep/clear now lives in `bprm_committed_creds`, which runs only
+  for a committed image; an unresolvable exec target drops any existing
+  marker (fail closed).
+- The hook is attached **sleepable** (`lsm.s/`). `bpf_lsm_bprm_committed_creds`
+  is in the kernel's `sleepable_lsm_hooks` allowlist on both 6.8 and 7.0, and
+  sleepable context is what makes `bpf_task_storage_get(F_CREATE)` a blocking
+  allocation. The residual failure is now counted rather than silent — see
+  the new counter below.
 - Pin link name: `comp_bprm_check_security` → `comp_bprm_committed_creds`.
   `--unpin` still sweeps the legacy name, so a v0.4..v0.7 pin tree can be
-  torn down before re-pinning. The hook is attached non-sleepable (`lsm/`),
-  like `task_alloc`, so it does not depend on the kernel's sleepable-hook
-  allowlist.
+  torn down before re-pinning.
+- Known and unchanged: a `#!`-script launcher has never worked. `bprm->file`
+  at commit time is the interpreter, and `mm->exe_file` for a script exec is
+  the interpreter too, so `launcher=` must name an ELF binary.
+
+### New counter: `marker_set_fail_total` (13th)
+
+- Bumped when `bprm_committed_creds` cannot allocate the task-storage
+  marker. The behaviour is fail-closed — the actor is denied at its first
+  protected operation — but it was silent. A nonzero value tells an operator
+  the denies came from allocation pressure, not from an attack on the
+  launcher chain. Expected to stay 0; strict-launch SL-11 is the negative
+  witness. `TM_MIN_COUNTERS` floor moves 12 → 13 and the freeze table
+  moves 17 → 18.
 
 ### Loader
 
-- `pin_links()` pins 26 links (16 v0.3 + 5 v0.4 + 5 v0.8); `KNOWN_LINK_NAMES`
+- `pin_links()` pins 27 links (16 v0.3 + 5 v0.4 + 6 v0.8); `KNOWN_LINK_NAMES`
   extended; `make check-actor-hook` gains grep gates for every v0.8 hook, its
-  `PIN_LINK`, and its unpin-table entry.
+  `PIN_LINK`, its unpin-table entry, the `file_ioctl_compat` BTF probe and
+  the `sb_mount` `MS_BIND` dispatch-order guard.
+- `select_file_ioctl_compat()` joins `select_inode_setattr_variant()` as an
+  autoload gate that runs between `__open()` and `__load()`.
 
-### Verification status
+### Documentation
 
-- Compiled and skeleton-generated against a 6.18 kernel BTF; every hooked
-  `security_*` wrapper and parameter list confirmed present. Kernel-side
-  verifier acceptance and the new bypass witnesses need the BPF-LSM VM
-  (`make smoke`, `tests/bypass/run-all.sh`, `tests/mesh/run-mesh.sh`,
-  `tests/strict-launch/run.sh`).
+- `LIMITATIONS.md` gains rows for ACL/xattr coverage, ioctl/`chattr` (with
+  the compat residual), timestamps (with the behaviour-change warning),
+  pre-existing writable fds, and `mount_setattr(2)`/`open_tree_attr(2)`
+  (unhooked upstream). Three factual corrections: frozen maps are already
+  immune to `BPF_MAP_UPDATE_ELEM`; `bpf(BPF_LINK_DETACH)` returns
+  `-EOPNOTSUPP` for an LSM link (the removal path is `unlink()` of the bpffs
+  pin); `fallocate(2)` is **not** covered by `security_file_permission()`.
+- `README.md` hook table lists the v0.8 hooks explicitly and drops
+  `task_free` (observe-only). `HOWTO.md` §7.1 names the hooks that actually
+  implement `no-chmod` instead of two symbols that never existed.
 
 ---
 

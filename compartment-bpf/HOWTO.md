@@ -121,12 +121,12 @@ forgeable.
 
 ### 2.3 Hook-side semantics (ED-4 / ED-6)
 
-At each of the 26 LSM hooks `compartment.bpf.c` attaches (the 16
+At each of the 27 LSM hooks `compartment.bpf.c` attaches (the 16
 file/inode/path hooks of v0.3; the five v0.4 strict-launch hooks
 `bprm_committed_creds`, `task_alloc`, `task_prctl`,
-`ptrace_access_check`, `ptrace_traceme`; and the five v0.8
+`ptrace_access_check`, `ptrace_traceme`; and the six v0.8
 metadata/mount hooks `inode_set_acl`, `inode_remove_acl`,
-`file_ioctl`, `sb_mount`, `move_mount`),
+`file_ioctl`, `file_ioctl_compat`, `sb_mount`, `move_mount`),
 after the
 existing seal+flag check passes the kernel runs an actor match
 against `current->mm->exe_file`'s `(dev, ino)`. On mismatch the
@@ -399,13 +399,15 @@ on x86_64) + `sodium_mlock` on every passphrase buffer + dual-
 channel audit (stderr + syslog `LOG_AUTHPRIV`) on
 `DENY_UNPIN_AUTH_FAIL` + an ABI-versioned action code
 (`ACTION_DENY_UNPIN_AUTH_FAIL = 7`, stable since ABI v0.3 and
-unchanged through the current v0.5 ABI). That is a
+unchanged through the current v0.8 ABI). That is a
 credential-gate-grade build, not the "speed bump" wording the
 v0 brief originally used. The honest threat-model framing:
 
 * **Against an attacker with CAP_BPF / CAP_SYS_ADMIN on the box,**
   this gate is bypassable — they own the sentinel file, the bpffs
-  pin tree, and can `bpftool prog detach`. The recovery path in
+  pin tree, and can `unlink()` the link pins (note `bpf(BPF_LINK_DETACH)`
+  does not work on an LSM link — it returns `-EOPNOTSUPP`; the pin tree is
+  the surface). The recovery path in
   §3.4 documents this directly.
 * **Against a non-CAP_BPF-restricted root attacker** (an
   unconfined process running as uid 0 but without CAP_BPF /
@@ -753,13 +755,28 @@ without enumerating every file, while keeping the model fail-closed.
 
 ### 7.1 What a dir-destination seal does
 
-`deny_file_write()` (LSM `file_open` / `file_truncate`) and
-`deny_file_chmod()` (`path_chmod`) call both `deny_inode_action()`
-(for the file's own inode seal — the v0.3 behavior) AND
-`deny_file_parent_dir_action()` (for the parent inode's
-`ACTION_DENY_WRITE_PARENT_DIR=9` / `ACTION_DENY_CHMOD_PARENT_DIR=10`).
-A non-actor write or chmod against any immediate child of a
-DD-sealed dir is denied even if the child has no per-file seal.
+Every hook that can mutate a file calls **both** `deny_inode_action()`
+(the file's own inode seal — the v0.3 behaviour) and one of
+`deny_file_parent_dir_action()` / `deny_dentry_parent_dir_action()` (the
+covering directory's seal, emitting `ACTION_DENY_WRITE_PARENT_DIR=9` or
+`ACTION_DENY_CHMOD_PARENT_DIR=10`). A non-actor write or metadata change
+against a child of a DD-sealed dir is denied even if the child has no
+per-file seal.
+
+The write-class hooks are `file_open`, `file_permission` and
+`file_truncate`. The chmod-class hooks — what `no-chmod` actually covers —
+are:
+
+| hook | denies |
+|------|--------|
+| `inode_setattr` | `chmod`, `chown`, and (v0.8) explicit timestamp writes: `ATTR_ATIME\|ATTR_MTIME` without `ATTR_SIZE`, i.e. `touch` / `touch -d` / `touch -a` / `utimensat(2)`. `ATTR_SIZE` is excluded so truncation stays write-class. |
+| `inode_setxattr` / `inode_removexattr` | extended-attribute writes |
+| `inode_set_acl` / `inode_remove_acl` (v0.8) | POSIX ACL writes (`setfacl -m/-x/-b`). Since Linux 6.2 these are routed by `vfs_set_acl()` / `vfs_remove_acl()` and never reach the xattr hooks. |
+| `file_ioctl` + `file_ioctl_compat` (v0.8) | `FS_IOC_SETFLAGS` / `FS_IOC32_SETFLAGS` / `FS_IOC_FSSETXATTR` / `FS_IOC_SETVERSION` — `chattr +i/+a`, project ids. Both the native and the 32-bit compat ioctl entry points are separate LSM hooks in the kernel, so both are attached. |
+
+(There is no `path_chmod` program and no `deny_file_chmod()` helper; earlier
+revisions of this section named symbols that do not exist in
+`compartment.bpf.c`.)
 
 ### 7.2 Syntax
 
@@ -826,7 +843,8 @@ at load time.
 
 ### 7.4 Version requirement
 
-The runtime kernel module must be at ABI v0.5 or higher.
+The runtime kernel module must be at ABI v0.5 or higher. The current ABI
+is v0.8 (`0x0008`).
 
 `compartment-bpf observe` calls `detect_runtime_abi()`, which since
 v0.6 reads the exact runtime ABI from `PIN_ROOT/maps/abi_version_map`

@@ -1556,28 +1556,42 @@ int BPF_PROG(comp_inode_removexattr, struct mnt_idmap *idmap,
 
 // §6.1 marker set / keep / clear — attached at bprm_committed_creds.
 //
-// v0.8: moved from bprm_check_security. That hook fires from
-// search_binary_handler() BEFORE begin_new_exec() commits the new image,
-// and load_elf_binary() can still fail afterwards — de_thread(),
-// unshare_files()/dup_fd() ENOMEM, exec_mmap() — in which case execve()
-// returns -errno to the caller's OLD image (fs/exec.c only forces SIGSEGV
-// once bprm->point_of_no_return is set). With the marker written at
-// check time, a task already executing the actor target (direct exec
-// under LD_PRELOAD: exe == target, no marker) could execve() the sealed
-// launcher, induce a post-check failure (e.g. a memcg limit hit inside
-// dup_fd with a CLONE_FILES sibling alive), and return to its own code
-// carrying a valid marker whose target matched its exe — satisfying
-// every strict-launch condition. bprm_committed_creds runs only once the
-// new credentials and mm are installed, so a marker can never describe
-// an image that did not actually replace the caller. bprm->file here is
-// the final binary (for scripts, the interpreter) and is what
-// set_mm_exe_file() installed as current->mm->exe_file — the same inode
-// caller_id_resolve_locked reads at enforcement time.
+// v0.8: moved from bprm_check_security. security_bprm_check() is called
+// from search_binary_handler() (fs/exec.c) immediately BEFORE
+// fmt->load_binary(), i.e. before load_elf_binary() has done anything. The
+// exploitable window is between that call and begin_new_exec(), because
+// every failure inside load_elf_binary() up to that point returns -errno to
+// the caller's ORIGINAL image — the task keeps running its old code with
+// whatever the check hook already wrote.
 //
-// Non-sleepable on purpose: bpf_task_storage_get(F_CREATE) is valid in
-// non-sleepable LSM context (comp_task_alloc relies on the same), and a
-// plain lsm/ attach does not depend on the hook being in the kernel's
-// sleepable allowlist. The hook is void; the return value is ignored.
+// Note this is NOT the window the first draft of this comment claimed:
+// de_thread(), unshare_files()/dup_fd() and exec_mmap() all run inside
+// begin_new_exec(), which sets bprm->point_of_no_return before any of them,
+// and bprm_execve() turns a failure past that point into force_fatal_sig
+// (SIGSEGV). Those paths kill the task; they can never return a marker to
+// the caller. The genuine pre-commit failure points, in
+// fs/binfmt_elf.c:load_elf_binary(), are:
+//
+//   - open_exec(elf_interpreter)  -> -ENOENT, and deterministically
+//     forceable: an attacker who controls a mount namespace shadows the
+//     interpreter path named in the launcher's PT_INTERP.
+//   - load_elf_phdrs()            -> -ENOMEM
+//   - the PT_INTERP sanity checks -> -ELIBBAD
+//   - the -ENOEXEC binfmt retry loop
+//
+// With the marker written at check time, a task already executing the actor
+// target (direct exec under LD_PRELOAD: exe == target, no marker) could
+// execve() the sealed launcher, force one of those failures — the
+// interpreter shadow is a single mount away and needs no race — and return
+// to its own code carrying a valid marker whose target matched its exe,
+// satisfying every strict-launch condition.
+//
+// bprm_committed_creds runs only once the new credentials and mm are
+// installed, so a marker can never describe an image that did not actually
+// replace the caller. bprm->file here is the final binary (for scripts, the
+// interpreter) and is what set_mm_exe_file() installed as
+// current->mm->exe_file — the same inode caller_id_resolve_locked reads at
+// enforcement time.
 //
 // Per SPEC §6.1:
 //   1. Resolve exec target inode (via bprm->file). Unresolvable → drop

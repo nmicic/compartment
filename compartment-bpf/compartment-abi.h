@@ -160,19 +160,39 @@
 //      seal did not stop `setfacl` on the project's >= 6.6 floor. Both
 //      hooks enforce SEAL_NO_CHMOD with the existing DENY_CHMOD /
 //      DENY_CHMOD_PARENT_DIR codes.
-//    - file_ioctl: FS_IOC_SETFLAGS / FS_IOC32_SETFLAGS / FS_IOC_FSSETXATTR /
-//      FS_IOC_SETVERSION (chattr, project ids) mutate inode metadata via
-//      ->fileattr_set with no inode_setattr or xattr hook; gated under
-//      SEAL_NO_CHMOD (same two codes).
+//    - file_ioctl + file_ioctl_compat: FS_IOC_SETFLAGS /
+//      FS_IOC32_SETFLAGS / FS_IOC_FSSETXATTR / FS_IOC_SETVERSION (chattr,
+//      project ids) mutate inode metadata via ->fileattr_set with no
+//      inode_setattr or xattr hook; gated under SEAL_NO_CHMOD (same two
+//      codes). Both the native and the 32-bit compat ioctl entry points
+//      are hooked — they are separate LSM hooks in the kernel.
 //    - sb_mount / move_mount: see ACTION_DENY_MOUNT.
 //  * Strict-launch marker mutation moved from bprm_check_security to
-//    bprm_committed_creds. The check hook fires before the exec point of
-//    no return; an exec that fails after it returns to the caller's OLD
-//    image carrying a freshly written marker. committed_creds runs only
-//    once the new image is installed. Pin link name changes
+//    bprm_committed_creds. security_bprm_check() runs in
+//    search_binary_handler() immediately before fmt->load_binary(); every
+//    failure inside load_elf_binary() BEFORE begin_new_exec() returns
+//    -errno to the caller's original image, which therefore keeps running
+//    with whatever the check hook already wrote. The most usable of those
+//    failures is open_exec(elf_interpreter) -> -ENOENT: shadowing the
+//    launcher's PT_INTERP path inside a mount namespace forces it
+//    deterministically, no race needed. (Failures inside begin_new_exec()
+//    and later — de_thread, dup_fd, exec_mmap — are past
+//    bprm->point_of_no_return and are converted to SIGSEGV, so they never
+//    return a marker to anyone.) committed_creds runs only once the new
+//    credentials and mm are installed. Pin link name changes
 //    comp_bprm_check_security -> comp_bprm_committed_creds; the loader
 //    keeps the legacy name in its --unpin sweep table so a v0.4..v0.7
 //    pin tree can still be torn down.
+//  * The marker hook is attached sleepable (lsm.s/): the hook is in the
+//    kernel's sleepable_lsm_hooks allowlist, and that is what makes the
+//    task-storage marker allocation blocking. A new counter,
+//    marker_set_fail_total, records the residual allocation failure so a
+//    strict-launch deny caused by memory pressure is distinguishable from
+//    one caused by an attack on the launcher chain.
+//  * New hook file_ioctl_compat, autoload-gated on a BTF probe for
+//    bpf_lsm_file_ioctl_compat: a 32-bit caller reaches
+//    security_file_ioctl_compat() and never security_file_ioctl(), so
+//    without it the ioctl gate above is bypassed by an i386 process.
 //  * inode_setattr: explicit timestamp writes (utimensat / touch -d) on a
 //    directly sealed inode are now chmod-class, matching the v0.5
 //    parent-dir rule. Truncation stays write-class.
@@ -393,9 +413,10 @@ _Static_assert(COMPARTMENT_MAX_ACTORS_PER_SEAL == 4,
 //                     (the launcher binary's file_id), value=struct
 //                     launcher_actor. Populated by the loader from
 //                     `actor-strict NAME = TARGET launcher=PATH`
-//                     directives. On `bprm_check_security`, a hit means
-//                     "exec of a sealed launcher" and the kernel sets a
-//                     marker on the new task.
+//                     directives. On `bprm_committed_creds` (v0.8; was
+//                     `bprm_check_security` through v0.7), a hit means
+//                     "exec of a sealed launcher COMMITTED" and the kernel
+//                     sets a marker on the new task.
 //
 // actor_marker      : BPF_MAP_TYPE_TASK_STORAGE, value=struct
 //                     actor_marker. Per-task; set on launcher exec,

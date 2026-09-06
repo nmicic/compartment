@@ -2959,10 +2959,11 @@ static void pin_lifecycle_unlock(int fd)
 static int pin_links(struct compartment_bpf *skel)
 {
 	// pin_one_link writes into pinned[*pinned_count] without an
-	// explicit bound. We currently make 21 PIN_LINK invocations and have
-	// 32 slots. The assert hard-codes the current count (21) because
-	// KNOWN_LINK_NAMES is declared later in the file; if the PIN_LINK
-	// invocation count below grows, bump the literal here in lockstep.
+	// explicit bound. We currently make 27 pin calls (25 PIN_LINK, plus
+	// the canonical-name inode_setattr pin and the conditional
+	// file_ioctl_compat pin) and have 32 slots. The assert hard-codes the
+	// current count because KNOWN_LINK_NAMES is declared later in the
+	// file; if the pin count below grows, bump the literal in lockstep.
 	char pinned[32][PATH_MAX];
 	_Static_assert(sizeof(pinned) / PATH_MAX >= 27,
 		       "pinned[] must hold all PIN_LINK invocations (currently 27: 16 v0.3 + 5 v0.4 + 6 v0.8)");

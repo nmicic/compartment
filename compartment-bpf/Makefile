@@ -164,7 +164,8 @@ check-parser-actor: compartment-bpf
 
 # ED-3 + ED-4 BPF-side syntactic gate. Compile-only check that
 # compartment.bpf.c still builds with the new struct seal_value, the
-# 16-hook actor_check_or_deny integration, and the unrolled actor[]
+# actor_check_or_deny integration across all 27 programs, and the
+# unrolled actor[]
 # scan. Does NOT load or verify the program (that lands with the
 # bypass suite in ED-8); fails fast if a future edit drops the helper
 # or breaks the unroll bound. Reuses the existing compartment.bpf.o
@@ -216,7 +217,7 @@ check-actor-hook: compartment.bpf.o
 	@grep -q 'strict_validate_launchers' compartment-bpf.c || { echo "error: strict_validate_launchers missing in compartment-bpf.c (ABI v0.4)"; exit 1; }
 	@grep -q 'STRICT_DANGEROUS_ENV_NAMES' compartment-bpf.c || { echo "error: STRICT_DANGEROUS_ENV_NAMES missing in compartment-bpf.c (ABI v0.4)"; exit 1; }
 	@# HIGH-11 (Review-1 fix): symmetric grep gates for the 3 strict-launch
-	@# LSM hooks that were ungated in the v0.3 lift, plus the 11 v0.4 map
+	@# LSM hooks that were ungated in the v0.3 lift, plus the v0.4 map
 	@# names. A future refactor that drops any of these will now fail
 	@# check-actor-hook instead of slipping through. Mirrors the v0.3
 	@# precedent set in F6 / Phase 2 mesh Review-1 fixes.

@@ -174,14 +174,18 @@ See `LIMITATIONS.md` for the full table. Highlights:
   sealed inodes, `pivot_root`, and mounting on the root of a nested mount
   that already sat inside a sealed tree at load time. The sealed inodes
   stay protected in every case; only the path guarantee breaks.
-- **32-bit ioctl callers**: `chattr`-class ioctls are gated on `no-chmod`
-  seals for native callers; on kernels ≥ 6.8 compat callers use an unhooked
-  `file_ioctl_compat` path. See LIMITATIONS.md.
+- **`chattr`-class ioctls**: gated on `no-chmod` seals for native *and*
+  32-bit compat callers (`file_ioctl` + `file_ioctl_compat`). The compat
+  program is autoload-gated on a BTF probe; on a kernel that lacks
+  `security_file_ioctl_compat()` compat ioctls route through the native hook
+  anyway. See LIMITATIONS.md.
 - **Existing writable mappings**: a shared-writable mmap established *before*
   policy attach is not revoked. Load before protected services start.
-- **BPF LSM detach**: a root process with `CAP_BPF` and access to the bpffs
-  link can detach the programs. Combine with capability dropping and bpffs
-  namespace lockdown for stronger guarantees.
+- **BPF LSM detach**: a root process with `CAP_BPF` and write access to the
+  bpffs pin directory can `unlink()` the link pins and, once the last fd
+  drops, remove enforcement. Note `bpf(BPF_LINK_DETACH)` does **not** work on
+  an LSM link — it returns `-EOPNOTSUPP` — so the pin tree is the surface to
+  guard. Combine with capability dropping and bpffs namespace lockdown.
 - **btrfs / overlayfs anon_bdev**: on these filesystems, `(dev, ino)` can be
   reused across bind-mount views of the same inode; see LIMITATIONS.md.
 - **No cryptographic policy signing** yet.
