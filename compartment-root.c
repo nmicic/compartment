@@ -1344,35 +1344,76 @@ static int path_has_dotdot(const char *path)
 
 static int assign_to_cgroups(Config *config, pid_t pid)
 {
+    /* Every cgroup path must live under the cgroup filesystem.  Without
+     * this check the code below happily created <path>/cgroup.procs
+     * anywhere a root process can write: `--cgroup /etc/cron.d` produced
+     * /etc/cron.d/cgroup.procs. */
+    static const char CGROUP_ROOT[] = "/sys/fs/cgroup/";
+    const size_t CGROUP_ROOT_LEN = sizeof(CGROUP_ROOT) - 1;
+
     for (int i = 0; i < config->cgroups_count; i++) {
+        const char *want = config->cgroups[i];
+
         /* Reject relative paths and paths with ".." traversal components */
-        if (config->cgroups[i][0] != '/') {
+        if (want[0] != '/') {
             fprintf(stderr, "compartment-root: cgroup path must be absolute: %s\n",
-                    config->cgroups[i]);
+                    want);
             return -1;
         }
-        if (path_has_dotdot(config->cgroups[i])) {
+        if (path_has_dotdot(want)) {
             fprintf(stderr, "compartment-root: cgroup path contains '..': %s\n",
-                    config->cgroups[i]);
+                    want);
             return -1;
         }
-        char tasks_file[PATH_MAX];
-        int n = snprintf(tasks_file, sizeof(tasks_file), "%s/cgroup.procs",
-                 config->cgroups[i]);
-        if (n < 0 || (size_t)n >= sizeof(tasks_file)) {
-            fprintf(stderr, "compartment-root: cgroup path too long: %s\n",
-                    config->cgroups[i]);
+        if (strncmp(want, CGROUP_ROOT, CGROUP_ROOT_LEN) != 0) {
+            fprintf(stderr, "compartment-root: cgroup path must be under %s: %s\n",
+                    CGROUP_ROOT, want);
             return -1;
         }
 
-        FILE *f = fopen(tasks_file, "we");
-        if (!f) {
+        /* Resolve symlinks and re-check the prefix: a symlinked component
+         * could otherwise redirect the write out of the cgroup tree. */
+        char resolved[PATH_MAX];
+        if (!realpath(want, resolved)) {
             fprintf(stderr, "compartment-root: cgroup %s: %s\n",
-                    tasks_file, strerror(errno));
+                    want, strerror(errno));
             return -1;
         }
-        fprintf(f, "%d\n", pid);
-        fclose(f);
+        if (strncmp(resolved, CGROUP_ROOT, CGROUP_ROOT_LEN) != 0) {
+            fprintf(stderr, "compartment-root: cgroup path resolves outside "
+                    "%s: %s -> %s\n", CGROUP_ROOT, want, resolved);
+            return -1;
+        }
+
+        char procs_file[PATH_MAX];
+        int n = snprintf(procs_file, sizeof(procs_file), "%s/cgroup.procs",
+                         resolved);
+        if (n < 0 || (size_t)n >= sizeof(procs_file)) {
+            fprintf(stderr, "compartment-root: cgroup path too long: %s\n",
+                    want);
+            return -1;
+        }
+
+        /* No O_CREAT — cgroup.procs is created by the kernel and must
+         * already exist.  O_NOFOLLOW so a symlink planted at the final
+         * component is refused rather than followed. */
+        int fd = open(procs_file, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) {
+            fprintf(stderr, "compartment-root: cgroup %s: %s\n",
+                    procs_file, strerror(errno));
+            return -1;
+        }
+        char buf[32];
+        int len = snprintf(buf, sizeof(buf), "%d\n", pid);
+        if (len < 0 || write(fd, buf, (size_t)len) != len) {
+            fprintf(stderr, "compartment-root: cgroup %s: %s\n",
+                    procs_file, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        close(fd);
+        if (config->verbose)
+            fprintf(stderr, "compartment-root: cgroup %s\n", resolved);
     }
     return 0;
 }
