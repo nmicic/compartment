@@ -646,6 +646,7 @@ check-release: check-env
 	@test -r /sys/kernel/btf/vmlinux || { echo "[check-release] FAIL: kernel BTF not readable"; exit 1; }
 	@command -v bpftool >/dev/null || { echo "[check-release] FAIL: bpftool missing"; exit 1; }
 	@command -v clang >/dev/null || { echo "[check-release] FAIL: clang missing"; exit 1; }
+	@[ "$${RUN_E2E:-1}" != "0" ] || { echo "[check-release] FAIL: RUN_E2E=0 removes the daemon end-to-end leg from a release run"; exit 1; }
 	@echo "[check-release] preflight OK — running full suite"
 	@log=$$(mktemp); \
 	if ! $(MAKE) check > "$$log" 2>&1; then \
@@ -658,13 +659,17 @@ check-release: check-env
 	  grep -n '^FAIL ' "$$log" | sed 's/^/  /'; \
 	  rm -f "$$log"; exit 1; \
 	fi; \
+	if ! sh tests/release-totals.sh "$$log"; then \
+	  echo "[check-release] FAIL: a suite is below its tracked assertion floor (above)"; \
+	  rm -f "$$log"; exit 1; \
+	fi; \
 	if grep -nEi 'SKIP.*(needs root|requires root|bpf not in active LSM|daemon not built|sealprobe not built|bpftool not available)' "$$log"; then \
 	  echo "[check-release] FAIL: a core suite SKIPPED for an env reason preflight should have guaranteed away (above)"; \
 	  rm -f "$$log"; exit 1; \
 	fi; \
 	pats=$$(mktemp); unknown=$$(mktemp); \
 	grep -vE '^[[:space:]]*(#|$$)' tests/release-skip-allowlist.txt > "$$pats"; \
-	grep -a 'SKIP' "$$log" | grep -avE -f "$$pats" > "$$unknown" || true; \
+	grep -ai 'skip' "$$log" | grep -avEi -f "$$pats" > "$$unknown" || true; \
 	if [ -s "$$unknown" ]; then \
 	  echo "[check-release] FAIL: unrecognised SKIP line(s). Every skip must match a documented"; \
 	  echo "[check-release]       entry in tests/release-skip-allowlist.txt — an unknown skip is a FAIL,"; \

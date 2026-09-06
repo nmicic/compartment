@@ -3001,6 +3001,21 @@ fi
 # SKIP (substrate unavailable or anon_bdev-refused setup, OUT-OF-SCOPE
 # nfs / doc-only ME-24). PASS no longer over-counts limitations.
 TOTAL=$((PASS+FAIL+ERR+KNOWN_GAP+SKIP))
+
+# OPEN-6.1: five of the mesh skips were CSV rows and nothing else, so the
+# release gate's allowlist could only ever see the aggregate "SKIP: N"
+# tally and never the individual reasons — and an unexplained skip failing
+# the release is the whole point of that gate. Echo every SKIP row from
+# the CSV to stdout with its reason, in the gate's own vocabulary, plus
+# every KNOWN-GAP row, which was invisible to both scans.
+awk -F, 'NR > 1 && $NF == "SKIP" {
+    printf "[mesh] SKIP: %s %s/%s op=%s expected=%s reason=%s\n",
+           $1, $2, $3, $4, $6, $7
+}' "$CSV"
+awk -F, 'NR > 1 && $6 ~ /KNOWN-GAP/ {
+    printf "[mesh] KNOWN-GAP: %s %s/%s op=%s reason=%s\n", $1, $2, $3, $4, $7
+}' "$CSV"
+
 {
 	echo "Mesh results @ ${TS}"
 	echo "  Total trials:       $TOTAL"
@@ -3025,4 +3040,5 @@ if [ "$FAIL" -ne 0 ] || [ "$ERR" -ne 0 ]; then
 	exit 6
 fi
 
+echo "RESULT check-mesh: pass=$PASS fail=$((FAIL+ERR)) skip=$((SKIP+KNOWN_GAP))"
 echo "[mesh] $PASS ENFORCED trials matched §2.2; $KNOWN_GAP KNOWN-GAP + $SKIP SKIP — PASS"
