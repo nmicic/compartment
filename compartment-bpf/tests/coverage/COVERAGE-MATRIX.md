@@ -7,76 +7,76 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 
 | surface | status | note |
 |---|---|---|
-| `inode_unlink` | witnessed |  |
-| `inode_rename` | witnessed |  |
-| `inode_rmdir` | witnessed |  |
-| `inode_create` | witnessed |  |
-| `inode_mkdir` | witnessed |  |
-| `inode_mknod` | witnessed |  |
-| `inode_symlink` | witnessed |  |
-| `inode_link` | witnessed |  |
-| `file_open` | witnessed |  |
-| `file_permission` | witnessed |  |
-| `file_truncate` | witnessed |  |
-| `inode_setattr` | witnessed |  |
-| `mmap_file` | witnessed |  |
-| `file_mprotect` | witnessed |  |
-| `inode_setxattr` | witnessed |  |
-| `inode_removexattr` | witnessed |  |
-| `bprm_check_security` | witnessed |  |
+| `inode_unlink` | witnessed | `tests/dir-matrix-runner.sh` |
+| `inode_rename` | witnessed | `tests/dir-matrix-runner.sh` |
+| `inode_rmdir` | witnessed | `tests/dir-matrix-runner.sh` |
+| `inode_create` | witnessed | `tests/dir-matrix-runner.sh` |
+| `inode_mkdir` | witnessed | `tests/dir-matrix-runner.sh` |
+| `inode_mknod` | witnessed | `tests/dir-matrix-runner.sh` |
+| `inode_symlink` | witnessed | `tests/dir-matrix-runner.sh` |
+| `inode_link` | witnessed | `tests/dir-matrix-runner.sh` |
+| `file_open` | witnessed | `tests/matrix-runner.sh` |
+| `file_permission` | witnessed | `tests/mesh/run-mesh.sh` |
+| `file_truncate` | witnessed | `tests/bypass/02-truncate-no-open.sh` |
+| `inode_setattr` | witnessed | `tests/inode-seal-witness.sh` |
+| `mmap_file` | witnessed | `tests/sealprobe.c` |
+| `file_mprotect` | witnessed | `tests/mesh/stubs/mesh_stub_main.c` |
+| `inode_setxattr` | witnessed | `tests/sealprobe.c` |
+| `inode_removexattr` | witnessed | `tests/sealprobe.c` |
+| `bprm_check_security` | witnessed | `tests/strict-launch/run.sh` |
 | `task_alloc` | exempt | Fork marker-copy hook; no op token. Witnessed indirectly by marker_copy_fork_total (strict-launch/run.sh + stability/counter-longevity.sh). |
-| `task_prctl` | witnessed |  |
-| `ptrace_access_check` | witnessed |  |
-| `ptrace_traceme` | witnessed |  |
+| `task_prctl` | witnessed | `tests/strict-launch/run.sh` |
+| `ptrace_access_check` | witnessed | `tests/strict-launch/run.sh` |
+| `ptrace_traceme` | witnessed | `tests/strict-launch/run.sh` |
 ## observe-hook
 
 | surface | status | note |
 |---|---|---|
-| `bprm_check_security` | witnessed |  |
-| `task_alloc` | witnessed |  |
-| `task_free` | witnessed |  |
-| `file_open` | witnessed |  |
-| `inode_create` | witnessed |  |
-| `inode_unlink` | witnessed |  |
-| `inode_rename` | witnessed |  |
-| `inode_mkdir` | witnessed |  |
-| `inode_rmdir` | witnessed |  |
-| `inode_link` | witnessed |  |
-| `inode_mknod` | witnessed |  |
-| `inode_symlink` | witnessed |  |
+| `bprm_check_security` | witnessed | `tests/observe/run.sh` |
+| `task_alloc` | witnessed | `tests/observe/run.sh` |
+| `task_free` | witnessed | `tests/observe/run.sh` |
+| `file_open` | witnessed | `tests/observe/run.sh` |
+| `inode_create` | witnessed | `tests/observe/run.sh` |
+| `inode_unlink` | witnessed | `tests/observe/run.sh` |
+| `inode_rename` | witnessed | `tests/observe/run.sh` |
+| `inode_mkdir` | witnessed | `tests/observe/run.sh` |
+| `inode_rmdir` | witnessed | `tests/observe/run.sh` |
+| `inode_link` | witnessed | `tests/observe/run.sh` |
+| `inode_mknod` | witnessed | `tests/observe/run.sh` |
+| `inode_symlink` | witnessed | `tests/observe/run.sh` |
 ## action
 
 | surface | status | note |
 |---|---|---|
-| `DENY_ACTOR_MISMATCH` | witnessed |  |
+| `DENY_ACTOR_MISMATCH` | witnessed | `tests/deny-to-candidate.sh` |
 | `DENY_STRICT_LAUNCH_MISSING` | exempt | Path exercised via strict_launch_missing_total (strict-launch/run.sh); audit-token grep pending Phase 3 SL-6. |
-| `DENY_WRITE_PARENT_DIR` | witnessed |  |
-| `DENY_WRITE` | witnessed |  |
+| `DENY_WRITE_PARENT_DIR` | witnessed | `tests/bypass/11-rename-into-no-write-dir.sh` |
+| `DENY_WRITE` | witnessed | `tests/aggregate-smoke.sh` |
 | `DENY_CHMOD_PARENT_DIR` | exempt | Path exercised via dir-matrix chmod-on-sealed-dir; audit-token witness pending Phase 3 (upgrade me25_trial / tests/coverage/parent-dir-actions.sh). |
-| `DENY_CHMOD` | witnessed |  |
-| `DENY_PRCTL_SET_MM` | witnessed |  |
-| `DENY_PTRACE_ACCESS` | witnessed |  |
-| `DENY_PTRACE_TRACEME` | witnessed |  |
-| `DENY_UNLINK` | witnessed |  |
-| `DENY_RENAME` | witnessed |  |
-| `DENY_CREATE` | witnessed |  |
-| `DENY_UNPIN_AUTH_FAIL` | witnessed |  |
+| `DENY_CHMOD` | witnessed | `tests/inode-seal-witness.sh` |
+| `DENY_PRCTL_SET_MM` | witnessed | `tests/strict-launch/run.sh` |
+| `DENY_PTRACE_ACCESS` | witnessed | `tests/deny-to-candidate.sh` |
+| `DENY_PTRACE_TRACEME` | witnessed | `tests/strict-launch/run.sh` |
+| `DENY_UNLINK` | witnessed | `tests/mesh/run-mesh.sh` |
+| `DENY_RENAME` | witnessed | `tests/mesh/run-mesh.sh` |
+| `DENY_CREATE` | witnessed | `tests/bypass/14-runtime-subtree-depth-cap.sh` |
+| `DENY_UNPIN_AUTH_FAIL` | witnessed | `tests/pin-passphrase.sh` |
 ## counter
 
 | surface | status | note |
 |---|---|---|
-| `deny_total` | witnessed |  |
-| `audit_drop_total` | witnessed |  |
-| `actor_mismatch_total` | witnessed |  |
-| `strict_launch_missing_total` | witnessed |  |
-| `strict_launch_allowed_total` | witnessed |  |
-| `marker_set_total` | witnessed |  |
-| `marker_clear_foreign_exec_total` | witnessed |  |
-| `marker_copy_fork_total` | witnessed |  |
-| `marker_stale_generation_total` | witnessed |  |
-| `prctl_set_mm_exe_file_denied_total` | witnessed |  |
-| `ptrace_access_denied_total` | witnessed |  |
-| `ptrace_traceme_denied_total` | witnessed |  |
+| `deny_total` | witnessed | `tests/counter-smoke.sh` |
+| `audit_drop_total` | witnessed | `tests/counter-smoke.sh` |
+| `actor_mismatch_total` | witnessed | `tests/counter-smoke.sh` |
+| `strict_launch_missing_total` | witnessed | `tests/bypass/exec-domain/BX-11-ld-preload-strict.sh` |
+| `strict_launch_allowed_total` | witnessed | `tests/stability/counter-longevity.sh` |
+| `marker_set_total` | witnessed | `tests/stability/counter-longevity.sh` |
+| `marker_clear_foreign_exec_total` | witnessed | `tests/stability/counter-longevity.sh` |
+| `marker_copy_fork_total` | witnessed | `tests/stability/counter-longevity.sh` |
+| `marker_stale_generation_total` | witnessed | `tests/stability/counter-longevity.sh` |
+| `prctl_set_mm_exe_file_denied_total` | witnessed | `tests/stability/counter-longevity.sh` |
+| `ptrace_access_denied_total` | witnessed | `tests/stability/counter-longevity.sh` |
+| `ptrace_traceme_denied_total` | witnessed | `tests/stability/counter-longevity.sh` |
 ## observe-counter
 
 | surface | status | note |

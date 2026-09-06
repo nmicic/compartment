@@ -523,6 +523,12 @@ check-counter-longevity: compartment-bpf
 # new surface with no witness now FAILS the build (the OPEN-1 / dir-seal-drift
 # class). Regenerates tests/coverage/COVERAGE-MATRIX.md as a side effect.
 check-coverage-static:
+	@# --selftest first: the gate is only as strong as its definition of
+	@# "witnessed", and that definition is what silently rotted before
+	@# (a hook was credited by its bare op suffix appearing anywhere in the
+	@# corpus, comments included). The selftest asserts a comment-only
+	@# mention is UNWITNESSED and a stray op token credits nothing.
+	@python3 tools/coverage-map.py --selftest
 	@python3 tools/coverage-map.py --write-matrix tests/coverage/COVERAGE-MATRIX.md
 
 # Loader fail-closed input-validation witnesses (2026-06-09): the recursive
