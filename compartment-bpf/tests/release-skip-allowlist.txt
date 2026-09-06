@@ -36,7 +36,7 @@
 # ---------------------------------------------------------------------------
 ^SKIP aide-e2e: aide not installed$
 ^SKIP postgres-e2e: pg_lsclusters not present \(postgresql-common missing\)$
-^\[check-profile-e2e\] tests/profile-e2e/(aide|postgres)\.sh SKIP \(env unsupported\)$
+^\[check-profile-e2e\] tests/profile-e2e/[a-z-]+\.sh SKIP \(orchestrator-driven: needs tests/profile-e2e\.sh, not standalone\)$
 ^SKIP[[:space:]]+T12: AIDE not present
 #
 # ---------------------------------------------------------------------------

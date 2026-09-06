@@ -74,9 +74,9 @@ BASE_CFLAGS = -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE -O2
 CFLAGS  = $(BASE_CFLAGS) $(HARDEN_CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS = $(HARDEN_LDFLAGS) $(EXTRA_LDFLAGS)
 
-.PHONY: all clean test test-integration test-quick test-root hardened \
+.PHONY: all clean test test-integration test-quick test-root test-kernels hardened \
         install install-man install-profiles show-hardening \
-        check check-shell check-modes
+        check check-shell check-modes check-orphans check-docs-symbols
 
 # Both tools: zero dependencies
 all: compartment-user compartment-root
@@ -122,6 +122,16 @@ test-integration: all tests/probes/deny_probe
 test test-quick: all tests/probes/deny_probe
 	./tests/scripts/run_all.sh --quick
 
+# Kernel matrix across virtme-ng guests (v5.4 .. v6.12). Not part of
+# `make check` or of either runner: it needs virtme-ng and boots eight
+# kernels, so it is a deliberate, named invocation. It was reachable from
+# nothing at all before this target existed — 70 assertions that never
+# ran. Exits 77 (and says so) when virtme-ng is absent.
+test-kernels: all tests/probes/deny_probe
+	@rc=0; ./tests/scripts/run_kernel_matrix.sh || rc=$$?; \
+	if [ "$$rc" = "77" ]; then echo "test-kernels: SKIP (virtme-ng not installed)"; exit 0; fi; \
+	exit $$rc
+
 # Root-only suites (tests/scripts/root.d/). Must be run as root:
 #   sudo make test-root
 test-root: all tests/probes/deny_probe
@@ -165,7 +175,7 @@ install-profiles:
 
 # ── Repository hygiene checks (also run in CI) ─────────────────────
 
-check: check-shell check-modes
+check: check-shell check-modes check-orphans check-docs-symbols
 
 # Shell sources of this project.  compartment-bpf/ is a separate subtree
 # with its own conventions and is not gated here.
@@ -174,6 +184,20 @@ SHELL_DIRS = examples extra man scripts tests tools
 check-shell:
 	@command -v shellcheck > /dev/null 2>&1 || 		{ echo "check-shell: shellcheck not installed (apt install shellcheck)"; exit 1; }
 	@files=$$(git ls-files '*.sh' 2>/dev/null | grep -v '^compartment-bpf/' || 		find . -name '*.sh' -not -path './compartment-bpf/*' -not -path './.git/*'); 	echo "shellcheck -S warning over $$(echo "$$files" | wc -l) files"; 	shellcheck -S warning $$files
+
+# A test script that no runner, target or workflow names is worse than a
+# missing one: it reads as coverage in tests/README.md and in review, and
+# it rots. run_kernel_matrix.sh carried ~70 assertions in exactly that
+# state until `make test-kernels` landed.
+check-orphans:
+	@bash scripts/check-orphans.sh
+
+# Every comp_*/ao_*/DENY_*/counter symbol the compartment-bpf docs name
+# has to exist in the sources. Four of the seven doc-vs-code claims
+# audited at the 1.4 gate were wrong in the shipped tree, and nothing
+# compared a documented symbol against the code.
+check-docs-symbols:
+	@bash scripts/check-docs-symbols.sh
 
 # Every *.sh that starts with a shebang must be executable, and every one
 # that does not (a sourced library) must not be: a test that ships

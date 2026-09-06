@@ -340,14 +340,27 @@ check-strict-launch: compartment-bpf
 # the smoke VM that actually has both daemons). Set RUN_E2E=0 to opt
 # out (e.g. CI-side parallelism). Sub-script SKIP (rc=77) bubbles up
 # as a 'SKIP' line; FAIL (rc=1) hard-fails the gate fail-closed.
+#
+# The list is a glob, not two hard-coded names: five of the seven scripts
+# in that directory were reachable from nothing at all, and hard-coding
+# is how they got there. The five are orchestrator-driven (they require a
+# NONCE from tests/profile-e2e.sh and cannot run standalone), so they are
+# reported as a named skip rather than run and failed — visible in the
+# transcript, and gated by the release allowlist like every other skip.
 check-profile-e2e: compartment-bpf test-tools
 	@set -u; \
 	if [ "$${RUN_E2E:-1}" = "0" ]; then \
 	  echo "[check-profile-e2e] RUN_E2E=0 set; skipping"; \
 	  exit 0; \
 	fi; \
-	rc=0; \
-	for s in tests/profile-e2e/aide.sh tests/profile-e2e/postgres.sh; do \
+	rc=0; n=0; \
+	for s in tests/profile-e2e/*.sh; do \
+	  [ -f "$$s" ] || continue; \
+	  n=$$((n + 1)); \
+	  if grep -q 'NONCE missing from orchestrator' "$$s"; then \
+	    echo "[check-profile-e2e] $$s SKIP (orchestrator-driven: needs tests/profile-e2e.sh, not standalone)"; \
+	    continue; \
+	  fi; \
 	  echo "[check-profile-e2e] $$s"; \
 	  bash "$$s"; \
 	  srrc=$$?; \
@@ -357,6 +370,7 @@ check-profile-e2e: compartment-bpf test-tools
 	    echo "[check-profile-e2e] $$s FAIL (rc=$$srrc)"; rc=1; \
 	  fi; \
 	done; \
+	echo "[check-profile-e2e] $$n scripts considered"; \
 	exit $$rc
 
 # ED-11 (Leader-7): exercise the Argon2id unpin-passphrase sentinel
