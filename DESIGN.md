@@ -41,8 +41,10 @@ compartment-user.c      <- includes compartment.h
 
 compartment-root.c      <- includes compartment.h
   |-- Namespace creation (clone flags)
-  |-- pivot_root + /dev + /proc setup
-  |-- UID/GID mapping
+  |-- pivot_root, then /proc + /sys + /dev, then detach the old root
+  |-- Built-in seccomp deny-list + /proc mask table
+  |-- Container init (PID 1 reaper: signal forwarding + orphan reaping)
+  |-- UID/GID mapping (identity by default; uid-map/gid-map to shift)
   |-- Capability drop + preserve (raw prctl + capset, no libcap)
   |-- Cgroup assignment
   |-- Network namespace (join or create)
@@ -240,6 +242,44 @@ positive "the probe ran" marker, an assertion cannot distinguish a blocked
 operation from a probe the sandbox refused to exec, and six assertions
 used to pass on exactly that ambiguity.
 
+Everything above is rootless. compartment-root needs real root, so it has
+its own suites under `tests/scripts/root.d/`, which the rootless targets do
+not run:
+
+```bash
+sudo make test-root
+```
+
+`root.d/compartment-root.sh` exercises a real container: start-up with a
+plain-directory rootdir, the `/dev` device nodes, the default seccomp
+filter, the privilege drop and `no-new-privs`, `/proc` and `/sys` masking,
+namespace isolation and escape attempts (host mounts, `/proc/1/root`, a
+pre-opened directory fd, a setuid-root binary), the PID 1 reaper and signal
+handling, the network namespace, uid/gid mapping, cgroup path confinement,
+and what `--dry-run` and `--audit` report. `root.d/profile-trust-root.sh`
+covers profile trust under root. Both build their own scratch trees under
+`mktemp -d` and remove everything they created on exit, including on
+failure. Green on kernel 6.8 (Ubuntu 24.04, gcc 13.3) and kernel 7.0
+(Ubuntu 26.04, gcc 15.2); the runner prints the assertion totals it
+measured rather than a number kept in this file.
+
 CI (`.github/workflows/ci.yml`) runs the build, the full rootless suite,
-the root suite under `sudo`, an ASan+UBSan build over the rootless suite,
+the root suites under `sudo`, an ASan+UBSan build over the rootless suite,
 shellcheck, and file-mode checks, on ubuntu-22.04 and ubuntu-24.04.
+
+### Mount order in compartment-root
+
+`compartment-root` as shipped in 1.3.3 could not start with a
+plain-directory `rootdir`: it detached the old root immediately after
+`pivot_root` and then tried to `mount("proc", ...)`, which the kernel
+refused with `EPERM` ("VFS: Mount too revealing"). `mount_too_revealing()`
+only allows a fresh `proc`/`sysfs` mount inside a user namespace when a
+fully visible mount of the same filesystem already exists in the current
+mount namespace, and detaching `/.pivot_old` removed the last one.
+
+The order is therefore: `pivot_root` → mount `/proc` → mount read-only
+`/sys` → tmpfs `/dev` plus bind-mounts of the old root's device nodes →
+`/proc` masks → `umount2("/.pivot_old", MNT_DETACH)`. Keeping the old root
+attached across those steps is also what makes the device nodes reachable
+at all: `mknod(2)` checks `CAP_MKNOD` against the initial user namespace
+and always fails in a `CLONE_NEWUSER` child.

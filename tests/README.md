@@ -6,9 +6,17 @@
 Integration tests for `compartment-user`, `compartment-root` and
 `sandbox.sh`.
 
-Note: compartment-root needs root, so its checks are not part of the
+Note: compartment-root needs real root, so its checks are not part of the
 unprivileged run. They live in `tests/scripts/root.d/` and must be started
-explicitly, as root (`sudo make test-root`).
+explicitly, as root:
+
+```bash
+sudo make test-root
+```
+
+Those suites build their own busybox rootdir under `mktemp -d`, refuse to
+run without root, and remove everything they created on exit — including
+on failure.
 
 ## Quick Start
 

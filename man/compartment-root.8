@@ -17,13 +17,18 @@ Isolation is applied in order:
 with new UTS, mount, PID, IPC, net, user, and cgroup namespaces.
 .IP 2.
 .B pivot_root
-\- new root filesystem; old root fully unmounted (stronger than chroot).
+\- new root filesystem, bind-mounted
+.B nosuid,nodev
+onto itself first (stronger than chroot).
 .IP 3.
-Minimal
-.IR /dev ", "
-masked
-.IR /proc ", "
-isolated hostname.
+.IR /proc " (fresh procfs), " /sys " (read-only sysfs), " /dev
+(tmpfs with device nodes bind-mounted from the old root), masked
+.IR /proc " paths, isolated hostname."
+All of this happens
+.I before
+the old root is detached \- see
+.B HARDENING DETAILS
+below.
 .IP 4.
 .B Capability drop
 \- all capabilities removed from bounding set except those named via
@@ -33,19 +38,26 @@ Uses raw prctl + capset (no libcap dependency).
 .B Privilege drop
 \- setgid/setuid to service user.
 .IP 6.
-.B seccomp BPF
-\- raw BPF filter, no libseccomp.
-.IP 7.
 .B Environment sanitization
 and
 .B audit logging
 (same as
 .BR compartment-user (1)).
-.IP 8.
+.IP 7.
 .B FD cleanup
-\- close all file descriptors >= 3 before exec
+\- close all file descriptors >= 3 before the seccomp filter is installed
 .RI ( close_range
 or fallback loop).
+.IP 8.
+.BR PR_SET_NO_NEW_PRIVS " (unconditional), " PR_SET_PDEATHSIG ,
+then a fork: the command runs as a child of a minimal
+.B PID 1
+reaper inside the pid namespace.
+.IP 9.
+.B seccomp BPF
+\- raw BPF filter, no libseccomp. A built-in deny-list is installed unless
+.BR \-\-block ", " \-\-seccomp\-allowed
+or a profile supplies one.
 .SH OPTIONS
 .SS Profile
 .TP
@@ -80,25 +92,54 @@ Override GID for privilege drop.
 Service user for privilege drop. Required.
 Looked up via
 .BR getpwnam (3)
-inside the container's
-.IR /etc/passwd .
+in the
+.B host
+.IR /etc/passwd ,
+before
+.BR clone (2)
+\- not in the container's. For a user that exists only inside the
+container, give
+.BR \-\-uid " and " \-\-gid
+explicitly; the name is then used only for diagnostics.
 .TP
 .BI \-n ", " \-\-netns " NAME"
 Join an existing network namespace
 .RI ( /var/run/netns/NAME ).
 Name must not contain \fB/\fR.
+.B Known limitation:
+the container always gets a new user namespace, and
+.BR setns (2)
+requires
+.B CAP_SYS_ADMIN
+in the user namespace that
+.I owns
+the target network namespace. A namespace created on the host (by
+.BR "ip netns add" ,
+say) is owned by the initial user namespace, so joining it fails with
+.BR EPERM .
+Use
+.B \-\-loopback
+in the container's own network namespace instead, or place the container
+inside an already-joined namespace from outside.
 .TP
 .BR \-l ", " \-\-loopback
 Bring up loopback interface in the new network namespace.
 .TP
 .BI \-C ", " \-\-cgroup " PATH"
 Assign the container process to a cgroup. Repeatable.
-Path must be absolute and contain no \fB..\fR components.
+Path must be absolute, contain no \fB..\fR components, and resolve
+(after
+.BR realpath (3))
+to a location under \fI/sys/fs/cgroup/\fR. The
+.I cgroup.procs
+file must already exist; it is never created.
 .TP
 .BI \-M ", " \-\-mount\-mask " PATH"
-Mount an empty read-only tmpfs over \fIPATH\fR inside the container.
-Repeatable. Used to hide sensitive paths in \fI/proc\fR.
-Path must be absolute and contain no \fB..\fR components.
+Hide \fIPATH\fR inside the container: an empty read-only tmpfs over a
+directory, a bind of \fI/dev/null\fR over anything else. Repeatable.
+Path must be absolute and contain no \fB..\fR components. A path that
+does not exist on the running kernel is skipped; a path that exists and
+cannot be masked is a fatal error.
 .SS Capabilities
 .TP
 .BI \-A ", " \-\-cap\-allowed " CAP"
@@ -121,6 +162,18 @@ Deny-list mode: block this syscall. Repeatable.
 .TP
 .B \-\-no\-seccomp
 Disable seccomp entirely.
+.PP
+With none of the above and no \fBblock\fR/\fBallow\fR lines in the
+profile, a built-in deny-list is installed (43 syscalls on x86\-64):
+ptrace and process_vm_readv/writev; mount, umount2, pivot_root, chroot,
+unshare, setns and the new mount API (open_tree, move_mount, fsopen,
+fsmount, fsconfig, fspick, mount_setattr); open_by_handle_at and
+name_to_handle_at; reboot, kexec_load, kexec_file_load, init_module,
+finit_module, delete_module; keyctl, add_key, request_key; bpf,
+userfaultfd, perf_event_open, io_uring_setup/enter/register; acct, swapon,
+swapoff, settimeofday, clock_settime, clock_adjtime, adjtimex;
+pidfd_getfd; ioperm and iopl. Asking for seccomp with an empty filter is
+refused rather than run unfiltered.
 .SS Environment
 .TP
 .BI \-E ", " \-\-env\-deny " VAR"
@@ -137,50 +190,171 @@ Do not strip environment variables.
 Show what would be applied without executing.
 .TP
 .BR \-v ", " \-\-verbose
-Print actions to stderr.
+Print actions to stderr. Combined with \fB\-\-dry\-run\fR it also lists
+the built-in parts of the policy: the mount plan, every masked path, the
+device nodes, the init reaper and the blocked syscalls by name.
 .TP
 .B \-\-audit
 Log events to stderr and to a file.
 .TP
 .BI \-L ", " \-\-audit\-log " DIR"
-Set audit log directory (implies \fB\-\-audit\fR).
+Audit log \fBdirectory\fR (implies \fB\-\-audit\fR). The log file
+inside it is named \fIYYYY\-MM\-DD.log\fR.
 .TP
 .B \-\-verify
 Check system support and exit.
 .TP
+.B \-\-version
+Print the version and exit.
+.TP
 .BR \-h ", " \-\-help
 Print usage summary.
 .SH HARDENING DETAILS
-.SS /proc masking
-The following paths are masked by default inside the container:
-.IR /proc/sys " (tmpfs),"
-.IR /proc/sysrq-trigger " (/dev/null),"
-.IR /proc/kcore " (/dev/null),"
-.IR /proc/acpi " (tmpfs)."
-Additional paths can be masked with
+.SS Mount order and mount_too_revealing
+Mounting a fresh
+.IR procfs " or " sysfs
+from inside a user namespace is gated by the kernel's
+.BR mount_too_revealing ()
+check: it succeeds only while a fully visible mount of the same filesystem
+already exists in the current mount namespace. The container therefore
+does
+.BR pivot_root (2)
+first, mounts
+.IR /proc " and " /sys ,
+populates
+.IR /dev ,
+applies the masks, and detaches the old root
+.RB ( "umount2(MNT_DETACH)" )
+last. Detaching it earlier makes the
+.I /proc
+mount fail with
+.BR EPERM .
+.SS Container root
+.I rootdir
+is bind-mounted onto itself
+.RB ( MS_BIND | MS_REC )
+and then remounted
+.BR nosuid,nodev .
+The remount uses
+.BR mount_setattr (2)
+with
+.B AT_RECURSIVE
+where available (Linux 5.12+) so submounts are covered too, and falls back
+to
+.BR MS_REMOUNT | MS_BIND ,
+which changes the per-mount flags only \- the superblock and the host's
+view of the same filesystem are untouched. A setuid-root binary inside
+.I rootdir
+therefore does not elevate.
+.SS /dev
+A
+.B tmpfs
+is mounted on
+.I /dev
+.RB ( nosuid,noexec ;
+deliberately not
+.BR nodev ),
+and
+.IR null ", " zero ", " full ", " random ", " urandom " and " tty
+are bind-mounted into it from the old root.
+.BR mknod (2)
+cannot be used: the kernel checks
+.B CAP_MKNOD
+against the initial user namespace, so it always fails here. Each bind is
+fatal on failure.
+.IR /dev/pts " is created and " /dev/fd ", " /dev/stdin ", " /dev/stdout
+and
+.I /dev/stderr
+are symlinked into
+.IR /proc/self/fd .
+.SS /proc and /sys masking
+.I /proc
+is a fresh procfs
+.RB ( nosuid,noexec,nodev ).
+.I /sys
+is a fresh read-only sysfs
+.RB ( ro,nosuid,noexec,nodev )
+with
+.I /sys/firmware
+masked; if the kernel refuses the sysfs mount,
+.I /sys
+is covered with an empty read-only tmpfs instead.
+.PP
+Masked by default inside the container \- an empty read-only tmpfs over a
+directory, a bind of
+.I /dev/null
+over a file:
+.IR /proc/acpi ", " /proc/bus ", " /proc/fs ", " /proc/irq ", "
+.IR /proc/kallsyms ", " /proc/kcore ", " /proc/keys ", "
+.IR /proc/latency_stats ", " /proc/modules ", " /proc/sched_debug ", "
+.IR /proc/scsi ", " /proc/sys ", " /proc/sysrq-trigger ", "
+.IR /proc/timer_list ", " /proc/timer_stats .
+Entries absent on the running kernel are skipped; an entry that exists and
+cannot be masked aborts the run. Additional paths can be masked with
 .BR \-\-mount\-mask .
+.SS User namespace
+The parent writes
+.B deny
+to
+.I /proc/<pid>/setgroups
+before the gid map (skipped when the policy keeps
+.BR CAP_SETGID )
+and clears its own supplementary groups before
+.BR clone (2).
+The map itself defaults to the identity map \fB0 0 65536\fR, which gives
+a capability boundary but
+.B no uid isolation:
+container uid 0 is host uid 0 for DAC purposes. Use the
+.BR uid-map " and " gid-map
+profile directives to map onto a subuid range instead \-
+.I rootdir
+must then be owned by the mapped host uid.
+.SS Container init
+The command does not run as PID 1. PID 1 of the new pid namespace is a
+minimal reaper that sets
+.B PR_SET_PDEATHSIG
+to
+.BR SIGKILL ,
+forwards
+.BR SIGTERM ", " SIGINT ", " SIGHUP " and " SIGQUIT
+to the command, reaps orphans, and exits with the command's status
+(128+\fIn\fR if it was killed by signal \fIn\fR). The reaper is inside
+every namespace and carries the same dropped capabilities, dropped uid and
+.B no-new-privs
+as the command, but it is deliberately
+.B not
+covered by the seccomp filter \- the command installs that for itself
+after the fork, so an allow-list policy that does not mention
+.BR wait4 / kill / rt_sigaction
+cannot break the reaper. It execs nothing. Without it a command
+with no signal handlers would ignore Ctrl\-C, orphans would never be
+reaped, and killing
+.B compartment-root
+would leave the container running.
 .SS Privilege drop sequence
 .IP 1. 4
-.B PR_SET_DUMPABLE(0)
-\- prevent ptrace from outside.
-.IP 2.
-.B PR_SET_NO_NEW_PRIVS
-\- prevent setuid escalation.
-.IP 3.
 Drop bounding-set capabilities (while still root, needs CAP_SETPCAP).
-.IP 4.
+.IP 2.
 .B setgid/setuid
 to service user.
-.IP 5.
+.IP 3.
 If
 .B \-\-cap\-allowed
 is used: restore named capabilities via capset + ambient raise.
+.IP 4.
+.B PR_SET_DUMPABLE(0)
+\- prevent ptrace from outside.
+.IP 5.
+Environment sanitization.
 .IP 6.
+Close all FDs >= 3.
+.IP 7.
+.BR PR_SET_NO_NEW_PRIVS " and " PR_SET_PDEATHSIG ,
+then fork under the PID 1 reaper.
+.IP 8.
 .B seccomp BPF
 filter applied.
-.IP 7.
-Close all FDs >= 3.
-.IP 8.
+.IP 9.
 .B execvp
 the command.
 .SH EXAMPLES
@@ -197,21 +371,30 @@ With profile:
 Preview:
 .B compartment-root \-\-profile container \-\-dry\-run \-\- /bin/sh
 .SH EXIT STATUS
+The container command's exit status is passed through, so any value in
+0\-255 is possible.
 .TP
 .B 0
 Command executed successfully inside the container.
 .TP
 .B 1
-Configuration error, namespace creation failure, or privilege drop failure.
+Configuration error, namespace creation failure, or privilege drop failure
+\- or the command itself exiting 1.
+.TP
+.BI 128+ n
+The command was killed by signal \fIn\fR.
 .SH FILES
 .TP
 .I /etc/compartment/*.conf
 System-wide profile files.
 compartment-root reads no other location.
 .TP
-.I /var/log/compartment/
-Default audit log directory when running as root (one file per day),
-created mode 0700.
+.I /var/log/compartment/YYYY\-MM\-DD.log
+Default audit log, when
+.B \-\-audit
+is given without
+.BR \-\-audit\-log :
+one file per day in a directory created mode 0700.
 It must be owned by root and mode 0700; compartment-root refuses to run
 if auditing was requested and the directory cannot be used safely.
 .SH REQUIREMENTS

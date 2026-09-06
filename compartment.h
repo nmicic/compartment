@@ -119,6 +119,8 @@ typedef struct {
     int         loopback;
     const char *mount_masks[MAX_PATHS];
     int         mount_mask_count;
+    char       *uid_map;        /* "<inside> <outside> <count>\n", NULL = identity */
+    char       *gid_map;        /* idem for gids */
 } Config;
 
 /* ── Syscall name → number table ────────────────────────────────────
@@ -1131,6 +1133,46 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 fprintf(stderr, "compartment: %s:%d: invalid value for loopback: '%s' (use on/off)\n", path, lineno, val);
                 fclose(fp); return PROFILE_ERROR;
             }
+        } else if (strcmp(directive, "uid-map") == 0 ||
+                   strcmp(directive, "gid-map") == 0) {
+            /* <container-start> <host-start> <count> — the range written to
+             * /proc/<pid>/uid_map (or gid_map) of the container's user
+             * namespace.  Without these directives the map is the identity
+             * map "0 0 65536", which gives a capability boundary but no uid
+             * isolation: container uid 0 is host uid 0 for DAC purposes.
+             * "0 100000 65536" maps the container onto an unprivileged
+             * subuid range instead. */
+            /* unsigned long long, not unsigned long: on a 32-bit build
+             * UINT32_MAX + 1 would wrap and reject every valid range. */
+            unsigned long long inside, outside, count;
+            const unsigned long long UID_LIMIT = (unsigned long long)UINT32_MAX + 1ULL;
+            char extra[2];
+            if (sscanf(val, "%llu %llu %llu %1s",
+                       &inside, &outside, &count, extra) != 3 ||
+                count == 0 ||
+                inside  >= UID_LIMIT || outside >= UID_LIMIT ||
+                count   >  UID_LIMIT ||
+                inside  + count > UID_LIMIT ||
+                outside + count > UID_LIMIT) {
+                fprintf(stderr, "compartment: %s:%d: invalid %s: '%s' "
+                        "(expected: <container-start> <host-start> <count>)\n",
+                        path, lineno, directive, val);
+                fclose(fp);
+                return PROFILE_ERROR;
+            }
+            char map[64];
+            snprintf(map, sizeof(map), "%llu %llu %llu\n",
+                     inside, outside, count);
+            /* A superseded map is deliberately not free()d: this Config is
+             * the loader's scratch copy and still shares the pointer with
+             * the caller's until the file parses cleanly (load_profile_file).
+             * Freeing here would leave the caller holding a dangling pointer
+             * when a later line rejects the profile.  Same leak-on-rollback
+             * convention as every other string the loader adds. */
+            if (directive[0] == 'u')
+                cfg->uid_map = xstrdup(map);
+            else
+                cfg->gid_map = xstrdup(map);
         } else if (strcmp(directive, "mount-mask") == 0) {
             if (cfg_add_str(cfg->mount_masks, &cfg->mount_mask_count, MAX_PATHS, where, "mount-mask", val, 1) != 0) {
                 fclose(fp); return PROFILE_ERROR;

@@ -17,9 +17,10 @@ core tools, one shared profile format, plus an optional BPF-LSM module.
 > `make test-integration` and `sudo make test-root` for the current
 > counts), but it has not undergone professional penetration testing
 > or formal verification. The automated tests do not yet cover all
-> bypass vectors (e.g. direct network egress in sandbox mode, and
-> compartment-root under root is only beginning to be covered). Use
-> it as a defense-in-depth layer, not as your sole
+> bypass vectors (e.g. direct network egress in sandbox mode).
+> compartment-root is covered by root-only suites — see
+> [tests/scripts/root.d/](tests/scripts/root.d/). Use it as a
+> defense-in-depth layer, not as your sole
 > security boundary. See [DESIGN.md](DESIGN.md) for documented
 > limits and the full security review log.
 
@@ -201,13 +202,21 @@ Landlock → seccomp → `chdir` → hardening → `exec`.
 
 **compartment-root** creates a fully isolated container:
 
-1. `clone()` with new UTS, mount, PID, IPC, net, user namespaces
-2. **pivot_root** — old root fully unmounted (stronger than chroot)
-3. Minimal `/dev`, masked `/proc`, isolated hostname
+1. `clone()` with new UTS, mount, PID, IPC, net, user, cgroup namespaces
+2. **pivot_root** — the new root is bind-mounted `nosuid,nodev` onto itself
+   first, so a setuid binary inside it cannot elevate (stronger than chroot)
+3. Fresh `/proc`, read-only `/sys`, a `/dev` tmpfs with `null`, `zero`,
+   `full`, `random`, `urandom` and `tty` bind-mounted from the old root,
+   15 masked `/proc` paths, isolated hostname — all of it applied *before*
+   the old root is detached, which is what the kernel's
+   `mount_too_revealing()` check requires
 4. **Capability drop** — raw prctl + capset, no libcap. `cap-allow` preserves
    named capabilities for the service user via `PR_SET_KEEPCAPS` + `capset()`
-5. **seccomp BPF** — raw BPF, no libseccomp
-6. **Environment sanitize** + **audit logging** (same as compartment-user)
+5. **seccomp BPF** — raw BPF, no libseccomp; a 43-syscall deny-list is
+   installed by default
+6. **Environment sanitize** + **audit logging** (same as compartment-user),
+   FD cleanup, `PR_SET_NO_NEW_PRIVS` (which no profile can turn off), and a
+   minimal PID 1 reaper that forwards signals and reaps orphans
 
 **sandbox.sh** wraps the command in a network-isolated user+mount namespace:
 

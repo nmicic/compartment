@@ -669,19 +669,38 @@ make compartment-root
 ### What compartment-root does (in order)
 
 1. Load profile file (if `--profile`)
-2. Resolve username to UID/GID (host `/etc/passwd`)
+2. Resolve username to UID/GID (**host** `/etc/passwd`, before `clone()` —
+   for a user that only exists inside the container, pass `--uid`/`--gid`)
 3. Open audit log (host filesystem, before namespace setup)
-4. `clone()` with new namespaces (UTS, mount, PID, IPC, net, user)
-5. Parent: UID/GID range mapping (0-65535), cgroup assignment
-6. Child: `pivot_root` (old root fully unmounted)
-7. Child: Minimal `/dev`, masked `/proc`
-8. Child: Hostname isolation, optional loopback, resource limits
+4. `clone()` with new namespaces (UTS, mount, PID, IPC, net, user, cgroup)
+5. Parent: clear supplementary groups, write `deny` to
+   `/proc/<pid>/setgroups`, write the UID/GID maps (identity `0 0 65536`
+   unless `uid-map`/`gid-map` say otherwise), cgroup assignment
+6. Child: become uid 0 *of the new namespace*, `pivot_root`
+7. Child: mount `/proc`, mount read-only `/sys`, populate `/dev` with
+   device nodes bind-mounted from the old root, apply the `/proc` masks —
+   **then** detach the old root (see "Why the order matters" below)
+8. Child: Hostname isolation, optional loopback
 9. Child: Capability bounding-set drop (raw `prctl` — while still root)
 10. Child: `PR_SET_KEEPCAPS` + privilege drop (`setgid`/`setuid`)
 10b. Child: `capset()` — restore effective+permitted caps for service user
-11. Child: Environment sanitize
-12. Child: seccomp BPF (raw, fatal on failure)
-13. Child: Close inherited FDs, `exec` the command
+11. Child: `PR_SET_DUMPABLE(0)`, environment sanitize
+12. Child: audit `CONTAINER_EXEC`, close inherited FDs
+13. Child: `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG`, fork under a PID 1
+    reaper, seccomp BPF (raw, fatal on failure), resource limits,
+    `exec` the command
+
+### Why the order matters
+
+Mounting a fresh `proc` or `sysfs` inside a user namespace is gated by the
+kernel's `mount_too_revealing()` check: it only succeeds while a fully
+visible mount of the same filesystem still exists in the current mount
+namespace. Detaching the old root removes the last visible procfs, so the
+old sequence (detach, then `mount proc`) failed with `EPERM` and
+compartment-root could not start at all. The old root is also the only
+source of real device nodes — `mknod(2)` checks `CAP_MKNOD` against the
+*initial* user namespace and always fails here — so `/dev` is populated by
+bind-mounting from `/.pivot_old/dev` before the detach.
 
 ### Root-specific profile directives
 
@@ -696,6 +715,33 @@ make compartment-root
 | `cgroup` | `cgroup /sys/fs/cgroup/cpu/sandbox` | Cgroup assignment (repeatable) |
 | `cap-allow` | `cap-allow CAP_NET_BIND_SERVICE` | Preserve capability for service user (repeatable) |
 | `mount-mask` | `mount-mask /proc/timer_list` | Extra path to mask (repeatable) |
+| `uid-map` | `uid-map 0 100000 65536` | `<container-start> <host-start> <count>`; default is the identity map `0 0 65536` |
+| `gid-map` | `gid-map 0 100000 65536` | Same, for gids |
+
+`cgroup` paths must resolve under `/sys/fs/cgroup/`.
+
+**The default uid map gives no uid isolation.** `0 0 65536` maps container
+uid 0 to host uid 0, so a process that regains uid 0 inside the container
+is host root for DAC purposes on the files backing `rootdir`. The user
+namespace still provides a capability boundary, which is the layer that
+matters here — but if you want a uid boundary too, map onto a subuid range
+with `uid-map`/`gid-map` and `chown` `rootdir` to the mapped host uid.
+
+### Testing compartment-root
+
+The rootless suite (`make test`) cannot exercise any of this. There is a
+separate root-only suite:
+
+```bash
+sudo ./tests/scripts/root.d/compartment-root.sh
+```
+
+It builds its own busybox rootdir under `mktemp -d`, runs 59 assertions
+against a real container (start-up, `/dev`, seccomp, privilege drop,
+`/proc` and `/sys` masking, namespace isolation and escape attempts, the
+init reaper, networking, uid mapping, cgroup confinement, reporting), and
+removes everything it created on exit. All 59 pass on kernel 6.8
+(Ubuntu 24.04) and kernel 7.0 (Ubuntu 26.04).
 
 ---
 
