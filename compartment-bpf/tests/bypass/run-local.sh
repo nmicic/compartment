@@ -18,8 +18,12 @@
 # so the default developer-host `make check` stays green; it becomes a real
 # gate inside the smoke VM.
 set -u
-cd "$(dirname "$0")/../.."
-REPO=${REPO:-$(pwd)}
+# REPO is authoritative for BOTH the witness list and the binaries the
+# witnesses resolve through lib-bypass.sh. It used to only affect the latter,
+# so `REPO=/elsewhere run-local.sh` ran /elsewhere's daemon against THIS
+# checkout's scripts.
+REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
+cd "$REPO" || { echo "[bypass-local] FAIL — REPO=$REPO is not a directory" >&2; exit 1; }
 export REPO
 
 # Whole-suite environment gate → clean SKIP (rc=77) on a dev host. The
