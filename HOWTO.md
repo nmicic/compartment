@@ -227,6 +227,12 @@ Used by **compartment-root** only:
 | `cap-allow` | capability name | `cap-allow net_bind_service` | `--cap-allowed` |
 | `loopback` | on/off | `loopback on` | `--loopback` |
 | `mount-mask` | path | `mount-mask /proc/keys` | `--mount-mask` |
+| `uid-map` | `<container-start> <host-start> <count>` | `uid-map 0 100000 65536` | — (profile only) |
+| `gid-map` | `<container-start> <host-start> <count>` | `gid-map 0 100000 65536` | — (profile only) |
+
+`uid-map` and `gid-map` have no command-line equivalent; both default to
+the identity map `0 0 65536`, which gives a capability boundary and no uid
+isolation. See "Root-specific profile directives" below.
 
 Note the one name that differs between the two spellings: the profile
 directive is `cap-allow`, the command-line flag is `--cap-allowed`.
