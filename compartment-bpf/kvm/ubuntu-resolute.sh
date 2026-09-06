@@ -102,10 +102,16 @@ mask2cidr() {
 # so a host that happened to have those skipped the whole install and a missing
 # ovmf surfaced much later as an opaque virt-install error. Probe EVERY binary
 # this script executes, plus the UEFI firmware `--boot uefi` needs.
+#
+# Every package HOST_TOOLS names has to appear in HOST_PKGS as well, or the
+# probe reports a package the installer never installs and the run dies on the
+# re-probe with "Still missing after apt-get install". iproute2 (`ip`) did
+# exactly that, and `sysctl` — run unconditionally to set ip_forward — was not
+# probed at all, so a host without procps failed at the call site with 127.
 HOST_PKGS=(
   qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients virtinst
   cloud-image-utils genisoimage bridge-utils iptables curl
-  libosinfo-bin ovmf
+  libosinfo-bin ovmf iproute2 procps
 )
 
 # tool:apt-package pairs for every external command used below.
@@ -120,6 +126,7 @@ HOST_TOOLS=(
   "curl:curl"
   "ip:iproute2"
   "osinfo-query:libosinfo-bin"
+  "sysctl:procps"
 )
 
 # ovmf ships firmware blobs, not a binary; --boot uefi fails without them.
@@ -405,6 +412,25 @@ packages:
   - aide
   - postgresql-common
   - postgresql
+  # Fixtures two bypass witnesses need, neither of which a cloud image or
+  # build-essential brings in:
+  #   acl          — tests/bypass/16-setfacl-no-chmod.sh SKIPs without
+  #                  setfacl/getfacl. That drops the bypass tally to 38,
+  #                  below the floor of 39 tracked in
+  #                  tests/release-totals.sh, so "sudo make check-release"
+  #                  on a guest built from this script FAILED with
+  #                  "bypass: 38, floor is 39 — the corpus shrank". The
+  #                  skip is not in tests/release-skip-allowlist.txt
+  #                  either, by design: a skip a package would close is a
+  #                  package problem, not a gate problem.
+  #   gcc-multilib — tests/bypass/18-chattr-no-chmod.sh builds its 32-bit
+  #                  compat-ioctl witness (W3) with "gcc -m32". Without a
+  #                  multilib toolchain that sub-witness is quietly not
+  #                  exercised: the script still prints one PASS label, so
+  #                  no tally moves and nothing fails — the FS_IOC_SETFLAGS
+  #                  compat path simply stops being tested.
+  - acl
+  - gcc-multilib
 
 write_files:
   - path: /etc/ssh/sshd_config.d/99-allow-root.conf
@@ -537,7 +563,14 @@ After that reboot, validate from the host:
 Then sync the compartment-bpf source and run the smoke gate:
 
   rsync -a --exclude=.git/ <checkout>/compartment-bpf/ ${USERNAME}@${VM_IP}:~/compartment-bpf/
-  ssh ${USERNAME}@${VM_IP} "bash -lc 'cd ~/compartment-bpf && make vmlinux.h && make && sudo make check'"
+  ssh ${USERNAME}@${VM_IP} "bash -lc 'cd ~/compartment-bpf && make regen-vmlinux && make && sudo make check'"
+
+\`make regen-vmlinux\`, not \`make vmlinux.h\`: rsyncing a checkout that has
+already been built on the host carries that host's vmlinux.h across, and
+\`make vmlinux.h\` is then a no-op on an up-to-date file — the guest would
+compile its BPF objects against the HOST kernel's BTF, which is the one
+thing a kernel-matrix VM exists to avoid. regen-vmlinux re-dumps the header
+from the guest's own /sys/kernel/btf/vmlinux first.
 
 \`make check\` runs every gate and prints a per-target transcript; the last
 lines are the howto-examples tally, and the run is green when it exits 0.
