@@ -609,10 +609,27 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             return -1;
         }
 
-        /* Skip blank lines and comments */
+        /* Strip an inline comment, then right-trim.
+         *
+         * A '#' that begins a whitespace-separated token starts a comment;
+         * a '#' inside a token stays literal, so a path such as
+         * "/tmp/issue#42" still works. Without this, "ro /usr  # libs"
+         * became the literal path "/usr  # libs" (no rule installed) and
+         * "env-deny LD_PRELOAD  # injection" stripped nothing. */
+        for (char *q = line; *q; q++) {
+            if (*q == '#' && (q == line || q[-1] == ' ' || q[-1] == '\t')) {
+                *q = '\0';
+                break;
+            }
+        }
+        len = strlen(line);
+        while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t'))
+            line[--len] = '\0';
+
+        /* Skip blank lines and comment-only lines */
         const char *s = line;
         while (*s == ' ' || *s == '\t') s++;
-        if (*s == '\0' || *s == '#') continue;
+        if (*s == '\0') continue;
 
         char directive[64] = "";
         char value[MAX_LINE] = "";
