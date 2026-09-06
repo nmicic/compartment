@@ -525,7 +525,8 @@ It builds its own busybox rootdir under `mktemp -d`, runs 59 assertions
 against a real container (start-up, `/dev`, seccomp, privilege drop,
 `/proc` and `/sys` masking, namespace isolation and escape attempts, the
 init reaper, networking, uid mapping, cgroup confinement, reporting), and
-removes everything it created on exit.
+removes everything it created on exit. All 59 pass on kernel 6.8
+(Ubuntu 24.04) and kernel 7.0 (Ubuntu 26.04).
 
 ---
 

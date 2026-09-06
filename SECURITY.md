@@ -55,9 +55,10 @@ documented limitations, including:
   the container, `/proc/1/root`, a pre-opened host directory fd, a
   setuid-root binary inside `rootdir`), the PID 1 reaper and signal
   handling, the network namespace, uid/gid mapping, cgroup path
-  confinement and policy reporting. Verified on Ubuntu 24.04
-  (kernel 6.8.0). The suite is not part of `make test`, which stays
-  rootless, and it is not yet run in CI
+  confinement and policy reporting. All 59 pass on Ubuntu 24.04
+  (kernel 6.8.0, gcc 13.3) and Ubuntu 26.04 (kernel 7.0.0, gcc 15.2).
+  The suite is not part of `make test`, which stays rootless, and it is
+  not yet run in CI
 - The uid/gid map defaults to the identity map, so the user namespace
   provides a capability boundary but no uid isolation unless `uid-map` /
   `gid-map` are set (see HOWTO.md)

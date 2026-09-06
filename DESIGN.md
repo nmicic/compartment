@@ -215,7 +215,8 @@ directory fd, a setuid-root binary), the PID 1 reaper and signal handling,
 the network namespace, uid/gid mapping, cgroup path confinement, and what
 `--dry-run` and `--audit` report. It builds its own busybox rootdir under
 `mktemp -d` and removes everything it created on exit, including on
-failure.
+failure. All 59 pass on kernel 6.8 (Ubuntu 24.04, gcc 13.3) and kernel 7.0
+(Ubuntu 26.04, gcc 15.2).
 
 ### Mount order in compartment-root
 
