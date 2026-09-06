@@ -15,25 +15,25 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `inode_mknod` | witnessed | `tests/dir-matrix-runner.sh` |
 | `inode_symlink` | witnessed | `tests/dir-matrix-runner.sh` |
 | `inode_link` | witnessed | `tests/dir-matrix-runner.sh` |
-| `file_open` | witnessed | `tests/matrix-runner.sh` |
-| `file_permission` | witnessed | `tests/mesh/run-mesh.sh` |
+| `file_open` | witnessed | `tests/bench/actor-overhead.sh` |
+| `file_permission` | witnessed | `tests/bypass/05-old-fd-write.sh` |
 | `file_truncate` | witnessed | `tests/bypass/02-truncate-no-open.sh` |
 | `inode_setattr` | witnessed | `tests/inode-seal-witness.sh` |
 | `mmap_file` | witnessed | `tests/sealprobe.c` |
-| `file_mprotect` | witnessed | `tests/mesh/stubs/mesh_stub_main.c` |
+| `file_mprotect` | witnessed | `tests/bypass/03-mprotect-rw.sh` |
 | `inode_setxattr` | witnessed | `tests/sealprobe.c` |
 | `inode_removexattr` | witnessed | `tests/sealprobe.c` |
 | `bprm_committed_creds` | witnessed | `tests/strict-launch/run.sh` |
 | `task_alloc` | exempt | Fork marker-copy hook; no op token. Witnessed indirectly by marker_copy_fork_total (strict-launch/run.sh + stability/counter-longevity.sh). |
 | `task_prctl` | witnessed | `tests/strict-launch/run.sh` |
 | `ptrace_access_check` | witnessed | `tests/strict-launch/run.sh` |
-| `ptrace_traceme` | witnessed | `tests/strict-launch/run.sh` |
+| `ptrace_traceme` | witnessed | `tests/strict-launch/fixtures/slm-actor.c` |
 | `inode_set_acl` | witnessed | `tests/bypass/16-setfacl-no-chmod.sh` |
 | `inode_remove_acl` | witnessed | `tests/bypass/16-setfacl-no-chmod.sh` |
 | `file_ioctl` | witnessed | `tests/bypass/18-chattr-no-chmod.sh` |
 | `file_ioctl_compat` | witnessed | `tests/bypass/18-chattr-no-chmod.sh` |
-| `sb_mount` | witnessed | `tests/mesh/run-mesh.sh` |
-| `sb_umount` | witnessed | `tests/inode-seal-witness.sh` |
+| `sb_mount` | witnessed | `tests/bypass/07-mount-bind-decoy.sh` |
+| `sb_umount` | witnessed | `tests/bypass/20-umount-shadow.sh` |
 | `move_mount` | witnessed | `tests/bypass/17-mount-inside-sealed-dir.sh` |
 ## observe-hook
 
@@ -55,19 +55,19 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 
 | surface | status | note |
 |---|---|---|
-| `DENY_ACTOR_MISMATCH` | witnessed | `tests/deny-to-candidate.sh` |
+| `DENY_ACTOR_MISMATCH` | witnessed | `tests/bypass/exec-domain/BX-5-setuid-actor.sh` |
 | `DENY_STRICT_LAUNCH_MISSING` | exempt | Path exercised via strict_launch_missing_total (strict-launch/run.sh); audit-token grep pending Phase 3 SL-6. |
 | `DENY_WRITE_PARENT_DIR` | witnessed | `tests/bypass/11-rename-into-no-write-dir.sh` |
 | `DENY_WRITE` | witnessed | `tests/aggregate-smoke.sh` |
 | `DENY_CHMOD_PARENT_DIR` | exempt | Path exercised via dir-matrix chmod-on-sealed-dir; audit-token witness pending Phase 3 (upgrade me25_trial / tests/coverage/parent-dir-actions.sh). |
-| `DENY_CHMOD` | witnessed | `tests/inode-seal-witness.sh` |
+| `DENY_CHMOD` | witnessed | `tests/bypass/16-setfacl-no-chmod.sh` |
 | `DENY_PRCTL_SET_MM` | witnessed | `tests/strict-launch/run.sh` |
 | `DENY_PTRACE_ACCESS` | witnessed | `tests/deny-to-candidate.sh` |
 | `DENY_PTRACE_TRACEME` | witnessed | `tests/strict-launch/run.sh` |
 | `DENY_MOUNT` | witnessed | `tests/bypass/07-mount-bind-decoy.sh` |
-| `DENY_UMOUNT` | witnessed | `tests/inode-seal-witness.sh` |
+| `DENY_UMOUNT` | witnessed | `tests/bypass/20-umount-shadow.sh` |
 | `DENY_UNLINK` | witnessed | `tests/mesh/run-mesh.sh` |
-| `DENY_RENAME` | witnessed | `tests/mesh/run-mesh.sh` |
+| `DENY_RENAME` | witnessed | `tests/bypass/11-rename-into-no-write-dir.sh` |
 | `DENY_CREATE` | witnessed | `tests/bypass/14-runtime-subtree-depth-cap.sh` |
 | `DENY_UNPIN_AUTH_FAIL` | witnessed | `tests/pin-passphrase.sh` |
 ## counter
@@ -76,7 +76,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 |---|---|---|
 | `deny_total` | witnessed | `tests/counter-smoke.sh` |
 | `audit_drop_total` | witnessed | `tests/counter-smoke.sh` |
-| `actor_mismatch_total` | witnessed | `tests/counter-smoke.sh` |
+| `actor_mismatch_total` | witnessed | `tests/bypass/exec-domain/BX-5-setuid-actor.sh` |
 | `strict_launch_missing_total` | witnessed | `tests/bypass/exec-domain/BX-11-ld-preload-strict.sh` |
 | `strict_launch_allowed_total` | witnessed | `tests/stability/counter-longevity.sh` |
 | `marker_set_total` | witnessed | `tests/stability/counter-longevity.sh` |
