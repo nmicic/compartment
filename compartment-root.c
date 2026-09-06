@@ -53,6 +53,26 @@
 #define CLONE_NEWCGROUP 0x02000000
 #endif
 
+/* mount_setattr(2): Linux 5.12+. Declared here rather than pulled in from
+ * <linux/mount.h> so the build stays header-independent (and keeps the
+ * zero-dependency promise). Only used to apply nosuid/nodev recursively;
+ * the code falls back to MS_REMOUNT|MS_BIND when it is unavailable. */
+#ifndef MOUNT_ATTR_NOSUID
+#define MOUNT_ATTR_NOSUID 0x00000002
+#endif
+#ifndef MOUNT_ATTR_NODEV
+#define MOUNT_ATTR_NODEV  0x00000004
+#endif
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE      0x8000
+#endif
+struct compartment_mount_attr {   /* layout of struct mount_attr */
+    uint64_t attr_set;
+    uint64_t attr_clr;
+    uint64_t propagation;
+    uint64_t userns_fd;
+};
+
 /* Shared: Config struct, syscall/cap tables, profile loader, audit,
  * env sanitize, seccomp BPF builder — all static inline, zero deps. */
 #include "compartment.h"
@@ -257,6 +277,14 @@ int main(int argc, char *argv[])
         case 'h': print_help(argv[0]); return 0;
         default:  print_help(argv[0]); return 1;
         }
+    }
+
+    /* ── no-new-privs is not negotiable for compartment-root ──────── */
+
+    if (!config.use_no_new_privs) {
+        fprintf(stderr, "compartment-root: no-new-privs cannot be disabled "
+                "— ignoring 'no-new-privs off'\n");
+        config.use_no_new_privs = 1;
     }
 
     /* Command to execute */
@@ -535,6 +563,42 @@ static int child_func(void *arg)
         exit(EXIT_FAILURE);
     }
 
+    /* b2) Re-apply the bind with MS_NOSUID|MS_NODEV.
+     *
+     * A bind mount inherits the mount flags of its source, so without this
+     * the container root carries whatever the host filesystem had —
+     * typically neither nosuid nor nodev.  A setuid-root binary sitting
+     * inside rootdir then still elevates, and a device node planted there
+     * is still a device node.
+     *
+     * MS_REMOUNT|MS_BIND changes only the per-mount flags: the filesystem
+     * type, source and data arguments are ignored and the superblock is
+     * left alone, so the host's own view of the same filesystem is
+     * unaffected.  mount(2) ignores MS_REC on a remount, so that call
+     * covers the top mount only; mount_setattr(2) (Linux 5.12+) with
+     * AT_RECURSIVE also covers the submounts MS_REC dragged in.  Prefer
+     * it, fall back to the plain remount on older kernels. */
+    {
+        int r = -1;
+#ifdef __NR_mount_setattr
+        struct compartment_mount_attr ma;
+        memset(&ma, 0, sizeof(ma));
+        ma.attr_set = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
+        r = (int)syscall(__NR_mount_setattr, AT_FDCWD, config->rootdir,
+                         AT_RECURSIVE, &ma, sizeof(ma));
+#endif
+        if (r != 0 && mount(NULL, config->rootdir, NULL,
+                            MS_BIND | MS_REMOUNT | MS_NOSUID | MS_NODEV,
+                            NULL) != 0) {
+            perror("compartment-root: remount rootdir nosuid,nodev");
+            exit(EXIT_FAILURE);
+        }
+        if (config->verbose)
+            fprintf(stderr, "compartment-root: rootdir remounted "
+                    "nosuid,nodev (%s)\n",
+                    r == 0 ? "recursive" : "top mount only");
+    }
+
     /* c) Enter new root */
     if (chdir(config->rootdir) != 0) {
         perror("compartment-root: chdir rootdir");
@@ -750,13 +814,17 @@ static int child_func(void *arg)
     if (config->use_env_sanitize)
         sanitize_env(config);
 
-    /* 13. seccomp (must be after no_new_privs, last before exec) */
-    if (config->use_no_new_privs) {
-        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-            fprintf(stderr, "compartment-root: PR_SET_NO_NEW_PRIVS: %s\n",
-                    strerror(errno));
-            exit(EXIT_FAILURE);
-        }
+    /* 13. seccomp (must be after no_new_privs, last before exec).
+     *
+     * no-new-privs is unconditional here: it is what makes the seccomp
+     * filter installable without privilege and what stops a setuid binary
+     * inside rootdir from re-gaining privilege after the drop.  The
+     * profile grammar has a `no-new-privs off` switch for compartment-user;
+     * compartment-root refuses to honour it (see main()). */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        fprintf(stderr, "compartment-root: PR_SET_NO_NEW_PRIVS: %s\n",
+                strerror(errno));
+        exit(EXIT_FAILURE);
     }
     if (config->use_seccomp) {
         if (apply_seccomp(config) != 0) {
