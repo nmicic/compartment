@@ -1047,9 +1047,11 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
             }
             /* Try loading the inherited profile. Search order:
              * 1. Same directory as the current profile file
-             * 2. Standard search paths (~/.config/compartment/, /etc/compartment/)
-             * This ensures "inherit ai-agent" works when strict.conf and
-             * ai-agent.conf sit in the same directory. */
+             * 2. The normal search path for this load — /etc/compartment/,
+             *    and ~/.config/compartment/ only when PROFILE_SEARCH_USER
+             *    is still set, which a profile loaded from /etc never has.
+             * Step 1 is what makes "inherit ai-agent" work when strict.conf
+             * and ai-agent.conf sit in the same directory. */
             int found = PROFILE_NOT_FOUND;
             if (!strchr(val, '/')) {
                 /* Extract directory from current profile path */
