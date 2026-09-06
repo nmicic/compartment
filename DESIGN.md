@@ -120,11 +120,11 @@ External review + automated testing uncovered these bugs:
 | 10 | **Medium** | compartment.h | `expand_var()` returned truncated path on buffer overflow — could create broader policy than intended | Returns NULL on truncation; caller aborts with error message |
 | 11 | **Low** | compartment-root | Missing `CLONE_NEWCGROUP` — container could see host cgroup hierarchy | Added to clone flags (Linux 4.6+, with fallback define) |
 | 12 | **High** | compartment-root | `cap-allow` only dropped bounding set — after `setuid()`, service user had zero effective caps despite profile | Added `PR_SET_KEEPCAPS` + raw `capset()` + `PR_CAP_AMBIENT_RAISE` |
-| 13 | **Medium** | compartment-user | Shell-replacement mode fail-open — ignored `prctl`/Landlock/seccomp failures | Made fail-closed: abort with rc=126 if any enforcement fails |
+| 13 | **Medium** | compartment-user | Shell-replacement mode ignored `prctl`/Landlock/seccomp failures silently | Kept fail-open by design (a login shell must never be blocked) but made it visible: each failure is counted and reported to syslog at `LOG_WARNING` with uid, pid and ppid |
 | 14 | **Medium** | compartment-user | `workdir` directive only implied `rw` in built-in ai-agent profile, not file-loaded profiles | Auto-add `rw` for `workdir` after all profile loading |
 | 15 | **High** | compartment-root | `join_netns()` path traversal — `netns_name` containing `/` could open arbitrary files instead of `/var/run/netns/<name>` | Reject any `netns_name` that contains `/` |
 | 16 | **High** | compartment-root | `assign_to_cgroups()` path traversal — cgroup paths with `..` components could write PID to arbitrary files | Reject relative paths and paths containing `..` components |
-| 17 | **High** | compartment-user | Shell-replacement `COMPARTMENT_SHELL_DIR` path traversal — env var could point outside intended directory | Reject non-absolute paths and paths containing `..` components |
+| 17 | **High** | compartment-user | Shell-replacement `COMPARTMENT_SHELL_DIR` path traversal — env var could point outside intended directory | Reject non-absolute paths and paths containing `..` components (extended later — see fix 53) |
 | 18 | **Medium** | sandbox.sh | Predictable proxy socket path in world-writable `/tmp` — race window for socket hijack | Move socket into a private `mktemp -d` directory (mode 700) |
 | 19 | **Medium** | sandbox.sh | `slirp4netns` success not verified — SOFT mode proceeded with broken networking on slirp failure | Poll for `tap0` interface appearance; abort if it does not appear |
 | 20 | **High** | compartment.h | Profile `uid`/`gid` parsed with `strtoul(val, NULL, 10)` — no error/range check; value `4294967296` silently truncates to UID 0 (root) | Added endptr/errno/range validation matching CLI parser |
@@ -156,6 +156,31 @@ External review + automated testing uncovered these bugs:
 | 46 | **Medium** | sandbox.sh | Shell intercept only covered `/bin/bash` and `/bin/sh` — bypassed by `/bin/dash`, `/usr/bin/bash`, etc. | Expanded to cover bash, sh, dash, zsh in both `/bin` and `/usr/bin` |
 | 47 | **Medium** | sandbox.sh | SOFT mode: background processes survived sandbox teardown — reparented to host PID 1 | Added `unshare --pid --fork` in SOFT mode nsenter to kill all descendants on exit |
 | 48 | **Info** | sandbox.sh | `SHELL_STASH` discoverable via `/proc/self/mountinfo` | Documented as known limitation — real security boundary is Landlock + seccomp, not path hiding |
+
+### Profile trust review
+
+A second review concentrated on everything upstream of enforcement: where
+the policy comes from and how the parser behaves when it goes wrong.
+
+| # | Severity | Component | Issue | Fix |
+|---|----------|-----------|-------|-----|
+| 49 | **Critical** | compartment.h | `$HOME/.config/compartment/<name>.conf` was searched before `/etc/compartment/`, and the built-in `ai-agent` profile grants RWX on `$HOME` — a sandboxed agent could write its own next-run profile and disable every mechanism for all later runs | System profiles first; `$HOME` only for compartment-user, only behind the new `--user-profiles` flag, never in shell-replacement mode, and never reachable through `inherit` from a `/etc` profile |
+| 50 | **Critical** | compartment.h | Profile files were read with no ownership or mode check, so `compartment-root` (uid 0) took `rootdir`, `username`, `cap-allow` and the seccomp policy from a `$HOME`-relative file | Validate every profile on the fd it is read from: regular file, owned by root or the caller's real uid (root only for compartment-root), no group/other write, containing directory the same. Symlinks stay usable; the target's directory is checked too |
+| 51 | **High** | compartment.h | A profile rejected mid-file kept its already-parsed rules, and the caller then layered a built-in on top and reported the result as `(built-in)` | Parse into a scratch `Config`, commit only on success, and give the loader a three-way result so "not found" and "found but invalid" are distinguishable. Invalid is always fatal, `--dry-run` included |
+| 52 | **High** | compartment.h | `landlock`/`seccomp`/`no-new-privs`/`env-sanitize` could be turned **off** from a profile — a complete escape for anyone who can write one | One-way switches: `off` in a profile is a fatal parse error. Only `--no-landlock`, `--no-seccomp` and `--no-env-sanitize` on the command line can disable enforcement; `no_new_privs` is now genuinely always on |
+| 53 | **Medium** | compartment-user | `COMPARTMENT_SHELL_DIR` chose which binary the replaced shell runs, defeating the `hardened` target's randomised `REAL_SHELL_DIR` | Honoured only when the directory and the shell binary are owned by root or the caller and are not group/other-writable; otherwise a warning and a fall back to the compile-time path. The sandbox is applied before the exec either way |
+| 54 | **High** | compartment.h | Inline `#` comments were swallowed into the value: `ro /usr  # libs` installed no rule and `env-deny LD_PRELOAD  # x` stripped nothing | A `#` beginning a whitespace-separated token starts a comment; values are right-trimmed; a `#` inside a token stays literal |
+| 55 | **High** | compartment.h | `block` entries past `MAX_BLOCKED_SC` (64) were dropped silently, deleting `pidfd_getfd`, `mount_setattr`, `ioperm` and `iopl` from the shipped policy | Limit raised to 256 (519 BPF instructions at the limit); every append goes through a helper that names the overflowing entry and refuses to run |
+| 56 | **Medium** | compartment-user | `$HOME` was used unvalidated as an RWX Landlock root, so `HOME=/` granted `rwx /` | Must be absolute, not `/`, and an existing directory owned by the caller's real uid |
+| 57 | **Medium** | compartment.h | Audit directory unvalidated: `O_NOFOLLOW` covered only the final component, an existing 0777 directory was accepted, and the default lived under world-writable `/var/tmp` | Default moved to `$XDG_STATE_HOME/compartment` (`/var/log/compartment` for root), created 0700; directory validated on its own fd and opened `O_DIRECTORY` + `O_NOFOLLOW`, day file created with `openat`; control characters scrubbed from every logged field |
+| 58 | **Medium** | compartment-user | Environment deny-list missed `GLIBC_TUNABLES`, most of the `LD_*` family, `PYTHON*`, `PROMPT_COMMAND`, `IFS`, `ZDOTDIR`, `GIT_SSH_COMMAND`, `PAGER`/`EDITOR` and more | Entries may end in `*` for a prefix match; the built-in uses `LD_*`, `DYLD_*`, `BASH_FUNC_*`, `PYTHON*`, `PERL5*` and `GIT_CONFIG_*`. Model-provider API keys stay deliberately untouched |
+| 59 | **High** | compartment-root | `--profile=FILE` and `-pFILE` silently discarded the entire policy: a hand-rolled pre-scan matched only the exact tokens `--profile` and `-p`, and getopt's own case was a no-op | Two `getopt_long` passes over the same optstring — the first resolves `-p/--profile`, the second applies everything else |
+| 60 | **Low** | compartment-user | Shell-replacement mode skipped `preflight_check()`, the ambient-capability clear, `PR_SET_DUMPABLE(0)` and `close_range()` | Hardening factored into `apply_hardening()` and called from both paths; preflight runs advisory so it still cannot block a login |
+| 61 | **Low** | compartment.h | Every `strdup()` return was unchecked — a rule could silently become `NULL` | `xstrdup()` fails loudly; a sandboxing tool must not run a partially materialised policy |
+
+`--dump-profile NAME` was added alongside these: it serialises the
+resolved policy back to `.conf` syntax, so `examples/ai-agent.conf` and
+the HOWTO are generated from the binary rather than transcribed by hand.
 
 ### seccomp Return Action: EPERM vs KILL
 
