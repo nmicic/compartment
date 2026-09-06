@@ -93,34 +93,9 @@ static int apply_profile_ai_agent(Config *cfg)
         cfg_add_path(cfg, BUILTIN_WHERE, cfg->workdir, PATH_RWX, 0) != 0)
         return -1;
 
-    /* Syscalls to block */
-    const char *blocked[] = {
-        "ptrace", "mount", "umount2", "reboot",
-        "kexec_load", "kexec_file_load",
-        "init_module", "finit_module", "delete_module",
-        "pivot_root", "chroot", "unshare", "setns",
-        "keyctl", "add_key", "request_key",
-        "bpf", "userfaultfd", "perf_event_open",
-        "process_vm_readv", "process_vm_writev",
-        "acct", "swapon", "swapoff",
-        "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
-        "io_uring_setup", "io_uring_enter", "io_uring_register",
-        /* Container escape vectors: handle-based file access, new mount API */
-        "open_by_handle_at", "name_to_handle_at",
-        "open_tree", "move_mount", "fsopen", "fsmount", "fsconfig", "fspick",
-        "mount_setattr",
-        /* Cross-process FD theft */
-        "pidfd_getfd",
-#ifdef __x86_64__
-        "ioperm", "iopl",
-#endif
-        NULL
-    };
-    for (int i = 0; blocked[i]; i++) {
-        int nr = resolve_syscall(blocked[i]);
-        if (nr >= 0 && cfg_add_blocked(cfg, BUILTIN_WHERE, blocked[i], nr) != 0)
-            return -1;
-    }
+    /* Syscalls to block — the table shared with compartment-root. */
+    if (cfg_add_builtin_denylist(cfg, BUILTIN_WHERE) != 0)
+        return -1;
 
     /* Dangerous env vars to strip.
      *

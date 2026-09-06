@@ -211,6 +211,9 @@ static const SyscallEntry syscall_table[] = {
 #ifdef __NR_close_range
     {"close_range",         __NR_close_range},
 #endif
+#ifdef __NR_openat2
+    {"openat2",             __NR_openat2},
+#endif
 
     /* ── File metadata ────────────────────────────────────────────── */
     {"fstat",               __NR_fstat},
@@ -239,6 +242,8 @@ static const SyscallEntry syscall_table[] = {
 
     /* ── Directory / filesystem ───────────────────────────────────── */
     {"getdents64",          __NR_getdents64},
+    {"statfs",              __NR_statfs},
+    {"fstatfs",             __NR_fstatfs},
     {"chdir",               __NR_chdir},
     {"mkdirat",             __NR_mkdirat},
     {"unlinkat",            __NR_unlinkat},
@@ -279,9 +284,84 @@ static const SyscallEntry syscall_table[] = {
     {"rt_sigaction",        __NR_rt_sigaction},
     {"rt_sigprocmask",      __NR_rt_sigprocmask},
     {"rt_sigreturn",        __NR_rt_sigreturn},
+    {"rt_sigpending",       __NR_rt_sigpending},
+    {"rt_sigsuspend",       __NR_rt_sigsuspend},
+    {"rt_sigtimedwait",     __NR_rt_sigtimedwait},
+    {"rt_sigqueueinfo",     __NR_rt_sigqueueinfo},
+    {"rt_tgsigqueueinfo",   __NR_rt_tgsigqueueinfo},
     {"sigaltstack",         __NR_sigaltstack},
     {"kill",                __NR_kill},
+    {"tkill",               __NR_tkill},
     {"tgkill",              __NR_tgkill},
+    {"pause",               __NR_pause},
+    {"restart_syscall",     __NR_restart_syscall},
+#ifdef __NR_signalfd4
+    {"signalfd4",           __NR_signalfd4},
+#endif
+#ifdef __NR_signalfd
+    {"signalfd",            __NR_signalfd},
+#endif
+
+    /* ── Sockets ──────────────────────────────────────────────────────
+     *
+     * Without these names `block connect` and `allow socket` hit the
+     * unknown-syscall path and were dropped with a warning, which is why
+     * examples/container.conf had to ship its network block commented out.
+     * Numeric substitution is not an option: 41 is socket on x86-64 and
+     * pivot_root on aarch64. */
+    {"socket",              __NR_socket},
+    {"socketpair",          __NR_socketpair},
+    {"bind",                __NR_bind},
+    {"listen",              __NR_listen},
+    {"accept4",             __NR_accept4},
+    {"connect",             __NR_connect},
+    {"getsockname",         __NR_getsockname},
+    {"getpeername",         __NR_getpeername},
+    {"setsockopt",          __NR_setsockopt},
+    {"getsockopt",          __NR_getsockopt},
+    {"sendto",              __NR_sendto},
+    {"recvfrom",            __NR_recvfrom},
+    {"sendmsg",             __NR_sendmsg},
+    {"recvmsg",             __NR_recvmsg},
+    {"sendmmsg",            __NR_sendmmsg},
+    {"recvmmsg",            __NR_recvmmsg},
+    {"shutdown",            __NR_shutdown},
+#ifdef __NR_accept
+    {"accept",              __NR_accept},
+#endif
+#ifdef __NR_socketcall
+    {"socketcall",          __NR_socketcall},
+#endif
+
+    /* ── Event / notification fds ─────────────────────────────────── */
+    {"epoll_create1",       __NR_epoll_create1},
+    {"epoll_ctl",           __NR_epoll_ctl},
+    {"epoll_pwait",         __NR_epoll_pwait},
+    {"eventfd2",            __NR_eventfd2},
+    {"timerfd_create",      __NR_timerfd_create},
+    {"timerfd_settime",     __NR_timerfd_settime},
+    {"timerfd_gettime",     __NR_timerfd_gettime},
+#ifdef __NR_epoll_create
+    {"epoll_create",        __NR_epoll_create},
+#endif
+#ifdef __NR_epoll_wait
+    {"epoll_wait",          __NR_epoll_wait},
+#endif
+#ifdef __NR_epoll_pwait2
+    {"epoll_pwait2",        __NR_epoll_pwait2},
+#endif
+#ifdef __NR_eventfd
+    {"eventfd",             __NR_eventfd},
+#endif
+#ifdef __NR_inotify_init1
+    {"inotify_init1",       __NR_inotify_init1},
+#endif
+#ifdef __NR_inotify_add_watch
+    {"inotify_add_watch",   __NR_inotify_add_watch},
+#endif
+#ifdef __NR_inotify_rm_watch
+    {"inotify_rm_watch",    __NR_inotify_rm_watch},
+#endif
 
     /* ── Process ──────────────────────────────────────────────────── */
     {"execve",              __NR_execve},
@@ -301,8 +381,16 @@ static const SyscallEntry syscall_table[] = {
     {"setgid",              __NR_setgid},
     {"setgroups",           __NR_setgroups},
     {"setsid",              __NR_setsid},
+    {"getsid",              __NR_getsid},
+    {"setpgid",             __NR_setpgid},
+    {"getpgid",             __NR_getpgid},
+    {"getgroups",           __NR_getgroups},
+    {"sysinfo",             __NR_sysinfo},
     {"prctl",               __NR_prctl},
     {"uname",               __NR_uname},
+#ifdef __NR_getpgrp
+    {"getpgrp",             __NR_getpgrp},
+#endif
 #ifdef __NR_fork
     {"fork",                __NR_fork},
 #endif
@@ -322,6 +410,7 @@ static const SyscallEntry syscall_table[] = {
     /* ── Scheduling / resources ───────────────────────────────────── */
     {"sched_yield",         __NR_sched_yield},
     {"sched_getaffinity",   __NR_sched_getaffinity},
+    {"sched_setaffinity",   __NR_sched_setaffinity},
     {"prlimit64",           __NR_prlimit64},
 #ifdef __NR_getrlimit
     {"getrlimit",           __NR_getrlimit},
@@ -338,6 +427,7 @@ static const SyscallEntry syscall_table[] = {
 
     /* ── I/O multiplexing ─────────────────────────────────────────── */
     {"ppoll",               __NR_ppoll},
+    {"pselect6",            __NR_pselect6},
 #ifdef __NR_select
     {"select",              __NR_select},
 #endif
@@ -549,6 +639,45 @@ static inline int resolve_cap(const char *name)
     return -1;
 }
 
+/* ── Built-in seccomp deny-list (shared by both tools) ─────────────
+ *
+ * One table, used by compartment-user's ai-agent/strict profiles and by
+ * the filter compartment-root installs when the operator supplies neither
+ * --block nor --seccomp-allowed.  The two used to be separate copies that
+ * happened to hold the same 43 syscalls in a different order; keeping them
+ * apart guaranteed they would eventually drift.
+ *
+ * Nothing in this list is needed after exec: every mount, namespace and
+ * privilege operation happens before the filter is installed. */
+static const char *const builtin_denylist[] = {
+    /* Debugging and process memory access */
+    "ptrace", "process_vm_readv", "process_vm_writev",
+    /* Mount / namespace manipulation — nested container escape */
+    "mount", "umount2", "pivot_root", "chroot", "unshare", "setns",
+    "mount_setattr", "open_tree", "move_mount",
+    "fsopen", "fsmount", "fsconfig", "fspick",
+    /* Handle-based file access — reaches outside the mount namespace */
+    "open_by_handle_at", "name_to_handle_at",
+    /* Kernel code loading and reboot */
+    "reboot", "kexec_load", "kexec_file_load",
+    "init_module", "finit_module", "delete_module",
+    /* Kernel keyring */
+    "keyctl", "add_key", "request_key",
+    /* Kernel interfaces with a long CVE history */
+    "bpf", "userfaultfd", "perf_event_open",
+    "io_uring_setup", "io_uring_enter", "io_uring_register",
+    /* Host-wide state */
+    "acct", "swapon", "swapoff",
+    "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
+    /* Cross-process FD theft */
+    "pidfd_getfd",
+#ifdef __x86_64__
+    /* Raw I/O port access */
+    "ioperm", "iopl",
+#endif
+    NULL
+};
+
 /* ── Allocation helper ──────────────────────────────────────────── */
 
 /* A sandboxing tool must never continue with a partially materialised
@@ -652,6 +781,21 @@ static inline int cfg_add_allowed(Config *c, const char *where,
         return policy_full(where, "allowed-syscall", name, MAX_ALLOWED_SC);
     c->allowed_syscalls[c->allowed_sc_count++] = nr;
     c->seccomp_allow_mode = 1;
+    return 0;
+}
+
+/* Append the built-in deny-list.  Returns 0, or -1 when the array is full
+ * (cfg_add_blocked refuses rather than truncating: an overflow here would
+ * mean the built-in policy itself was silently cut short). */
+static inline int cfg_add_builtin_denylist(Config *c, const char *where)
+{
+    for (int i = 0; builtin_denylist[i]; i++) {
+        int nr = resolve_syscall(builtin_denylist[i]);
+        if (nr < 0)
+            continue;   /* syscall does not exist on this architecture */
+        if (cfg_add_blocked(c, where, builtin_denylist[i], nr) != 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -2389,6 +2533,7 @@ static inline const char *seccomp_action_name(const Config *cfg)
 static inline int apply_seccomp(Config *cfg)
 {
     int r;
+    uint32_t deny = seccomp_deny_action(cfg);
 
     if (cfg->seccomp_allow_mode) {
         /* Allow-list: only these syscalls permitted, default deny */
@@ -2397,8 +2542,7 @@ static inline int apply_seccomp(Config *cfg)
             return -1;
         }
         r = build_seccomp_bpf(cfg->allowed_syscalls, cfg->allowed_sc_count,
-                               SECCOMP_RET_ALLOW,
-                               SECCOMP_RET_ERRNO | (EPERM & 0xFFFF));
+                               SECCOMP_RET_ALLOW, deny);
         if (r != 0) {
             fprintf(stderr, "compartment: seccomp load failed: %s\n",
                     strerror(errno));
@@ -2406,7 +2550,8 @@ static inline int apply_seccomp(Config *cfg)
         }
         if (cfg->verbose)
             fprintf(stderr, "compartment: seccomp ALLOW-LIST enforced "
-                    "(%d syscalls allowed, rest denied)\n", cfg->allowed_sc_count);
+                    "(%d syscalls allowed, rest denied with %s)\n",
+                    cfg->allowed_sc_count, seccomp_action_name(cfg));
     } else {
         /* Deny-list: block these syscalls, default allow */
         if (cfg->blocked_count == 0) {
@@ -2415,8 +2560,7 @@ static inline int apply_seccomp(Config *cfg)
             return 0;
         }
         r = build_seccomp_bpf(cfg->blocked_syscalls, cfg->blocked_count,
-                               SECCOMP_RET_ERRNO | (EPERM & 0xFFFF),
-                               SECCOMP_RET_ALLOW);
+                               deny, SECCOMP_RET_ALLOW);
         if (r != 0) {
             fprintf(stderr, "compartment: seccomp load failed: %s\n",
                     strerror(errno));
@@ -2424,7 +2568,8 @@ static inline int apply_seccomp(Config *cfg)
         }
         if (cfg->verbose)
             fprintf(stderr, "compartment: seccomp DENY-LIST enforced "
-                    "(%d syscalls blocked)\n", cfg->blocked_count);
+                    "(%d syscalls blocked with %s)\n", cfg->blocked_count,
+                    seccomp_action_name(cfg));
     }
     return 0;
 }
