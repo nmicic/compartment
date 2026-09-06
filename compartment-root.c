@@ -156,56 +156,15 @@ static const char *syscall_name(int nr)
  * every container ran with Seccomp: 0 — byte-identical to --no-seccomp —
  * while --help advertised seccomp as one of the things the tool does.
  *
- * The list mirrors compartment-user's built-in ai-agent deny-list.  It is
- * deliberately kept here rather than hoisted into compartment.h: the
- * profile loader in that header is being reworked separately, and keeping
- * the two copies apart keeps this change to compartment-root.c.  Fold them
- * into one shared table once that work lands.
- *
- * Nothing in this list is needed by a container after exec: all mounts,
- * namespace setup and privilege changes happen in the child before the
- * filter is installed.
+ * The table itself lives in compartment.h and is shared with
+ * compartment-user's built-in profiles.  Nothing in it is needed by a
+ * container after exec: all mounts, namespace setup and privilege changes
+ * happen in the child before the filter is installed.
  */
 static void apply_default_seccomp_denylist(Config *config)
 {
-    static const char *blocked[] = {
-        /* Debugging and process memory access */
-        "ptrace", "process_vm_readv", "process_vm_writev",
-        /* Mount / namespace manipulation — nested container escape */
-        "mount", "umount2", "pivot_root", "chroot", "unshare", "setns",
-        "mount_setattr", "open_tree", "move_mount",
-        "fsopen", "fsmount", "fsconfig", "fspick",
-        /* Handle-based file access — reaches outside the mount namespace */
-        "open_by_handle_at", "name_to_handle_at",
-        /* Kernel code loading and reboot */
-        "reboot", "kexec_load", "kexec_file_load",
-        "init_module", "finit_module", "delete_module",
-        /* Kernel keyring */
-        "keyctl", "add_key", "request_key",
-        /* Kernel interfaces with a long CVE history */
-        "bpf", "userfaultfd", "perf_event_open",
-        "io_uring_setup", "io_uring_enter", "io_uring_register",
-        /* Host-wide state */
-        "acct", "swapon", "swapoff",
-        "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
-        /* Cross-process FD theft */
-        "pidfd_getfd",
-#ifdef __x86_64__
-        /* Raw I/O port access */
-        "ioperm", "iopl",
-#endif
-        NULL
-    };
-
-    for (int i = 0; blocked[i]; i++) {
-        int nr = resolve_syscall(blocked[i]);
-        if (nr < 0)
-            continue;   /* syscall does not exist on this architecture */
-        /* cfg_add_blocked refuses rather than truncating; an overflow here
-         * would mean the built-in policy itself was silently cut short. */
-        if (cfg_add_blocked(config, "built-in deny-list", blocked[i], nr) != 0)
-            exit(EXIT_FAILURE);
-    }
+    if (cfg_add_builtin_denylist(config, "built-in deny-list") != 0)
+        exit(EXIT_FAILURE);
 }
 
 /* ── main ────────────────────────────────────────────────────────────── */
