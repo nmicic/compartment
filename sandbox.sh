@@ -45,7 +45,8 @@ LOGFILE="${LOGDIR}/sandbox-$(date +%Y%m%dT%H%M%S)-$$.log"
 die() { echo "sandbox: ERROR: $*" >&2; exit 1; }
 
 log() {
-    local msg="$(date -Iseconds) $*"
+    local msg
+    msg="$(date -Iseconds) $*"
     echo "sandbox: $*" >&2
     echo "$msg" >> "$LOGFILE" 2>/dev/null || true
 }
@@ -78,7 +79,8 @@ check_deps() {
     [ -z "$missing" ] || die "missing dependencies:$missing (install: uidmap, socat)"
 
     # Check unprivileged user namespaces enabled
-    local userns=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "1")
+    local userns
+    userns=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "1")
     [ "$userns" = "1" ] || die "unprivileged user namespaces disabled (sysctl kernel.unprivileged_userns_clone=0)"
 
     # Check subuid/subgid configured
@@ -97,7 +99,8 @@ run_verify() {
 
     echo ""
     echo "2. Kernel support:"
-    local userns=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "unknown")
+    local userns
+    userns=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "unknown")
     printf "   %-30s %s\n" "unprivileged_userns_clone:" "$userns"
     printf "   %-30s " "user+net namespace creation:"
     if unshare --user --net -- /bin/true 2>/dev/null; then echo "OK"; else echo "FAILED"; fi

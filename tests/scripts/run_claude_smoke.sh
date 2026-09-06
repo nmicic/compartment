@@ -145,6 +145,10 @@ mkdir -p "${AUDIT_DIR}"
 MARKER=$(mktemp)
 sleep 1
 
+# The capture is deliberate: this case asserts on the audit log the run
+# produces, not on what the CLI prints, and the assignment keeps that output
+# off the suite's stdout.
+# shellcheck disable=SC2034  # AUDIT_OUT is intentionally write-only
 AUDIT_OUT=$(timeout 60 "${CU}" --profile "${PROFILE}" --audit-log "${AUDIT_DIR}" -- \
     claude --print --max-turns 1 --model claude-sonnet-4-6 \
     "Reply with exactly: AUDIT_OK" 2>&1) || true
