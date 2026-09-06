@@ -98,7 +98,7 @@ trap cleanup EXIT INT TERM
 mkdir -p "${JAIL}"/{bin,dev,proc,sys,tmp,etc,srv,lib,lib64}
 cp "${BUSYBOX}" "${JAIL}/bin/busybox"
 for applet in sh ls cat echo grep head id env printf sleep true cp chmod \
-              mount stat dd nc; do
+              mount stat dd nc timeout; do
     ln -sf /bin/busybox "${JAIL}/bin/${applet}"
 done
 # Two distinct static binaries for the exec allow-list.  They cannot be
@@ -529,15 +529,19 @@ else
     P="$(mkprofile netok "rootdir ${JAIL}" "username ctsvc" "uid 60000" \
          "gid 60000" "loopback on" "landlock on" "ro /" "rw /dev/null" \
          "rw /tmp" "net-bind 34811" "net-connect 34811" "net-default deny")"
+    # Every listener is wrapped in `timeout`.  A build that does not deny the
+    # bind leaves nc listening for ever, the container's PID 1 waits for it,
+    # and the suite hangs instead of failing — which is exactly what happened
+    # when these cases were first run against a pre-Landlock binary.
     run_cr --profile "${P}" -- /bin/sh -c \
-        'nc -l -p 34811 >/dev/null 2>&1 & sleep 1; echo hi | nc -w 2 127.0.0.1 34811 && echo NET_ALLOWED_OK'
+        'timeout 8 nc -l -p 34811 >/dev/null 2>&1 & sleep 1; echo hi | nc -w 2 127.0.0.1 34811 && echo NET_ALLOWED_OK; wait'
     want_out "the allowed port can be bound and connected to" "NET_ALLOWED_OK"
 
     P="$(mkprofile netdeny "rootdir ${JAIL}" "username ctsvc" "uid 60000" \
          "gid 60000" "loopback on" "landlock on" "ro /" "rw /dev/null" \
          "rw /tmp" "net-connect 34811" "net-default deny")"
     run_cr --profile "${P}" -- /bin/sh -c \
-        'nc -l -p 34811 2>&1 | head -1'
+        'timeout 8 nc -l -p 34811 2>&1 | head -1'
     want_out "a port with no net-bind rule cannot be bound" "Permission denied"
 
     run_cr --profile "${P}" -- /bin/sh -c \
