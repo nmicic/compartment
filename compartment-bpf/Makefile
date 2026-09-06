@@ -687,6 +687,14 @@ check-dir-matrix: compartment-bpf test-tools
 # preflight on every prerequisite, then the full check, then a scan that fails
 # if any core suite SKIPPED for an env reason that preflight should have
 # guaranteed away (missing root / BPF LSM / built daemon / sealprobe).
+# The skip scan carries its own self-test THROUGH itself rather than
+# beside it: a sentinel that no allowlist entry matches is appended to the
+# scan input, and the scan's own output has to contain it. Beside it, a
+# self-test would still pass with the real scan neutered — which is
+# exactly the mutation this guards against: replacing the scan with
+# `: > "$unknown"` made an injected, undocumented SKIP invisible and the
+# gate printed PASS. Carried through, an empty result means the scan did
+# not run, and that is a failure in itself.
 check-release: check-env
 	@echo "[check-release] strict preflight — no critical skips permitted"
 	@[ "$$(id -u)" -eq 0 ] || { echo "[check-release] FAIL: must run as root"; exit 1; }
@@ -721,22 +729,19 @@ check-release: check-env
 	  echo "[check-release] FAIL: a core suite SKIPPED for an env reason preflight should have guaranteed away (above)"; \
 	  rm -f "$$log"; exit 1; \
 	fi; \
-	pats=$$(mktemp); unknown=$$(mktemp); \
+	pats=$$(mktemp); unknown=$$(mktemp); scanin=$$(mktemp); \
 	grep -vE '^[[:space:]]*(#|$$)' tests/release-skip-allowlist.txt > "$$pats"; \
-	stlog=$$(mktemp); stout=$$(mktemp); \
-	printf '%s\n' '  SKIP: 7' \
-	  'SKIP __release-gate-selftest__: deliberately not in the allowlist' > "$$stlog"; \
-	grep -ai 'skip' "$$stlog" | grep -avEi -f "$$pats" > "$$stout" || true; \
-	if [ "$$(wc -l < "$$stout")" -ne 1 ] || ! grep -q '__release-gate-selftest__' "$$stout"; then \
-	  echo "[check-release] FAIL: the gate's own skip scan is broken — it did not flag"; \
-	  echo "[check-release]       the self-test sentinel, or it flagged an allow-listed line."; \
-	  echo "[check-release]       A gate that cannot fail is not a gate; this is the same"; \
-	  echo "[check-release]       self-test discipline the core harness uses."; \
-	  sed 's/^/  /' "$$stout"; \
-	  rm -f "$$log" "$$pats" "$$unknown" "$$stlog" "$$stout"; exit 1; \
+	cat "$$log" > "$$scanin"; \
+	printf '%s\n' 'SKIP __release-gate-selftest__: deliberately not in the allowlist' >> "$$scanin"; \
+	grep -ai 'skip' "$$scanin" | grep -avEi -f "$$pats" > "$$unknown" || true; \
+	if ! grep -q '__release-gate-selftest__' "$$unknown"; then \
+	  echo "[check-release] FAIL: the gate's own skip scan did not run — its output does"; \
+	  echo "[check-release]       not contain the self-test sentinel that no allowlist entry"; \
+	  echo "[check-release]       matches. A gate that cannot fail is not a gate."; \
+	  rm -f "$$log" "$$pats" "$$unknown" "$$scanin"; exit 1; \
 	fi; \
-	rm -f "$$stlog" "$$stout"; \
-	grep -ai 'skip' "$$log" | grep -avEi -f "$$pats" > "$$unknown" || true; \
+	grep -v '__release-gate-selftest__' "$$unknown" > "$$scanin"; \
+	mv "$$scanin" "$$unknown"; \
 	if [ -s "$$unknown" ]; then \
 	  echo "[check-release] FAIL: unrecognised SKIP line(s). Every skip must match a documented"; \
 	  echo "[check-release]       entry in tests/release-skip-allowlist.txt — an unknown skip is a FAIL,"; \
