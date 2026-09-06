@@ -22,14 +22,14 @@ not read `/etc/profile.d`, and `sudo` replaces `PATH` with its
 
 ## Per-suite invocation
 
-| suite | command | expected (Ubuntu 24.04 / 6.8.0-139) |
+| suite | command | expected (identical on 6.8.0-139 and 7.0.0-31) |
 |---|---|---|
 | static coverage | `make check-coverage-static` | selftest 11/11, then "every surface is witnessed or explicitly exempted" |
 | smoke | `sudo make smoke` | `smoke ok` |
-| mesh | `sudo tests/mesh/run-mesh.sh` | 3282 trials: 3273 PASS / 0 FAIL / 1 KNOWN-GAP / 8 SKIP |
-| bypass (in place) | `sudo tests/bypass/run-local.sh` | `34 PASS / 0 FAIL / 0 SKIP over 34 scripts` |
+| mesh | `sudo tests/mesh/run-mesh.sh` | 3284 trials: 3277 PASS / 0 FAIL / 0 KNOWN-GAP / 7 SKIP |
+| bypass (in place) | `sudo tests/bypass/run-local.sh` | `39 PASS / 0 FAIL / 0 SKIP over 39 scripts` |
 | bypass (host driver) | `tests/bypass/run-all.sh` | see below — it is NOT an in-guest command |
-| strict-launch | `sudo tests/strict-launch/run.sh` | `PASS=15 FAIL=0` |
+| strict-launch | `sudo tests/strict-launch/run.sh` | `PASS=17 FAIL=0` |
 | observe | `sudo tests/observe/run.sh` | `PASS=21 FAIL=0 SKIP=1` (T12: AIDE absent) |
 | dir matrix | `sudo make check-dir-matrix` | `40/40 PASS` |
 | actor wrapper | `sudo make check-wrapper` | `Total PASS=21 FAIL=0` |
@@ -85,7 +85,7 @@ sequence or died with a bare "missing stub".
 in `tests/release-skip-allowlist.txt`. That file is the authoritative
 list; the categories are:
 
-* **tallies** — `SKIP: 8`, `... 0 SKIP over 34 scripts`, `Summary:
+* **tallies** — `SKIP: 7`, `... 0 SKIP over 39 scripts`, `Summary:
   PASS=.. SKIP=..`. Counts, not verdicts; the lines they summarise are
   scanned individually.
 * **optional packages** — `aide not installed`, `pg_lsclusters not

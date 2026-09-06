@@ -91,8 +91,8 @@ ssh <user>@<vm> "bash -lc 'cd ~/compartment-bpf && sudo make check-stability-qui
 |---|---|---|
 | `make vmlinux.h && make` | ~5 s | exit 0, zero warnings |
 | `sudo make smoke` | ~10 s | `smoke ok` |
-| `sudo make check` | ~7 min | exit 0; see the per-target tallies below |
-| `sudo make check-release` | ~7 min | `[check-release] PASS ...` |
+| `sudo make check` | ~10 min | exit 0; see the per-target tallies below |
+| `sudo make check-release` | ~10 min | `[check-release] PASS ...` |
 | `sudo make check-stability-quick` | ~2 min | `stability summary: pass=8 fail=0 skip=0` |
 
 Headline tallies inside `make check`:
@@ -100,9 +100,9 @@ Headline tallies inside `make check`:
 | target | expected |
 |---|---|
 | `check-coverage-static` | selftest 11/11, then "every surface is witnessed or explicitly exempted" |
-| `check-mesh` | 3282 trials: 3273 PASS / 0 FAIL / 1 KNOWN-GAP / 8 SKIP |
-| `check-bypass` | 34 PASS / 0 FAIL / 0 SKIP over 34 scripts |
-| `check-strict-launch` | PASS=15 FAIL=0 |
+| `check-mesh` | 3284 trials: 3277 PASS / 0 FAIL / 0 KNOWN-GAP / 7 SKIP |
+| `check-bypass` | 39 PASS / 0 FAIL / 0 SKIP over 39 scripts |
+| `check-strict-launch` | PASS=17 FAIL=0 |
 | `check-observe` | PASS=21 FAIL=0 SKIP=1 (T12, AIDE not installed) |
 | `check-dir-matrix` | 40/40 PASS |
 | `check-wrapper` | PASS=21 FAIL=0 |
