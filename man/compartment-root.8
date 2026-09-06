@@ -331,11 +331,10 @@ and
 In a profile the directive is spelled
 .BR cap\-allow ,
 not
-.BR cap\-allowed :
-the profile parser warns about an unknown directive and drops the
-capability, so the misspelling is silent unless
-.B \-\-verbose
-is used. See
+.BR cap\-allowed .
+Writing the flag spelling in a profile produces an "unknown directive"
+warning on stderr and the capability is dropped \(em the run continues
+without it, so the warning is the only signal. See
 .B "PROFILE FORMAT"
 in
 .BR compartment\-user (1)

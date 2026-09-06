@@ -514,7 +514,7 @@ check-deny-candidate: compartment-bpf
 # --pin/--unpin and dmesg access; SKIPs cleanly (rc=77) on a dev host
 # missing CAP_BPF / BPF LSM. Two cadences:
 #   - check-stability       full run, 1024 cycles (~45-60 min)
-#   - check-stability-quick smoke run, 64 cycles (~5 min)
+#   - check-stability-quick smoke run, 64 cycles (~1-2 min)
 # The harness also accepts STAB_CYCLES=N for ad-hoc cadences; both
 # targets exist as named entry points so CI / operator scripts don't
 # need to know the env-var spelling.

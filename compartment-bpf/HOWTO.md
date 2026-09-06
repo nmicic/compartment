@@ -921,7 +921,7 @@ attach→pin→exit sequence.
 ### 9.2 Running
 
 ```bash
-# Quick smoke (64 cycles, a few minutes):
+# Quick smoke (64 cycles, ~1-2 min):
 make check-stability-quick
 
 # Full run (1024 cycles, ~45-60 min):
