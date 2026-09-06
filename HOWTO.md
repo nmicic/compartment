@@ -249,6 +249,57 @@ Used by **both** tools:
 | `audit-log` | directory path (outside every granted path) | `audit-log /srv/audit/compartment` |
 | `inherit` | profile name | `inherit ai-agent` |
 
+Used by **compartment-user** only:
+
+| Directive | Value | Example | CLI equivalent |
+|-----------|-------|---------|----------------|
+| `workdir` | path | `workdir $HOME/projects` | `--workdir` |
+| `cap-drop` (alias `cap-bounding`) | capability name or number (repeatable) | `cap-drop CAP_SYS_MODULE` | `--cap-drop` |
+| `mask` | path, `?` = optional (repeatable) | `mask /run/systemd/private` | `--mask` |
+
+`cap-drop` and `mask` are the two directives a **root** subject needs and an
+unprivileged one does not; both are no-ops for a caller with no privilege to
+give up. They are compartment-user-only because compartment-root's nearest
+equivalents are not the same thing: `cap-allow` is an allow-list over a set
+compartment-root builds from scratch, and `mount-mask` names paths *inside
+the new root* it is about to pivot into. Writing either of them in a
+compartment-root profile gets the usual "belongs to the other tool" warning.
+
+* **`cap-drop CAP`** removes `CAP` from the bounding set with
+  `PR_CAPBSET_DROP`, clears the ambient and inheritable sets, and locks the
+  securebits. For a uid-0 process exec'ing a file with no file capabilities
+  the kernel recomputes permitted as *(full set ∩ bounding set)*, so what
+  survives the exec is exactly the bounding set — which is why this, and not
+  a `capset()` of the effective set, is the primitive that binds a root
+  shell. It is one-way: nothing later in the session can put a dropped
+  capability back. Check with `grep CapBnd /proc/self/status`.
+
+  `SECBIT_NOROOT` is **not** set, deliberately. With it, the same exec
+  computes permitted = 0 and the process gets no capabilities at all: right
+  for an unprivileged sandbox, useless for an account that has to read a log
+  or run `ip`. The trade-off is that a limited root keeps every capability
+  the profile does not name.
+
+* **`mask PATH`** covers `PATH` inside a private mount namespace — an empty
+  read-only tmpfs over a directory, a bind of `/dev/null` over anything
+  else. It needs `CAP_SYS_ADMIN` at setup time and nothing afterwards, so
+  the capability can be dropped in the same run.
+
+  It exists for the one surface Landlock has no right for: `connect(2)` to a
+  unix socket named by a path is not a filesystem access, so a domain that
+  denies `open()` on `/run/systemd/private` still lets the process drive
+  systemd through it. Making the path not be there is the only answer short
+  of a BPF socket hook.
+
+  Two properties are easy to get wrong. The namespace is made
+  `MS_PRIVATE|MS_REC` first — without it a cover mount propagates back to
+  the host and hides the path from the whole machine, permanently, because
+  `/` is `shared` on a systemd distribution. And a non-directory mask
+  *neutralises* a write rather than refusing one: the open succeeds (Landlock
+  keys on inodes and every usable profile grants `rw /dev/null`) and the
+  bytes go nowhere. Use `mask` for a read or connect surface; use a path
+  rule for a write surface, where Landlock refuses the open with `EACCES`.
+
 Used by **compartment-root** only:
 
 | Directive | Value | Example | CLI equivalent |
@@ -635,10 +686,237 @@ warning and uses the compile-time `REAL_SHELL_DIR`.
 is confined. For a hardened deployment, do not set the variable at all
 and rely on `make hardened`.
 
-In shell-replacement mode the profile is read from
-`/etc/compartment/ai-agent.conf` or the compiled-in default;
-`~/.config/compartment/` is never searched, and `--user-profiles` does
-not apply.
+**A login shell's `argv[0]` starts with a dash.** `login(1)` and `sshd`
+hand a login shell `argv[0] = "-bash"`, and the dash is a convention that
+tells the shell to read the login startup files — it is not part of the
+program's name. compartment-user strips one leading `-` when it picks the
+stash entry, and passes `argv` to the real shell unchanged so that the shell
+still knows what it is. Without that, an interactive login looks for
+`<stash>/-bash` and fails to exec; only `ssh host command` worked, because
+sshd passes the bare basename there.
+
+In shell-replacement mode the profile is resolved in this order, with the
+same trust checks as `--profile` and with `~/.config/compartment/` never
+searched:
+
+1. `/etc/compartment/shell-replacement.conf`
+2. `/etc/compartment/ai-agent.conf`, then the compiled-in `ai-agent` policy
+
+`shell-replacement.conf` also changes the failure semantics. The agent
+deployment degrades to a syslog warning and lets the login through, because
+an unsandboxed agent beats a user locked out of `/bin/bash`. An operator who
+writes `shell-replacement.conf` is confining an *account*, and for such an
+account an unconfined uid-0 login **is** the failure — so with that file in
+force a rejected profile, a failed mask, a failed capability policy or any
+failed enforcement mechanism refuses the session with exit status 126.
+Keep a second administrative account whose login shell is the stashed binary,
+and console access, before you deploy it.
+
+`mask` and `cap-drop` failures are fatal in *both* modes: nothing depends on
+them degrading, and a mask that did not go on is a hole the profile says is
+shut.
+
+---
+
+## Limited root over SSH
+
+A uid-0 account that can administer the host but cannot switch off the
+enforcement that confines it. The account logs in over the machine's own
+sshd; its login shell is the compartment-user wrapper; everything descended
+from that login inherits a Landlock domain, a seccomp filter, a reduced
+capability bounding set and a private mount namespace. sshd, PID 1, cron and
+the pinned `compartment-bpf` policy stay outside it.
+
+Read the "what this does not guarantee" block at the top of
+`examples/limited-root.conf` before deploying. The short version: this
+confines a *session*; it does not create a uid boundary, and it does not
+protect against a root process that was never in the session. That second
+adversary is what the seal profile is for, and both halves are needed.
+
+### 1. The account
+
+```bash
+# A second name for uid 0.  -o allows the duplicate uid; the distinct name
+# is what sshd, the audit trail and the seal profile key on.
+useradd -o -u 0 -g 0 -m -d /home/radmin -s /bin/bash radmin
+```
+
+`-s /bin/bash` assumes the **shell-replacement deployment**: `/bin/bash` on
+this host *is* the wrapper, and the real bash lives in the stash. That
+confines every account whose shell is `/bin/bash`, including `root`, which
+is usually what you want and is occasionally a surprise.
+
+The alternative is to point only this account at the wrapper:
+
+```bash
+install -d -m 0755 /usr/local/lib/compartment/limited-root
+ln -s /usr/local/bin/compartment-user /usr/local/lib/compartment/limited-root/bash
+usermod -s /usr/local/lib/compartment/limited-root/bash radmin
+```
+
+Nothing else on the machine changes, and `root` keeps an unconfined shell —
+which is either your recovery path or your escape route, depending on who
+holds root's key. `tests/scripts/root.d/limited-root.sh` uses this form,
+because a test must not replace `/bin/bash` on a host it does not own.
+
+Either way the wrapper must be *invoked under a shell's name* — the symlink
+is what puts it in shell-replacement mode. Setting the account's shell to
+`/usr/local/bin/compartment-user` directly does not work.
+
+### 2. The hardened stash
+
+```bash
+make hardened          # randomises REAL_SHELL_DIR; prints the path it chose
+make install           # /usr/local/bin/compartment-user
+
+install -d -m 0755 -o root -g root /bin/shells      # or the randomised path
+install -m 0755 -o root -g root /bin/bash /bin/shells/bash
+ln -sf /usr/local/bin/compartment-user /bin/bash    # shell-replacement form
+```
+
+The stash directory and the binary inside it must be owned by root and
+neither group- nor world-writable, or the wrapper refuses to use them. Put
+the stash somewhere a `ro` rule in the profile covers — under `/bin` or
+`/usr` — or the confined shell cannot be exec'd.
+
+### 3. The policy
+
+```bash
+install -d -m 0755 -o root -g root /etc/compartment
+install -m 0644 -o root -g root examples/limited-root.conf /etc/compartment/
+printf 'inherit limited-root\n' > /etc/compartment/shell-replacement.conf
+chmod 0644 /etc/compartment/shell-replacement.conf
+install -d -m 0700 -o root -g root /var/log/compartment
+```
+
+Both files must be root-owned and not group- or world-writable; the wrapper
+refuses a policy anyone else could have written. Edit the `rw` rules to name
+the paths this operator's limited root is actually supposed to manage — the
+shipped list is an example, and a profile that grants more than the account
+needs is the easiest way to undo everything below it.
+
+Check the result before you rely on it:
+
+```bash
+compartment-user --profile limited-root --dry-run -- /bin/bash
+```
+
+### 4. sshd
+
+Two settings, and neither is optional. Both defend against sshd doing
+something on the account's behalf that the session itself cannot do.
+
+```
+# /etc/ssh/sshd_config.d/50-limited-root.conf
+Match User radmin
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    PermitTunnel no
+    X11Forwarding no
+    PermitOpen none
+    PermitListen none
+```
+
+`ssh -L /tmp/s:/run/systemd/private radmin@host` makes **sshd** — which is
+outside the confinement — open the socket the profile masks. Forwarding has
+to be off, and the seal on `sshd_config` is what keeps it off.
+
+Keep the *external* sftp subsystem:
+
+```
+Subsystem sftp /usr/lib/openssh/sftp-server
+```
+
+OpenSSH runs a subsystem command through the user's login shell, so the
+external `sftp-server` goes through the wrapper. `internal-sftp` runs
+in-process in the sshd child and never execs a shell, so it bypasses the
+confinement completely.
+
+### 5. The seal profile
+
+```bash
+cd compartment-bpf
+sysctl -w fs.protected_hardlinks=1
+: > /etc/ld.so.preload                 # must exist before it can be sealed
+export COMPARTMENT_BPF_PASSPHRASE='<high-entropy-string>'
+sudo -E ./compartment-bpf --pin profiles/limited-root-authpath.conf
+```
+
+`--pin`, not a daemon. A daemon can be killed by any same-uid process, and
+below Landlock ABI v6 the confined session can send that signal. `--pin`
+leaves nothing to kill: the links live in the bpffs pin tree, which the
+session cannot reach because no rule in `limited-root.conf` grants
+`/sys/fs/bpf`.
+
+Adjust the paths in that profile to your install before loading it — the
+loader refuses the whole file if any path is missing or is a symlink at the
+leaf. Sealing pins the filesystem, so `--unpin` before a `dpkg` run that
+rewrites a sealed file, before a kernel or grub upgrade, and before any
+account maintenance: the account database is sealed shut, so `passwd(1)` and
+`usermod(8)` do not work while the policy is loaded.
+
+**Never seal a path the profile also masks.** compartment-bpf refuses a new
+mount on or under a sealed path, so the mask fails — and a failed mask
+refuses the login.
+
+### 6. Recommended one-way sysctls
+
+```bash
+sysctl -w kernel.modules_disabled=1        # irreversible until reboot
+sysctl -w kernel.kexec_load_disabled=1     # irreversible until reboot
+```
+
+Both are genuinely one-way. `kernel.yama.ptrace_scope` is **not** — root can
+lower it again from anything below 3 — so treat Yama as advisory and rely on
+the `CAP_SYS_PTRACE` drop. Booting with `lockdown=integrity` closes
+`/dev/mem`, unsigned module loading and `kexec` at the kernel level and is
+worth doing, but it is a property of the host, not of this deployment.
+
+`kernel.modules_disabled=1` must come after every module the host needs is
+loaded.
+
+### 7. Recovery
+
+Everything here can lock the account out, on purpose:
+
+* the wrapper refuses the session when a mask or the capability policy
+  cannot be applied, or when `shell-replacement.conf` does not parse;
+* a sealed `/etc/passwd` means the account's shell cannot be changed back
+  while the policy is loaded;
+* a stash that moves or loses its permissions makes the shell unexecutable.
+
+So before enabling any of it, make sure you have **both** of:
+
+1. a second administrative account whose login shell is the stashed binary
+   (`/bin/shells/bash`, not `/bin/bash`), with its own key; and
+2. console access — a serial console, the hypervisor console, or physical
+   access.
+
+To take the deployment apart, in this order:
+
+```bash
+compartment-bpf --unpin                  # needs the passphrase
+rm /etc/compartment/shell-replacement.conf
+usermod -s /bin/shells/bash radmin       # or ln -sf /bin/shells/bash /bin/bash
+```
+
+### 8. Residual risks
+
+Copied from the design notes, because they are the reason this is a
+defence-in-depth layer and not a boundary.
+
+| # | What is still open | Why |
+|---|---|---|
+| 1 | New privileged unix sockets appear with distribution updates and the mask list will not know about them | Landlock has no right covering `connect(2)` to a pathname unix socket, and seccomp cannot filter `connect`'s address family — it is behind a pointer. Re-run `find /run -type s` after an upgrade |
+| 2 | sshd forwarding | sshd is outside the session by design; closed by configuration plus the `sshd_config` seal, not by enforcement |
+| 3 | `internal-sftp` | never execs a shell, so the wrapper is not on the path |
+| 4 | Signals out of the domain below Landlock ABI v6 | no scope primitive before Linux 6.12; a denial-of-service surface, and the reason the seal profile must be pinned rather than run as a daemon |
+| 5 | A process holding `CAP_BPF` owns the seals | it can unlink the pin tree, delete the unpin sentinel and take the legacy unpin path, or rewrite the task-storage marker map. This deployment makes `CAP_BPF` the only way in; it does not defend `CAP_BPF` itself |
+| 6 | An fd received over `SCM_RIGHTS` from an unconfined process is not re-checked | Landlock has no hook for it |
+| 7 | `memfd` + `fexecve` runs code the policy never named | Landlock has no mmap hook and an anonymous file has no path. The code still runs inside the same domain, filter and capability set |
+| 8 | uid 0 is uid 0 | no uid boundary is created; the Landlock allow-list is the only thing between the account and the filesystem, and DAC contributes nothing. Read policy matters as much as write policy — `ro /etc` means the account can read `/etc/shadow` |
+| 9 | The account cannot run `compartment-root`, `sandbox.sh` HARD mode, or this project's own root test suite | `CAP_SYS_ADMIN` is dropped. A CI runner must not be a limited root |
+
 
 ---
 
