@@ -76,7 +76,7 @@ LDFLAGS = $(HARDEN_LDFLAGS) $(EXTRA_LDFLAGS)
 
 .PHONY: all clean test test-integration test-quick test-root test-kernels hardened \
         install install-man install-profiles show-hardening \
-        check check-shell check-modes check-orphans check-docs-symbols
+        check check-shell check-shell-bpf check-modes check-orphans check-docs-symbols
 
 # Both tools: zero dependencies
 all: compartment-user compartment-root
@@ -175,7 +175,7 @@ install-profiles:
 
 # ── Repository hygiene checks (also run in CI) ─────────────────────
 
-check: check-shell check-modes check-orphans check-docs-symbols
+check: check-shell check-shell-bpf check-modes check-orphans check-docs-symbols
 
 # Shell sources of this project.  compartment-bpf/ is a separate subtree
 # with its own conventions and is not gated here.
@@ -198,6 +198,13 @@ check-orphans:
 # compared a documented symbol against the code.
 check-docs-symbols:
 	@bash scripts/check-docs-symbols.sh
+
+# compartment-bpf/ is excluded from check-shell above, so the largest body
+# of shell in the project has never been linted by any gate. It has 74
+# distinct (file, code) findings at -S warning today; they are baselined
+# rather than fixed at a release gate, and a NEW one fails.
+check-shell-bpf:
+	@bash scripts/check-shell-bpf.sh
 
 # Every *.sh that starts with a shebang must be executable, and every one
 # that does not (a sourced library) must not be: a test that ships

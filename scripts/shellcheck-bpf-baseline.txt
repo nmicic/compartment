@@ -1,0 +1,82 @@
+# scripts/shellcheck-bpf-baseline.txt
+#
+# One '<file> <SCcode>' pair per known shellcheck -S warning finding
+# under compartment-bpf/. Line numbers are deliberately absent so an
+# ordinary edit does not churn this file. A pair that is not listed
+# here fails check-shell-bpf: the list may shrink, never grow.
+#
+# Regenerate ONLY to remove entries: scripts/check-shell-bpf.sh --regenerate
+compartment-bpf/tests/actor-wrapper/run.sh SC2027
+compartment-bpf/tests/actor-wrapper/run.sh SC3043
+compartment-bpf/tests/bench/actor-overhead.sh SC2034
+compartment-bpf/tests/bench/actor-overhead.sh SC2164
+compartment-bpf/tests/bench/bench-dir-destination.sh SC2034
+compartment-bpf/tests/bench/open-concurrency.sh SC2034
+compartment-bpf/tests/bench/open-concurrency.sh SC2164
+compartment-bpf/tests/bypass/01-hardlink-unlink.sh SC2034
+compartment-bpf/tests/bypass/02-truncate-no-open.sh SC2034
+compartment-bpf/tests/bypass/03-mprotect-rw.sh SC2034
+compartment-bpf/tests/bypass/04-name-to-handle.sh SC2034
+compartment-bpf/tests/bypass/08-mount-namespace.sh SC2034
+compartment-bpf/tests/bypass/09-unlink-storm.sh SC2034
+compartment-bpf/tests/bypass/10-detach-by-kill.sh SC2034
+compartment-bpf/tests/bypass/11-rename-into-no-write-dir.sh SC2034
+compartment-bpf/tests/bypass/12-deep-subtree-write.sh SC2034
+compartment-bpf/tests/bypass/13-deep-rename-into-sealed.sh SC2034
+compartment-bpf/tests/bypass/14-runtime-subtree-depth-cap.sh SC2034
+compartment-bpf/tests/bypass/15-runtime-subtree-alias-invariants.sh SC2034
+compartment-bpf/tests/bypass/16-setfacl-no-chmod.sh SC2034
+compartment-bpf/tests/bypass/17-mount-inside-sealed-dir.sh SC2034
+compartment-bpf/tests/bypass/17-mount-inside-sealed-dir.sh SC2154
+compartment-bpf/tests/bypass/18-chattr-no-chmod.sh SC2034
+compartment-bpf/tests/bypass/19-utimes-no-chmod.sh SC2034
+compartment-bpf/tests/bypass/20-umount-shadow.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-1-bind-mount-actor.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-11-ld-preload-strict.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-11-ld-preload-strict.sh SC3043
+compartment-bpf/tests/bypass/exec-domain/BX-12-abi-size-gate.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-13-candidate-pin-gate.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-14-actor-self-mod.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-15-prog-detach.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-16-anon-bdev-refuse.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-17-strict-launcher-runtime.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-18-hardlink-actor-binary.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-19-actor-never-exec.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-2-mount-namespace.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-3-hardlink-nonactor.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-4-interpreter-chain.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-5-setuid-actor.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-6-fork-without-exec.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-7-inplace-modify.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-8-exec-then-fork-exec.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/BX-9-version-mismatch.sh SC2034
+compartment-bpf/tests/bypass/exec-domain/lib-exec-domain.sh SC2148
+compartment-bpf/tests/bypass/lib-bypass.sh SC2148
+compartment-bpf/tests/counter-smoke.sh SC2034
+compartment-bpf/tests/deny-to-candidate.sh SC2164
+compartment-bpf/tests/inode-seal-witness.sh SC2010
+compartment-bpf/tests/inode-seal-witness.sh SC2034
+compartment-bpf/tests/inode-seal-witness.sh SC2164
+compartment-bpf/tests/lib.sh SC2148
+compartment-bpf/tests/limit-stress.sh SC2034
+compartment-bpf/tests/limit-stress.sh SC2164
+compartment-bpf/tests/loader-refusal-witness.sh SC2164
+compartment-bpf/tests/mesh/predict.sh SC2148
+compartment-bpf/tests/mesh/run-mesh.sh SC2034
+compartment-bpf/tests/mesh/run-mesh.sh SC2100
+compartment-bpf/tests/mesh/run-mesh.sh SC2155
+compartment-bpf/tests/mesh/run-mesh.sh SC2209
+compartment-bpf/tests/pin-passphrase.sh SC2034
+compartment-bpf/tests/pin-regression.sh SC2034
+compartment-bpf/tests/profile-e2e.sh SC2034
+compartment-bpf/tests/profile-smoke.sh SC2034
+compartment-bpf/tests/smoke-actor.sh SC2034
+compartment-bpf/tests/stability/corner-cases/CC-05-rapid-pin-unpin.sh SC2034
+compartment-bpf/tests/stability/counter-longevity.sh SC2034
+compartment-bpf/tests/stability/counter-longevity.sh SC2164
+compartment-bpf/tests/stability/lib-stability.sh SC2148
+compartment-bpf/tests/stability/pin-unpin-churn.sh SC3028
+compartment-bpf/tests/strict-launch/perf-g11-corrected.sh SC2034
+compartment-bpf/tests/strict-launch/run.sh SC2034
+compartment-bpf/tests/telemetry-smoke.sh SC2010
+compartment-bpf/tests/telemetry-smoke.sh SC2034

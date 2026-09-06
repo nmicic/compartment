@@ -135,9 +135,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-    # LeakSanitizer cannot work here: it reads /proc/<pid>/task from an
-    # at-exit handler, and by then Landlock and seccomp are applied, so it
-    # aborts with "LeakSanitizer has encountered a fatal error" on every run.
+    # LeakSanitizer cannot run over the enforcing paths: it reads
+    # /proc/<pid>/task from an at-exit handler, and by then Landlock and
+    # seccomp are applied, so it aborts with "LeakSanitizer has
+    # encountered a fatal error" on every run. detect_leaks=0 therefore
+    # stays for the suite — but it used to be the only setting, which
+    # meant nothing anywhere looked for a leak. The step below runs LSan
+    # over every path that returns instead of exec'ing (--version,
+    # --verify, --dry-run, --dump-profile, and compartment-root's own
+    # dry run), which is where the parser allocates and where
+    # config_free_oneshot() now frees.
     # UBSan is made fatal so a report fails the job instead of being printed
     # and ignored.
     env:
@@ -163,6 +170,83 @@ jobs:
       - name: Rootless suite under the sanitizers
         run: ./tests/scripts/run_all.sh --quick
 
+      # Every non-enforcing path, with LeakSanitizer on. These are the
+      # paths that parse a profile and then return, so they exercise the
+      # whole allocation surface without reaching restrict_self() — which
+      # is the only reason detect_leaks had to be off at all.
+      - name: LeakSanitizer over the non-enforcing paths
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          set -e
+          conf="$(mktemp --suffix=.conf)"
+          printf 'ro /usr\nro /lib32?\nrw /tmp\nenv-deny FOO\nworkdir /tmp\nlandlock on\nseccomp on\n' > "$conf"
+          chmod go-w "$conf"
+          ./compartment-user --version
+          ./compartment-user --verify   || true
+          ./compartment-user --dry-run -- /bin/true
+          ./compartment-user --dump-profile ai-agent > /dev/null
+          ./compartment-user --dump-profile strict   > /dev/null
+          ./compartment-user --dry-run --profile "$conf" -- /bin/true
+          ./compartment-user --dry-run --profile "$conf" --workdir /tmp \
+                             --audit-log /tmp -- /bin/true
+          ./compartment-root --dry-run --verbose -c /tmp -U root \
+                             -M /proc/foo -A net_bind_service -L /tmp -- /bin/true
+          rm -f "$conf"
+
+  # ── compartment-bpf: everything that needs neither root nor a
+  #    BPF-capable kernel ─────────────────────────────────────────────
+  #
+  # The whole of compartment-bpf/ was outside CI: 39 bypass witnesses,
+  # 3284 mesh trials, 17 strict-launch witnesses, the coverage gate and
+  # check-release ran only by hand on two VMs. The enforcement suites
+  # genuinely need root and a bpf-LSM kernel, but the build and the
+  # static gates do not, and those are what break first.
+  bpf-static:
+    name: compartment-bpf build + static gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libbpf-dev linux-tools-common \
+                                  linux-tools-generic libelf-dev zlib1g-dev
+          clang --version | head -1
+          bpftool version || true
+
+      - name: Kernel BTF is readable
+        run: test -r /sys/kernel/btf/vmlinux
+
+      - name: Build
+        working-directory: compartment-bpf
+        run: make
+
+      - name: Coverage gate
+        working-directory: compartment-bpf
+        run: make check-coverage-static
+
+      - name: Coverage-map selftest
+        working-directory: compartment-bpf
+        run: tools/coverage-map.py --selftest
+
+      - name: ABI / actor-hook gate
+        working-directory: compartment-bpf
+        run: make check-actor-hook
+
+      - name: Every shipped profile parses
+        working-directory: compartment-bpf
+        run: make check-profiles
+
+      - name: Parser and actor witnesses
+        working-directory: compartment-bpf
+        run: make check-parser-actor
+
+      - name: HOWTO examples still load
+        working-directory: compartment-bpf
+        run: make check-howto-examples
+
   # ── Repository hygiene ───────────────────────────────────────────
   lint:
     name: shellcheck + file modes
@@ -183,6 +267,18 @@ jobs:
       # applies to, with a comment saying why.
       - name: shellcheck
         run: make check-shell
+
+      # compartment-bpf/ is excluded above and had never been linted by
+      # any gate. Baselined rather than fixed at a release gate; a NEW
+      # finding fails.
+      - name: shellcheck (compartment-bpf, against the baseline)
+        run: make check-shell-bpf
+
+      - name: No orphaned test scripts
+        run: make check-orphans
+
+      - name: Documented symbols exist
+        run: make check-docs-symbols
 
       # Every *.sh with a shebang must be mode 755 (all 12 scripts under
       # extra/ shipped non-executable, so the documented ./start.sh workflow
