@@ -19,6 +19,8 @@ set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO}"
 BIN="${REPO}/compartment-bpf"
+# shellcheck source=tests/lib-realbin.sh
+. "${REPO}/tests/lib-realbin.sh"
 PIN_ROOT="/sys/fs/bpf/compartment"
 REPS="${BENCH_OVERHEAD_REPS:-7}"
 OPS="${BENCH_OVERHEAD_OPS:-4000}"
@@ -56,7 +58,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Representative workload: OPS open(write)+open(read) cycles (file_open /
-# file_permission hooks, builtins → no exec noise) + EXECS /bin/true (exec hook).
+# file_permission hooks, builtins → no exec noise) + EXECS of a real ELF
+# no-op (exec hook). Not /bin/true: on uutils-coreutils distros that is a
+# symlink into the multi-call binary, so the exec cost measured there is a
+# different binary's.
+EXEC_BIN=$(realbin_noop) || { echo "actor-overhead: no real ELF exec fixture" >&2; exit 2; }
 workload() {
 	local i=0
 	while [ "$i" -lt "$OPS" ]; do
@@ -66,7 +72,7 @@ workload() {
 		i=$((i+1))
 	done
 	i=0
-	while [ "$i" -lt "$EXECS" ]; do /bin/true; i=$((i+1)); done   # exec -> bprm hook
+	while [ "$i" -lt "$EXECS" ]; do "$EXEC_BIN"; i=$((i+1)); done   # exec -> bprm hook
 }
 time_ms() { local t0 t1; t0=$(date +%s%N); workload; t1=$(date +%s%N); echo $(( (t1 - t0) / 1000000 )); }
 median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'; }
@@ -93,7 +99,7 @@ kill -TERM "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || 
 delta=$(( mode_b - mode_a ))
 if [ "$mode_a" -gt 0 ]; then pct=$(( delta * 100 / mode_a )); else pct=0; fi
 {
-	echo "workload: ${OPS} open(write)+open(read) cycles + ${EXECS} exec /bin/true, median of ${REPS} reps"
+	echo "workload: ${OPS} open(write)+open(read) cycles + ${EXECS} exec ${EXEC_BIN}, median of ${REPS} reps"
 	echo "baseline (no compartment):   ${mode_a} ms"
 	echo "with compartment (enforcing): ${mode_b} ms"
 	echo "delta:                        ${delta} ms"

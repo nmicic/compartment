@@ -936,6 +936,36 @@ All stability tests require root (for `--pin`/`--unpin`, dmesg access,
 and bpffs cleanup). The harness `stab_skip`s with rc=77 on hosts
 without root or BPF LSM, matching the project SKIP convention.
 
+Two things the harness now does for you, because getting them wrong
+produced a run that looked healthy and tested nothing:
+
+* **It drives `--pin` the way the loader actually behaves.** `--pin`
+  does not daemonise, fork or detach, and there is no
+  `--daemonize`/`--background` flag: it attaches, writes the pins under
+  `PIN_ROOT`, prints `[run] compartment-bpf live. ^C to exit.` and then
+  blocks in the ringbuf poll loop. The pins outlive the process — that
+  is the point — so each cycle starts it, waits for the pins to appear
+  on bpffs, then signals and reaps it. The old harness waited for
+  `--pin` to *exit* and declared a hang at cycle 0 of 64 on a perfectly
+  healthy box.
+* **It renders the profile against a real binary.**
+  `tests/stability/baseline-profile{,-b}.conf` are templates:
+  `@STAB_ACTOR@` / `@STAB_ACTOR_B@` are substituted with a purpose-built
+  regular-file ELF (`tests/lib-realbin.sh`). They used to name
+  `/usr/bin/true` and `/usr/bin/false`, which are symlinks on any distro
+  shipping uutils coreutils (Ubuntu 26.04); the loader refuses a symlink
+  leaf, so every seal failed to resolve and all 64 cycles pinned nothing
+  while the run still reported the churn as healthy. T-STAB-8 now fails
+  the run unless every cycle observed a live pin.
+
+Loop B runs `tests/mesh/run-mesh.sh` concurrently, and its ME-10 phase
+pins a daemon to read counter deltas back through `--stats`. `PIN_ROOT`
+is one global namespace and `--unpin` sweeps all of it, so both sides
+take the advisory mutex in `tests/lib-pinlock.sh` around their pinned
+window. Without it, the churn deleted the maps ME-10 was measuring and
+the run failed with `deny_total-delta(exp=1,got=0)` rows that had
+nothing to do with enforcement.
+
 ### 9.3 Acceptance criteria
 
 | ID | Check | Gate |
@@ -947,6 +977,7 @@ without root or BPF LSM, matching the project SKIP convention.
 | T-STAB-5 | All 10 corner-case witnesses pass or documented-skip | FAIL on any FAIL |
 | T-STAB-6 | No stuck-state (D-state survivor, mesh outer timeout) | FAIL |
 | T-STAB-7 | BPF prog/map counts return to baseline (±4) | FAIL |
+| T-STAB-8 | Every churn cycle observed a live pin under `PIN_ROOT/links` | FAIL |
 
 ### 9.4 Failure handling
 

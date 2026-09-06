@@ -19,7 +19,10 @@ mkdir -p "$STAB_DIR"
 
 DAEMON="$REPO/compartment-bpf"
 MESH="$REPO/tests/mesh/run-mesh.sh"
-PROF="$SCRIPT_DIR/../baseline-profile.conf"
+# baseline-profile.conf is a template (@STAB_ACTOR@); stab_profile renders it
+# against a real regular-file ELF so it also resolves on uutils-coreutils
+# distros where /usr/bin/true is a symlink. See tests/lib-realbin.sh.
+PROF=$(stab_profile "$SCRIPT_DIR/../baseline-profile.conf")
 
 if [ "$(id -u)" -ne 0 ]; then
 	stab_skip "CC-01 requires root"

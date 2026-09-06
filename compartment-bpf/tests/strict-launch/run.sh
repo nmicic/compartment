@@ -432,6 +432,42 @@ fi
     fi
 }
 
+# SL-12 (v0.8): the marker hook is attached at bprm_committed_creds, and the
+# old pre-commit attach point is gone.
+#
+# Every other strict-launch witness here passes identically whether the marker
+# is set from lsm.s/bprm_check_security (v0.4..v0.7) or lsm.s/
+# bprm_committed_creds (v0.8): both run during exec and both leave a marker
+# behind, so a revert of the v0.8 move would be invisible to SL-1..SL-11. The
+# move is the whole point of the ABI bump — bprm_check_security runs BEFORE
+# bprm->point_of_no_return, so a failure after it (the reachable one is
+# open_exec(PT_INTERP) returning -ENOENT) hands the marker back to the caller's
+# original image. What distinguishes the two is which link the loader pinned.
+#
+# The loader pins each attached link as PIN_ROOT/links/<BPF program name>
+# (pin_one_link()), so the pin tree is the assertion surface. bpftool's own
+# `prog show` output is not: the kernel truncates program names to 15 chars,
+# so comp_bprm_committed_creds appears there as "comp_bprm_commi".
+{
+    sl12_links="$PIN_ROOT/links"
+    if [ ! -d "$sl12_links" ]; then
+        printf 'FAIL %-36s no link pin tree at %s\n' "SL-12-marker-hook-attach-point" "$sl12_links"
+        FAIL=$((FAIL+1)); RESULT[SL-12-marker-hook-attach-point]="FAIL"
+    elif [ ! -e "$sl12_links/comp_bprm_committed_creds" ]; then
+        printf 'FAIL %-36s comp_bprm_committed_creds not attached (marker hook moved back off bprm_committed_creds?)\n' \
+            "SL-12-marker-hook-attach-point"
+        FAIL=$((FAIL+1)); RESULT[SL-12-marker-hook-attach-point]="FAIL"
+    elif [ -e "$sl12_links/comp_bprm_check_security" ]; then
+        printf 'FAIL %-36s enforcement object still attaches comp_bprm_check_security (pre-v0.8 marker hook)\n' \
+            "SL-12-marker-hook-attach-point"
+        FAIL=$((FAIL+1)); RESULT[SL-12-marker-hook-attach-point]="FAIL"
+    else
+        printf 'PASS %-36s marker set from comp_bprm_committed_creds; pre-v0.8 comp_bprm_check_security absent\n' \
+            "SL-12-marker-hook-attach-point"
+        PASS=$((PASS+1)); RESULT[SL-12-marker-hook-attach-point]="PASS"
+    fi
+}
+
 # SL-10 deny-storm under ringbuf pressure. 200 direct denies (lighter
 # than the spike's 1000 to keep `make check` under the mesh timeout cap;
 # exactness is the point, not count). Even if audit events drop, the

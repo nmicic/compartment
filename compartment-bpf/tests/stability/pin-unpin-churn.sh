@@ -59,8 +59,16 @@ STAB_DIR="${STAB_DIR:-$SCRIPT_DIR/results/$UTC}"
 export STAB_DIR
 mkdir -p "$STAB_DIR"
 
-PROFILE_A="${STAB_PROFILE:-$SCRIPT_DIR/baseline-profile.conf}"
-PROFILE_B="$SCRIPT_DIR/baseline-profile-b.conf"
+# The shipped profiles are templates (@STAB_ACTOR@ / @STAB_ACTOR_B@);
+# stab_profile renders them against a real regular-file ELF fixture. See
+# tests/lib-realbin.sh for why /usr/bin/true is no longer usable.
+PROFILE_A=$(stab_profile "${STAB_PROFILE:-$SCRIPT_DIR/baseline-profile.conf}")
+PROFILE_B=$(stab_profile "$SCRIPT_DIR/baseline-profile-b.conf")
+if grep -q '@STAB_ACTOR' "$PROFILE_A" 2>/dev/null; then
+	stab_skip "no real (non-symlink) ELF actor fixture could be produced; install a C compiler or set REALBIN_CACHE to a prebuilt one"
+	stab_summary || true
+	exit 77
+fi
 DUAL_PROFILE="${DUAL_PROFILE:-0}"
 STAB_CYCLES="${STAB_CYCLES:-64}"
 
@@ -88,7 +96,8 @@ fi
 
 LOOP_A_DONE="/tmp/stab-loop-a-done.$$"
 LOOP_A_FAIL="/tmp/stab-loop-a-fail.$$"
-rm -f "$LOOP_A_DONE" "$LOOP_A_FAIL"
+LOOP_A_PINNED="/tmp/stab-loop-a-pinned.$$"
+rm -f "$LOOP_A_DONE" "$LOOP_A_FAIL" "$LOOP_A_PINNED"
 
 cleanup() {
 	# Loop A may still be running on early exit (Loop B mesh fail). Kill
@@ -106,7 +115,7 @@ cleanup() {
 	# Final --unpin so the host bpffs is clean regardless of where we
 	# exited. Failure here is informational; T-STAB-3 records the truth.
 	"$DAEMON" --unpin >>"$STAB_DIR/cleanup-unpin.log" 2>&1 || true
-	rm -f "$LOOP_A_DONE" "$LOOP_A_FAIL"
+	rm -f "$LOOP_A_DONE" "$LOOP_A_FAIL" "$LOOP_A_PINNED"
 	# Don't remove /tmp/stab-* paths — they're cheap to recreate and
 	# leaving them lets a re-run skip the mkdir+touch.
 }
@@ -119,6 +128,8 @@ START_TS=$(date +%s)
 
 (
 	i=0
+	pinned_cycles=0
+	deferred_total=0
 	while [ "$i" -lt "$STAB_CYCLES" ]; do
 		if [ "$DUAL_PROFILE" = "1" ] && [ $((i % 2)) -eq 0 ]; then
 			PROF="$PROFILE_B"
@@ -128,26 +139,75 @@ START_TS=$(date +%s)
 
 		echo "=== cycle $i: pin $PROF ===" >> "$STAB_DIR/loop-a.log"
 		PIN_START=$(date +%s%3N 2>/dev/null || date +%s)
-		"$DAEMON" --pin "$PROF" >> "$STAB_DIR/loop-a.log" 2>&1 &
-		PIN_PID=$!
-		WAITED=0
-		while kill -0 "$PIN_PID" 2>/dev/null; do
-			sleep 0.1
-			WAITED=$((WAITED + 1))
-			if [ "$WAITED" -gt 50 ]; then
-				stab_capture_stack "$PIN_PID"
-				echo "LOOP_A_HANG_PIN cycle=$i pid=$PIN_PID" >> "$STAB_DIR/loop-a.log"
-				kill -KILL "$PIN_PID" 2>/dev/null || true
-				wait "$PIN_PID" 2>/dev/null || true
+
+		# PIN_ROOT is a single global namespace and Loop B's mesh runner
+		# owns it for its own ME-10 --pin'd counter phase. Take the
+		# harness mutex for the whole pin->unpin transaction so this
+		# loop's --unpin can never delete the counter maps ME-10 is
+		# measuring (tests/lib-pinlock.sh). The lock is released
+		# implicitly if this subshell dies, so a crash cannot wedge
+		# the mesh runner.
+		if ! pinlock_acquire 120; then
+			echo "LOOP_A_PINLOCK_TIMEOUT cycle=$i (waited 120s for $COMPARTMENT_TEST_PINLOCK)" >> "$STAB_DIR/loop-a.log"
+			touch "$LOOP_A_FAIL"
+			touch "$LOOP_A_DONE"
+			exit 1
+		fi
+
+		# Belt and braces: even holding the mutex, never pin over and
+		# never --unpin a tree we did not create.
+		DEFER=0
+		while : ; do
+			FOREIGN=$(stab_count_pins links)
+			if [ "${FOREIGN:-0}" -eq 0 ]; then
+				stab_pin_once "$DAEMON" "$PROF" "$STAB_DIR/loop-a.log" 100
+				PIN_RC=$?
+				# rc=1 with a tree now present means the other owner
+				# pinned inside our check->pin window. That is a
+				# deferral, not a silent no-op — retry.
+				if [ "$PIN_RC" -ne 1 ]; then
+					break
+				fi
+				FOREIGN=$(stab_count_pins links)
+				if [ "${FOREIGN:-0}" -eq 0 ]; then
+					break
+				fi
+			else
+				PIN_RC=1
+			fi
+			DEFER=$((DEFER + 1))
+			deferred_total=$((deferred_total + 1))
+			if [ "$DEFER" -gt 300 ]; then
+				echo "LOOP_A_PIN_STARVED cycle=$i (PIN_ROOT held by another owner for >30s)" >> "$STAB_DIR/loop-a.log"
 				touch "$LOOP_A_FAIL"
 				touch "$LOOP_A_DONE"
 				exit 1
 			fi
+			sleep 0.1
 		done
-		wait "$PIN_PID" 2>/dev/null
-		PIN_RC=$?
+
 		PIN_END=$(date +%s%3N 2>/dev/null || date +%s)
-		echo "cycle $i pin rc=$PIN_RC start=$PIN_START end=$PIN_END" >> "$STAB_DIR/loop-a.log"
+		echo "cycle $i pin rc=$PIN_RC links=${STAB_PIN_LINKS:-0} defer=$DEFER start=$PIN_START end=$PIN_END" >> "$STAB_DIR/loop-a.log"
+
+		if [ "$PIN_RC" -eq 2 ]; then
+			# stab_pin_once already captured the stack.
+			echo "LOOP_A_HANG_PIN cycle=$i" >> "$STAB_DIR/loop-a.log"
+			touch "$LOOP_A_FAIL"
+			touch "$LOOP_A_DONE"
+			exit 1
+		fi
+		# T-STAB-8: a cycle that pins nothing is a SILENT NO-OP, and the
+		# whole point of this loop is the churn. Before this assertion a
+		# profile whose actor path failed to resolve (the /usr/bin/true
+		# symlink case) produced 64 cycles of "pin rc=1 / 0 pins removed"
+		# and the run still reported the churn as healthy.
+		if [ "$PIN_RC" -ne 0 ] || [ "${STAB_PIN_LINKS:-0}" -le 0 ]; then
+			echo "LOOP_A_PIN_NOOP cycle=$i rc=$PIN_RC links=${STAB_PIN_LINKS:-0} (pin produced no pinned links)" >> "$STAB_DIR/loop-a.log"
+			touch "$LOOP_A_FAIL"
+			touch "$LOOP_A_DONE"
+			exit 1
+		fi
+		pinned_cycles=$((pinned_cycles + 1))
 
 		# Random 10-100ms jitter so pin/unpin don't synchronise with mesh.
 		sleep 0.0$(( (RANDOM % 9) + 1 ))
@@ -157,13 +217,17 @@ START_TS=$(date +%s)
 		"$DAEMON" --unpin >> "$STAB_DIR/loop-a.log" 2>&1
 		UNPIN_RC=$?
 		UNPIN_END=$(date +%s%3N 2>/dev/null || date +%s)
-		echo "cycle $i unpin rc=$UNPIN_RC start=$UNPIN_START end=$UNPIN_END" >> "$STAB_DIR/loop-a.log"
+		RESIDUE=$(stab_count_pins)
+		echo "cycle $i unpin rc=$UNPIN_RC residue=$RESIDUE start=$UNPIN_START end=$UNPIN_END" >> "$STAB_DIR/loop-a.log"
+		pinlock_release
 
 		sleep 0.0$(( (RANDOM % 9) + 1 ))
 
 		i=$((i + 1))
 		echo "cycle $i/$STAB_CYCLES complete" >> "$STAB_DIR/loop-a.log"
 	done
+	echo "loop-a: pinned_cycles=$pinned_cycles/$STAB_CYCLES deferrals=$deferred_total" >> "$STAB_DIR/loop-a.log"
+	echo "$pinned_cycles" > "$LOOP_A_PINNED"
 	touch "$LOOP_A_DONE"
 ) &
 LOOP_A_PID=$!
@@ -192,6 +256,23 @@ while ! [ -f "$LOOP_A_DONE" ]; do
 		stab_fail "T-STAB-6 mesh iteration $MESH_ITER timed out (>120s) — possible kernel hang"
 		break
 	fi
+
+	# Mesh harness-level errors (run-mesh.sh exit codes: 2 missing daemon
+	# or stub, 3 inode collision, 4/5 daemon attach) mean the iteration
+	# ran NO trials. Without this guard the loop spun on an unbuildable
+	# mesh several hundred times in five seconds, tallied pass=0 fail=0
+	# every time, and the run then SKIPped T-STAB-4 for "no mesh
+	# iterations completed" instead of reporting the real cause.
+	case "$MESH_RC" in
+	0|6|7)
+		: ;;
+	77)
+		stab_skip "mesh iteration $MESH_ITER SKIPped (rc=77, env unsupported); stopping Loop B"
+		break ;;
+	*)
+		stab_fail "T-STAB-4 mesh iteration $MESH_ITER: harness error rc=$MESH_RC (no trials ran); see $STAB_DIR/mesh-iter-$MESH_ITER.log"
+		break ;;
+	esac
 
 	# Pass-rate accounting. The mesh runner emits "ENFORCED PASS"/
 	# "ENFORCED FAIL" rows + a final summary; we count the per-trial
@@ -234,6 +315,20 @@ wait "$LOOP_A_PID" 2>/dev/null
 LOOP_A_RC=$?
 if [ "$LOOP_A_RC" -ne 0 ]; then
 	stab_fail "Loop A exited rc=$LOOP_A_RC"
+fi
+
+# T-STAB-7: the churn must actually have churned. Loop A records the number
+# of cycles in which a pin was OBSERVED on bpffs (link-pin count > 0); a run
+# where every cycle pinned nothing used to pass every other check precisely
+# BECAUSE nothing was ever pinned (T-STAB-3 "0 pinned objects" is trivially
+# satisfied by a no-op).
+LOOP_A_PINNED_N=0
+[ -r "$LOOP_A_PINNED" ] && LOOP_A_PINNED_N=$(cat "$LOOP_A_PINNED" 2>/dev/null || echo 0)
+LOOP_A_PINNED_N=${LOOP_A_PINNED_N:-0}
+if [ "$LOOP_A_PINNED_N" -eq "$STAB_CYCLES" ]; then
+	stab_pass "T-STAB-8 pin witness: $LOOP_A_PINNED_N/$STAB_CYCLES cycles observed a live pin under $STAB_PIN_ROOT/links"
+else
+	stab_fail "T-STAB-8 pin witness: only $LOOP_A_PINNED_N/$STAB_CYCLES cycles observed a live pin — the churn was (partly) a no-op; see $STAB_DIR/loop-a.log"
 fi
 
 END_TS=$(date +%s)

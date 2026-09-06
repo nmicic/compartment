@@ -44,6 +44,11 @@
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO}"
+# realbin_noop(): a real regular-file ELF for the W6 actor fixture. /bin/true
+# is a symlink on uutils-coreutils distros, and cp'ing a symlink target that
+# is a multi-call binary makes the actor identity meaningless.
+# shellcheck source=tests/lib-realbin.sh
+. "${REPO}/tests/lib-realbin.sh"
 BIN="${REPO}/compartment-bpf"
 PIN_ROOT="/sys/fs/bpf/compartment"
 
@@ -225,7 +230,7 @@ rm -rf "${RTMP}" 2>/dev/null || true; RTMP=""
 # a NON-actor caller, is DENIED — directly under the dir AND in a subdir (the
 # recursive ancestor walk, bounded by COMPARTMENT_MAX_DIR_ANCESTORS).
 W6="$(mktemp -d /tmp/inode-w6.XXXXXX)"
-W6DIR="${W6}/datadir"; mkdir -p "${W6DIR}/sub"; cp /bin/true "${W6}/actor"
+W6DIR="${W6}/datadir"; mkdir -p "${W6DIR}/sub"; cp "$(realbin_noop)" "${W6}/actor"
 echo orig  > "${W6DIR}/existing";  echo orig2 > "${W6DIR}/sub/deep"
 chmod 0666 "${W6DIR}/existing" "${W6DIR}/sub/deep"
 cat > "${SCR}/p6.conf" <<EOF6

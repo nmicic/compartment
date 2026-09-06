@@ -302,8 +302,10 @@ check-howto-examples: compartment-bpf
 # SL-1..SL-10 against the production daemon (not the spike runner) and
 # verifies the new BPF percpu counters increment as expected. Requires
 # root + BPF LSM; the script SKIPs (rc=77) cleanly on developer hosts
-# without a real kernel. Reuses the spike's fixtures under
-# experimental/strict-launch-marker/build/; builds them if missing.
+# without a real kernel. The fixtures are vendored under
+# tests/strict-launch/fixtures/ and built into a temp dir by run.sh; there
+# is no experimental/ directory in this repository (the stale reference to
+# one is what left BX-11 permanently skipped).
 #
 # HIGH-10 (Review-1 fix): trap rc=77 as SKIP so dev hosts without root
 # / BPF LSM / kernel toolchain do not break `make check`. Mirrors
@@ -516,11 +518,15 @@ check-deny-candidate: compartment-bpf
 # The harness also accepts STAB_CYCLES=N for ad-hoc cadences; both
 # targets exist as named entry points so CI / operator scripts don't
 # need to know the env-var spelling.
-check-stability:
+# The harness's Loop B drives tests/mesh/run-mesh.sh, which needs the daemon,
+# the test tools and the 8 mesh stubs. Without these prerequisites every mesh
+# iteration exited 2 ("missing stub") in milliseconds and the churn run spun
+# hundreds of empty iterations before reporting an unrelated SKIP.
+check-stability: compartment-bpf test-tools mesh-stubs
 	@echo "Running stability test ($${STAB_CYCLES:-1024} cycles; requires root)..."
 	sudo STAB_CYCLES=$${STAB_CYCLES:-1024} bash tests/stability/pin-unpin-churn.sh
 
-check-stability-quick:
+check-stability-quick: compartment-bpf test-tools mesh-stubs
 	@echo "Running quick stability test (64 cycles; requires root)..."
 	sudo STAB_CYCLES=64 bash tests/stability/pin-unpin-churn.sh
 
@@ -543,6 +549,12 @@ check-counter-longevity: compartment-bpf
 # new surface with no witness now FAILS the build (the OPEN-1 / dir-seal-drift
 # class). Regenerates tests/coverage/COVERAGE-MATRIX.md as a side effect.
 check-coverage-static:
+	@# --selftest first: the gate is only as strong as its definition of
+	@# "witnessed", and that definition is what silently rotted before
+	@# (a hook was credited by its bare op suffix appearing anywhere in the
+	@# corpus, comments included). The selftest asserts a comment-only
+	@# mention is UNWITNESSED and a stray op token credits nothing.
+	@python3 tools/coverage-map.py --selftest
 	@python3 tools/coverage-map.py --write-matrix tests/coverage/COVERAGE-MATRIX.md
 
 # Loader fail-closed input-validation witnesses (2026-06-09): the recursive
@@ -642,6 +654,20 @@ check-release: check-env
 	  echo "[check-release] FAIL: a core suite SKIPPED for an env reason preflight should have guaranteed away (above)"; \
 	  rm -f "$$log"; exit 1; \
 	fi; \
+	pats=$$(mktemp); unknown=$$(mktemp); \
+	grep -vE '^[[:space:]]*(#|$$)' tests/release-skip-allowlist.txt > "$$pats"; \
+	grep -a 'SKIP' "$$log" | grep -avE -f "$$pats" > "$$unknown" || true; \
+	if [ -s "$$unknown" ]; then \
+	  echo "[check-release] FAIL: unrecognised SKIP line(s). Every skip must match a documented"; \
+	  echo "[check-release]       entry in tests/release-skip-allowlist.txt — an unknown skip is a FAIL,"; \
+	  echo "[check-release]       because that is how two permanently-dead bypass witnesses (BX-11"; \
+	  echo "[check-release]       'spike fixtures missing', BX-12 'bpftool map create failed') read"; \
+	  echo "[check-release]       as green on every release. Fix the witness, or add an allowlist"; \
+	  echo "[check-release]       entry with a reason."; \
+	  sed 's/^/  /' "$$unknown"; \
+	  rm -f "$$log" "$$pats" "$$unknown"; exit 1; \
+	fi; \
+	rm -f "$$pats" "$$unknown"; \
 	rm -f "$$log"; \
 	echo "[check-release] PASS — full suite ran with no critical env skips"
 

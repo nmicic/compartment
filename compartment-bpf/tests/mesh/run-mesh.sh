@@ -50,8 +50,49 @@ STUB_DIR="$REPO_ROOT/tests/mesh/build"
 RESULTS_DIR="$REPO_ROOT/tests/results"
 mkdir -p "$RESULTS_DIR"
 
+# --- Preconditions this harness used to leave to the Makefile ---------------
+#
+# `make check-mesh` chowns tests/mesh/sequences to 0:0 before invoking us
+# because ME-21 refuses to source a .seq file that is not root-owned
+# (HIGH-13, below). A direct `sudo tests/mesh/run-mesh.sh` — the invocation
+# in the docs and the obvious one for an operator — did not, so on a freshly
+# rsync'd, user-owned tree every sequence FATAL'd and the operator got a
+# silent hole in the run. We already require root here, so do it ourselves.
+if [ -d "$REPO_ROOT/tests/mesh/sequences" ]; then
+	if ! chown -R 0:0 "$REPO_ROOT/tests/mesh/sequences" 2>/dev/null ||
+	   ! chmod -R u=rwX,go=rX "$REPO_ROOT/tests/mesh/sequences" 2>/dev/null; then
+		echo "[mesh] FATAL: cannot make $REPO_ROOT/tests/mesh/sequences root-owned and non-group/world-writable." >&2
+		echo "[mesh]        ME-21 sources those files as root shell code and refuses anything else (HIGH-13)." >&2
+		echo "[mesh]        Fix with: chown -R 0:0 tests/mesh/sequences && chmod -R u=rwX,go=rX tests/mesh/sequences" >&2
+		exit 2
+	fi
+fi
+
+# The 8 mesh stubs are built by `make mesh-stubs`. A standalone run on a tree
+# where they are absent used to die at the distinct-inode assertion with a
+# bare "missing stub" and exit 2 — which the stability harness happily looped
+# on 358 times. Build them here if they are missing so the harness is
+# self-sufficient; if the build is not possible, say exactly what to run.
+if [ ! -x "$STUB_DIR/mesh_actor_a1" ]; then
+	echo "[mesh] mesh stubs absent under $STUB_DIR; building via 'make mesh-stubs'" >&2
+	if ! make -C "$REPO_ROOT" mesh-stubs >/dev/null 2>&1; then
+		echo "[mesh] FATAL: mesh stubs missing and 'make -C $REPO_ROOT mesh-stubs' failed." >&2
+		echo "[mesh]        Build them first: make mesh-stubs" >&2
+		exit 2
+	fi
+fi
+
 # shellcheck source=tests/mesh/predict.sh
 . "$REPO_ROOT/tests/mesh/predict.sh"
+# realbin_noop(): a real regular-file ELF, never /usr/bin/true (a symlink
+# under uutils coreutils). Used by ME-13's cp-onto-actor trial.
+# shellcheck source=tests/lib-realbin.sh
+. "$REPO_ROOT/tests/lib-realbin.sh"
+# pinlock_*(): PIN_ROOT is global and --unpin sweeps all of it, so the ME-10
+# counter phase must own it exclusively for the whole pin-measure-unpin
+# transaction. See tests/lib-pinlock.sh.
+# shellcheck source=tests/lib-pinlock.sh
+. "$REPO_ROOT/tests/lib-pinlock.sh"
 
 ACTORS=(a1 a2 a3 a4)
 OUTSIDERS=(b1 b2 b3 b4)
@@ -1446,8 +1487,10 @@ me13_assert_deny() {
 		fi
 	fi
 }
-# (a) no-write: cp /usr/bin/true onto the actor binary → DENY.
-me13_assert_deny cp-onto-actor cp /usr/bin/true "$ME13_BIN"
+# (a) no-write: cp a real ELF onto the actor binary → DENY. The source used
+# to be /usr/bin/true, a symlink on uutils-coreutils distros.
+ME13_SRC=$(realbin_noop) || ME13_SRC="$STUB_DIR/mesh_outsider_b1"
+me13_assert_deny cp-onto-actor cp "$ME13_SRC" "$ME13_BIN"
 # (b) no-rename/no-unlink: mv actor binary aside → DENY.
 me13_assert_deny mv-actor mv "$ME13_BIN" "${ME13_BIN}.bak"
 # (c) no-unlink: rm actor binary → DENY.
@@ -2829,6 +2872,16 @@ done
 
 # Unpin any leftover state from prior runs (best-effort) and launch
 # fresh with --pin so --stats can read counters.
+#
+# From here to the matching pinlock_release below we must be the ONLY owner
+# of PIN_ROOT: --stats reads the pinned counter maps, and any other suite's
+# --unpin in this window deletes them mid-measurement (which is what turned
+# every deny_total delta into got=0 when the stability harness drove this
+# runner concurrently).
+if ! pinlock_acquire 180; then
+	echo "[mesh] ME-10 FAIL: timed out waiting for the PIN_ROOT test lock ($COMPARTMENT_TEST_PINLOCK)" >&2
+	FAIL=$((FAIL+1))
+fi
 "$DAEMON" --unpin >/dev/null 2>&1 || true
 ME10_LOG="$WORK/me10/daemon.log"
 "$DAEMON" --pin "$ME10_PROFILE" >"$ME10_LOG" 2>&1 &
@@ -2918,6 +2971,7 @@ if [ -n "${ME10_DAEMON_PID:-}" ] && kill -0 "$ME10_DAEMON_PID" 2>/dev/null; then
 fi
 "$DAEMON" --unpin >/dev/null 2>&1 || true
 DAEMON_PID=""
+pinlock_release
 
 echo "[mesh] ME-10 counter consistency: $ME10_PASS PASS / $ME10_FAIL FAIL"
 
