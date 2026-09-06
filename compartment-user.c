@@ -832,7 +832,9 @@ static int shell_dir_acceptable(const char *dir, const char *shell_name)
      * uid, nothing group- or world-writable. */
     int ok = profile_fd_trusted(dfd, 0, S_IFDIR, "shell directory", dir) == 0;
     if (ok) {
-        int sfd = openat(dfd, shell_name, O_RDONLY | O_CLOEXEC);
+        /* O_PATH: we only need to stat it, and an execute-only shell
+         * binary would not be readable. */
+        int sfd = openat(dfd, shell_name, O_PATH | O_CLOEXEC);
         if (sfd < 0) {
             fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
                     "'%s': %s/%s: %s\n", dir, dir, shell_name, strerror(errno));

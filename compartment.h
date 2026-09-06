@@ -1494,7 +1494,13 @@ static inline void sanitize_env(Config *cfg)
         char *victim = NULL;
         for (char **e = environ; *e && !victim; e++) {
             const char *eq = strchr(*e, '=');
-            size_t nlen = eq ? (size_t)(eq - *e) : strlen(*e);
+            /* An entry with no '=' cannot be removed: unsetenv() reports
+             * success but leaves it in place, which would spin this loop
+             * forever. Such an entry is also invisible to getenv(), so
+             * skipping it costs nothing. A caller can only produce one by
+             * crafting envp for execve() by hand. */
+            if (!eq) continue;
+            size_t nlen = (size_t)(eq - *e);
             if (nlen == 0) continue;
             char *name = strndup(*e, nlen);
             if (!name) {
