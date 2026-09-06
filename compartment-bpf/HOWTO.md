@@ -701,13 +701,17 @@ map fd the kernel hands out, to anything on the box. Measured with
 
 | kernel | no policy | `--pin` | `--pin --self-protect` |
 |---|---|---|---|
-| 6.8.0-139 | 1451 ns | 1456 ns (+0.4 %) | 1601 ns (**+10.4 %**) |
-| 7.0.0-31 | 1153 ns | 1155 ns (+0.2 %) | 1286 ns (**+11.5 %**) |
+| 6.8.0-139 | 1451–1452 ns | −0.2 % to +0.4 % | **+10 % to +17 %** (+145 to +252 ns) |
+| 7.0.0-31 | 1148–1153 ns | +0.1 % to +0.5 % | **+11 % to +12 %** (+121 to +138 ns) |
 
-Without the flag the cost is nil, because `comp_bpf_map` is not even loaded.
-With it, budget ~130–145 ns per map-fd creation. Nothing on the file or inode
-data plane changes: the pin-tamper branch costs one array lookup and one
-integer compare on any filesystem that is not the bpffs holding the pins.
+Without the flag the cost is nil, because `comp_bpf_map` is not even loaded —
+every run lands within the noise of the no-policy baseline. With it, budget of
+order 100–250 ns per map-fd creation; the range is the guest, not the hook (7.0
+reproduced to within 17 ns across three runs, 6.8 spread between two). If you
+have a latency budget on `bpf(2)`, measure it on your own hardware. Nothing on
+the file or inode data plane changes either way: the pin-tamper branch costs
+one array lookup and one integer compare on any filesystem that is not the
+bpffs holding the pins.
 
 See the `LIMITATIONS.md` self-protection section for the measurement behind the
 read-only decision and for what the flag does **not** close.
