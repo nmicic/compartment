@@ -42,7 +42,6 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
-#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <linux/capability.h>
 #include <net/if.h>
@@ -581,22 +580,54 @@ static int child_func(void *arg)
         }
     }
 
-    /* 5. Minimal /dev — tmpfs with only safe devices */
+    /* 5. Minimal /dev — tmpfs holding the host device nodes, bind-mounted
+     *
+     * mknod(2) can never work here.  vfs_mknod() gates character and block
+     * device creation on capable(CAP_MKNOD) against the *initial* user
+     * namespace, not ns_capable(), so every mknod() in a CLONE_NEWUSER
+     * child returns EPERM.  The old code ignored those return values and
+     * the container ended up with a /dev that had no device nodes at all:
+     * `echo x > /dev/null` failed for every process inside.
+     *
+     * Bind-mounting the host's existing nodes is the standard workaround
+     * and *is* permitted in a user namespace.  This is the second reason
+     * the old root must still be attached at this point (see step 3):
+     * /.pivot_old/dev is the only remaining path to real device nodes.
+     *
+     * The tmpfs is MS_NOSUID|MS_NOEXEC but deliberately NOT MS_NODEV —
+     * MS_NODEV would make the nodes we just bound in unusable.
+     */
+    static const char *dev_nodes[] = {
+        "null", "zero", "full", "random", "urandom", "tty", NULL
+    };
     (void)mkdir("/dev", 0755);
     if (mount("tmpfs", "/dev", "tmpfs",
-              MS_NOSUID | MS_NOEXEC, "size=64k,mode=0755") == 0) {
-        mknod("/dev/null",    S_IFCHR | 0666, makedev(1, 3));
-        mknod("/dev/zero",    S_IFCHR | 0666, makedev(1, 5));
-        mknod("/dev/full",    S_IFCHR | 0666, makedev(1, 7));
-        mknod("/dev/random",  S_IFCHR | 0666, makedev(1, 8));
-        mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
-        (void)mkdir("/dev/pts", 0755);
-        if (symlink("/proc/self/fd",   "/dev/fd")     < 0) { /* best-effort */ }
-        if (symlink("/proc/self/fd/0", "/dev/stdin")  < 0) { /* best-effort */ }
-        if (symlink("/proc/self/fd/1", "/dev/stdout") < 0) { /* best-effort */ }
-        if (symlink("/proc/self/fd/2", "/dev/stderr") < 0) { /* best-effort */ }
+              MS_NOSUID | MS_NOEXEC, "size=64k,mode=0755") != 0) {
+        perror("compartment-root: mount /dev tmpfs");
+        exit(EXIT_FAILURE);
     }
-    /* If /dev mount fails (no CAP_SYS_ADMIN inside userns), use existing /dev */
+    for (int i = 0; dev_nodes[i]; i++) {
+        char src[PATH_MAX], dst[PATH_MAX];
+        snprintf(src, sizeof(src), "/.pivot_old/dev/%s", dev_nodes[i]);
+        snprintf(dst, sizeof(dst), "/dev/%s", dev_nodes[i]);
+        /* A bind mount needs an existing target — an empty regular file
+         * is enough, the bind replaces it with the device node. */
+        int dfd = open(dst, O_CREAT | O_WRONLY | O_CLOEXEC, 0666);
+        if (dfd >= 0)
+            close(dfd);
+        if (mount(src, dst, NULL, MS_BIND, NULL) != 0) {
+            fprintf(stderr, "compartment-root: bind %s -> %s: %s\n",
+                    src, dst, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        if (config->verbose)
+            fprintf(stderr, "compartment-root: dev %s\n", dst);
+    }
+    (void)mkdir("/dev/pts", 0755);
+    if (symlink("/proc/self/fd",   "/dev/fd")     < 0) { /* best-effort */ }
+    if (symlink("/proc/self/fd/0", "/dev/stdin")  < 0) { /* best-effort */ }
+    if (symlink("/proc/self/fd/1", "/dev/stdout") < 0) { /* best-effort */ }
+    if (symlink("/proc/self/fd/2", "/dev/stderr") < 0) { /* best-effort */ }
 
     /* Default masks: hide kernel tunables and memory */
     (void)mount("tmpfs", "/proc/sys", "tmpfs",
