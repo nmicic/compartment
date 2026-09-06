@@ -54,6 +54,10 @@
 #define CLONE_NEWCGROUP 0x02000000
 #endif
 
+/* Shared: Config struct, syscall/cap tables, profile loader, audit,
+ * env sanitize, seccomp BPF builder — all static inline, zero deps. */
+#include "compartment.h"
+
 /* mount_setattr(2): Linux 5.12+. Declared here rather than pulled in from
  * <linux/mount.h> so the build stays header-independent (and keeps the
  * zero-dependency promise). Only used to apply nosuid/nodev recursively;
@@ -73,10 +77,6 @@ struct compartment_mount_attr {   /* layout of struct mount_attr */
     uint64_t propagation;
     uint64_t userns_fd;
 };
-
-/* Shared: Config struct, syscall/cap tables, profile loader, audit,
- * env sanitize, seccomp BPF builder — all static inline, zero deps. */
-#include "compartment.h"
 
 /* ── Child args passed through clone() ─────────────────────────────── */
 
