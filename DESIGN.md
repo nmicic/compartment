@@ -62,6 +62,60 @@ cc -o compartment-root compartment-root.c          # zero deps
 The header is `#include`d directly — no separate compilation unit, no
 linking, no build system complexity.
 
+## Trust boundaries
+
+Three of the tools in this repository confine a uid-0 subject, and they do
+it against three different adversaries. Which one a control answers is the
+first thing to establish about it, because the failure mode of confusing
+them is believing a boundary exists where none does.
+
+**The confined session.** Everything `compartment-user` installs — a
+Landlock domain, a seccomp filter, a capability bounding set, a private
+mount namespace, `no_new_privs` — is per-task kernel state established at
+the `execve` that enters the sandbox. It is inherited by every descendant,
+it can only be narrowed, and there is no API to release any of it. Against
+a process *inside* the session this is a genuine boundary. Against anything
+else it is silent: it is a property of the task, not of the filesystem, so
+it constrains only the side it is on. That is why it says nothing about a
+uid-0 process that was never in the session, and why it creates no uid
+boundary at all — the account is still uid 0, and DAC contributes nothing
+to a subject holding `CAP_DAC_OVERRIDE`.
+
+**Unconfined root.** A uid-0 process outside the session — cron, a systemd
+unit, a package hook, an sshd session for an account whose shell is not the
+wrapper — is not in any domain and cannot be reached by one. The only
+control that binds it is one that binds the *object* instead of the
+subject: a `compartment-bpf` seal, which keys on `(dev, ino)` and is
+enforced by the kernel on every caller regardless of uid or capability.
+This is why the limited-root deployment ships as two profiles that have to
+be deployed together — `examples/limited-root.conf` binds the session,
+`compartment-bpf/profiles/limited-root-authpath.conf` binds the inodes on
+the login path — and why neither half is sufficient. `/etc/ld.so.preload`
+is the clearest case: a Landlock rule protects it from the session, but the
+file is read by the dynamic loader in unconfined processes, sshd included,
+so only a seal covers the other side.
+
+**`CAP_BPF`.** The seals are themselves kernel state, and the capability
+that manages BPF manages them. A holder can obtain an fd to any of the
+tool's maps and rewrite it from program context — `bpf_map_freeze()` gates
+the syscall path only — or unlink the bpffs pin tree, or unmount the
+filesystem holding it. So `CAP_BPF` sits underneath both of the layers
+above, and it is answered from two directions that do not substitute for
+each other: a limited-root profile drops the capability from the confined
+session, which makes `CAP_BPF` the only route to the seals; and
+`compartment-bpf --pin --self-protect` puts the maps and the pin tree
+behind the loader's own binary identity, which answers everybody else.
+Under it all sits the boot chain, which nothing enforced from inside a
+running kernel can defend: bpffs is not persistent and the BPF LSM is in
+the chain only because `lsm=` on the kernel command line put it there.
+Secure Boot and a locked bootloader are a separate layer and a separate
+decision.
+
+What each layer does *not* cover is documented where an operator will meet
+it: `HOWTO.md`, "Limited root over SSH" §8 for the session side, and the
+self-protection section of `compartment-bpf/LIMITATIONS.md` for the kernel
+side.
+
 ## Unification History
 
 ### Phase 1: Extract shared code into compartment.h

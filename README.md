@@ -574,11 +574,14 @@ Two directives make that possible on top of Landlock and seccomp:
 Ship `examples/limited-root.conf` and
 `compartment-bpf/profiles/limited-root-authpath.conf` together: the first
 binds the session, the second binds the inodes, and they answer different
-adversaries. Full walk-through, the sshd settings it needs, the recovery
-plan and the residual-risk list: [HOWTO.md](HOWTO.md), "Limited root over
-SSH". `tests/scripts/root.d/limited-root.sh` exercises it end to end
-through a real sshd login, with an unconfined uid-0 login as the positive
-control.
+adversaries. Full walk-through, the sshd settings it needs and the recovery
+plan: [HOWTO.md](HOWTO.md), "Limited root over SSH". **Section 8 there is the
+complete list of what this does not protect against** — read it before
+deploying, along with the self-protection section of
+[compartment-bpf/LIMITATIONS.md](compartment-bpf/LIMITATIONS.md), which covers
+the kernel-side half of the pair. `tests/scripts/root.d/limited-root.sh`
+exercises the deployment end to end through a real sshd login, with an
+unconfined uid-0 login as the positive control.
 
 ## Requirements
 

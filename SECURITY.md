@@ -201,18 +201,26 @@ documented limitations, including:
   ingesting the `audit_event` ringbuf and alerting on enforcement stopping.
   `tests/bypass/26-frozen-map-honesty.sh` re-measures the gap on every run,
   so it cannot quietly return to prose
-- **`compartment-bpf --pin --self-protect` closes that at the kernel, opt-in,
-  and leaves three known edges.** The flag gates `bpf_map_new_fd()` and the
-  pin tree so only an authorised loader image can obtain a map fd, unlink or
-  rename a pin, or unmount the bpffs holding it. It is off by default because
-  it changes the upgrade ceremony: a successor loader at a different inode
-  cannot `--unpin` what this one pinned unless it was named with
-  `--authorize-loader` (see `compartment-bpf/HOWTO.md` §3.6). Residuals with
-  the flag on: a task that inherits a map fd from a *running* loader via
-  `pidfd_getfd(2)` or `SCM_RIGHTS` never calls `bpf_map_new_fd()` and is not
-  gated (it needs `PTRACE_MODE_ATTACH` on the loader, and daemonless `--pin`
-  leaves no loader running); `mount --move` of the pin bpffs has no LSM hook
-  and orphans the pins while enforcement stays live; and the ED-11 unpin
-  sentinel lives on `/run`, not on bpffs, so it is not covered — deleting it
-  downgrades `--unpin` to the legacy path but does not remove enforcement.
-  `compartment-bpf/LIMITATIONS.md` carries the full table
+- **`compartment-bpf --pin --self-protect` closes that at the kernel, opt-in.**
+  The flag gates `bpf_map_new_fd()` and the pin tree so only an authorised
+  loader image can obtain a map fd — read-only included, because a read-only
+  fd is a complete attack — unlink or rename a pin, over-mount the pin tree,
+  or unmount the bpffs holding it. Measured on 6.8.0-139 and 7.0.0-31. It is
+  off by default for three costs: it changes the upgrade ceremony (a successor
+  loader at a different inode cannot `--unpin` what this one pinned unless it
+  was named with `--authorize-loader` at pin time, and a stranded tree costs a
+  reboot); a host-wide `bpftool map show` aborts at the first compartment map
+  while it is on; and the gate costs of order 100–250 ns per map-fd creation,
+  where the default build costs nothing. Six residuals with the flag on — a
+  reboot with `lsm=` changed or a `kexec`; a map fd stolen from a *running*
+  loader via `pidfd_getfd(2)`/`SCM_RIGHTS`, which never calls
+  `bpf_map_new_fd()`; a stranded pin tree; the `bpftool map show` listing; an
+  operator in a mount namespace that cannot see the pin tree; and `CAP_BPF`
+  itself, which is the limited-root profile's job. Two adjacent upstream gaps
+  sit beside them: `mount --move` of the pin bpffs has no LSM hook and orphans
+  the pins while enforcement stays live, and the ED-11 unpin sentinel lives on
+  `/run` rather than bpffs, so deleting it downgrades `--unpin` to the legacy
+  path without removing enforcement. **The two controls compose and neither
+  replaces the other.** `compartment-bpf/HOWTO.md` §3.6 is the operator path;
+  the self-protection section of `compartment-bpf/LIMITATIONS.md` carries the
+  full table
