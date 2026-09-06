@@ -47,4 +47,6 @@ documented limitations, including:
 
 - No formal verification or professional penetration testing
 - Network egress bypass testing not yet automated for sandbox.sh HARD mode
-- compartment-root not tested under actual root (test suite runs rootless)
+- compartment-root coverage under real root is only beginning: there is a
+  runner (`sudo make test-root`) and a discovery directory, but what it
+  actually covers is whatever `tests/scripts/root.d/` contains — run it

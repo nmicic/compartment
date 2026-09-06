@@ -13,11 +13,13 @@ core tools, one shared profile format, plus an optional BPF-LSM module.
 
 > **Note:** This is an open-source Linux isolation toolkit, not a
 > formally validated security product. The code has been through
-> multiple review rounds and 51 automated tests, but it has not
-> undergone professional penetration testing or formal verification.
-> The automated tests do not yet cover all bypass vectors (e.g.,
-> direct network egress in sandbox mode, compartment-root under
-> root). Use it as a defense-in-depth layer, not as your sole
+> multiple review rounds and an automated test suite (run
+> `make test-integration` and `sudo make test-root` for the current
+> counts), but it has not undergone professional penetration testing
+> or formal verification. The automated tests do not yet cover all
+> bypass vectors (e.g. direct network egress in sandbox mode, and
+> compartment-root under root is only beginning to be covered). Use
+> it as a defense-in-depth layer, not as your sole
 > security boundary. See [DESIGN.md](DESIGN.md) for documented
 > limits and the full security review log.
 
@@ -49,10 +51,19 @@ make
 
 ```bash
 make                    # builds the zero-dependency core tools
-make test               # run core tests (Landlock + seccomp + env + inheritance)
-make test-integration   # run all tests (includes Claude CLI smoke test)
+make test               # core suites (Landlock + seccomp + env + inheritance)
+make test-integration   # every unprivileged suite (sandbox.sh, external CLI)
+sudo make test-root     # the root-only suites
 make hardened           # build with randomized shell stash path
+make show-hardening     # print the hardening flags this toolchain accepted
+make check              # shellcheck + file-mode checks (same gates as CI)
 ```
+
+Hardening flags (`-fPIE -pie`, full RELRO, `-z noexecstack`,
+`-fstack-clash-protection`, `-fcf-protection`, `_FORTIFY_SOURCE=3`) are
+stated by the Makefile rather than inherited from the distribution's gcc
+specs, and each one a toolchain might not have is chosen by a compile-and-
+link probe, so an older or non-x86 target drops it instead of failing.
 
 Optional BPF module:
 
@@ -410,9 +421,18 @@ man/
   compartment-root.8   — Man page (section 8: system administration)
 tests/
   probes/deny_probe.c  — Sandbox validation probe (machine-parseable output)
-  profiles/            — Test-specific .conf profiles
-  scripts/run_all.sh   — Top-level test runner (52 tests across 4 suites)
+  profiles/            — Test-specific .conf profile templates
+  scripts/run_all.sh   — Rootless test runner (make test-integration)
+  scripts/run_root_tests.sh — Root-only test runner (sudo make test-root)
+  scripts/rootless.d/  — Discovered unprivileged suites (drop a script in)
+  scripts/root.d/      — Discovered root-only suites
   README.md            — Test documentation
+scripts/
+  timestamp.sh         — SHA256 + OpenTimestamps proof-of-existence
+extra/
+  squid-proxy/, tinyproxy/ — Optional egress-proxy helpers
+.github/workflows/
+  ci.yml               — Build, rootless + root suites, sanitizers, lint
 archive/
   shell-guard/         — Archived shell-replacement tool (~2003, self-contained)
 ```

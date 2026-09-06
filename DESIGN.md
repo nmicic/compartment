@@ -179,20 +179,42 @@ balance of safety and usability.
 
 ### Testing
 
-52 automated tests across 4 suites:
+`make test-integration` runs every unprivileged suite; `sudo make test-root`
+runs the root-only ones. Both print the assertion totals they measured —
+counts are deliberately not repeated here, because the three places that
+used to repeat them each quoted a different, wrong figure.
 
-- **Compartment-user matrix** (46 tests): Landlock ro/rw paths, seccomp
-  deny-list (ptrace, unshare, process_vm_*, userfaultfd, perf_event_open,
-  io_uring), environment sanitization (deny-list + preserve), combined
-  profiles, built-in profiles (ai-agent, strict + inheritance), --dry-run,
-  --verify, shell-replacement mode
-- **Child inheritance** (6 tests): seccomp survives fork/exec via /bin/sh
-  and /bin/bash, Landlock inherited by children, env sanitization inherited,
-  grandchild (depth-2) inherits seccomp
-- **Sandbox.sh** (skipped in containers): HARD/SOFT network modes, proxy bridge
-- **Claude CLI smoke** (4 tests): `claude --version` + `claude --print` under
-  full sandbox, audit logging captures PPID chain, --dry-run policy display
+- **Compartment-user matrix** (`run_compartment_user_matrix.sh`): Landlock
+  ro/rw paths, seccomp deny-list (ptrace, unshare, process_vm_*,
+  userfaultfd, perf_event_open, io_uring), environment sanitization
+  (deny-list + preserve), combined profiles, built-in profiles (ai-agent,
+  strict + inheritance), --dry-run, --verify, shell-replacement mode, FD
+  inheritance, and self-tests of the harness's own assertion helpers
+- **Child inheritance** (`run_child_inheritance_tests.sh`): seccomp survives
+  fork/exec via /bin/sh and /bin/bash, Landlock inherited by children, env
+  sanitization inherited, grandchild (depth-2) inherits seccomp
+- **Discovered suites**: every executable `tests/scripts/rootless.d/*.sh`
+  runs as its own suite, and every `tests/scripts/root.d/*.sh` under
+  `sudo make test-root`. Adding a test means adding a file, not editing a
+  runner. `core-matrix-extra.sh` covers the x32-ABI bypass, W^X in both
+  directions, exact seccomp errnos, profile parser limits and inherit
+  depth, --dry-run/--verify shape, and env sanitization as observed by the
+  exec'd process
+- **Sandbox.sh** (skipped without user namespaces): HARD/SOFT network
+  modes, proxy bridge
+- **External CLI smoke** (`run_claude_smoke.sh`): a third-party CLI under
+  full sandbox, audit logging captures the PPID chain, --dry-run policy
+  display. Skipped when that CLI is missing or unauthenticated, or with
+  `--no-external`
 
 Tests use `deny_probe`, a purpose-built binary with subcommands for each
-operation (fs_read, fs_write, sc_ptrace_traceme, env_get, spawn_sh, etc.)
-that reports machine-parseable results.
+operation (fs_read, fs_write, sc_ptrace_traceme, sc_ptrace_x32, env_get,
+env_dump, fd_list, spawn_sh, etc.) that reports machine-parseable results.
+It prints `PROBE_START op=<op> pid=<n>` before anything else: without a
+positive "the probe ran" marker, an assertion cannot distinguish a blocked
+operation from a probe the sandbox refused to exec, and six assertions
+used to pass on exactly that ambiguity.
+
+CI (`.github/workflows/ci.yml`) runs the build, the full rootless suite,
+the root suite under `sudo`, an ASan+UBSan build over the rootless suite,
+shellcheck, and file-mode checks, on ubuntu-22.04 and ubuntu-24.04.

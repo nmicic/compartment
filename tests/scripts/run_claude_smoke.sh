@@ -17,6 +17,11 @@
 # Usage:
 #   ./tests/scripts/run_claude_smoke.sh [--with-proxy]
 
+# AUDIT_OUT below is write-only on purpose: the case it belongs to asserts on
+# the audit log the run produces, not on what the CLI prints, and assigning
+# the output keeps it off the suite's stdout.
+# shellcheck disable=SC2034
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

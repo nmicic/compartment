@@ -66,14 +66,14 @@ if ! command -v vng >/dev/null 2>&1; then
     exit 1
 fi
 
-KVM_FLAG=""
+KVM_FLAG=()
 if [[ $USE_KVM -eq 0 ]]; then
-    KVM_FLAG="--disable-kvm"
+    KVM_FLAG=(--disable-kvm)
     echo "NOTE: Running without KVM (TCG emulation) — tests will be slower."
 elif [[ ! -w /dev/kvm ]] 2>/dev/null; then
     echo "WARNING: /dev/kvm not writable — falling back to TCG emulation."
     echo "  Fix: sudo usermod -aG kvm \$(whoami)"
-    KVM_FLAG="--disable-kvm"
+    KVM_FLAG=(--disable-kvm)
 fi
 
 echo ""
@@ -82,7 +82,7 @@ echo "║  Compartment kernel matrix test (virtme-ng)                 ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 echo "Kernels: $KERNELS"
-echo "KVM: ${KVM_FLAG:-enabled}"
+echo "KVM: ${KVM_FLAG[*]:-enabled}"
 echo "Memory: $MEMORY  CPUs: $CPUS"
 echo ""
 
@@ -105,7 +105,7 @@ run_kernel_test() {
     printf "  %-12s %-40s " "$kernel" "$test_name"
 
     local output rc=0
-    local -a vng_cmd=(vng --run "$kernel" $KVM_FLAG --rw --pwd
+    local -a vng_cmd=(vng --run "$kernel" ${KVM_FLAG[@]+"${KVM_FLAG[@]}"} --rw --pwd
                       --memory "$MEMORY" --cpus "$CPUS"
                       "${extra_args[@]}" --exec)
 
