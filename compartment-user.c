@@ -962,15 +962,28 @@ int main(int argc, char *argv[])
      *   # real shell lives at /bin/shells/bash
      */
     char *invoked_name = basename(argv[0]);
-    if (strcmp(invoked_name, "compartment-user") != 0) {
+
+    /* login(1) and sshd hand a *login* shell an argv[0] of "-bash": the
+     * leading dash is a convention that tells the shell to read the login
+     * startup files, not part of the program's name.  Without stripping it
+     * the stash lookup becomes "<stash>/-bash" and every interactive login
+     * through the wrapper fails to exec — which made the whole login-shell
+     * deployment work only for `ssh host command`, where sshd passes the
+     * bare basename.  argv itself is left alone on the exec below, so the
+     * real shell still sees its dash and still behaves as a login shell. */
+    const char *shell_name = invoked_name;
+    if (shell_name[0] == '-' && shell_name[1] != '\0')
+        shell_name++;
+
+    if (strcmp(shell_name, "compartment-user") != 0) {
         const char *shell_dir = getenv("COMPARTMENT_SHELL_DIR");
-        if (shell_dir && !shell_dir_acceptable(shell_dir, invoked_name))
+        if (shell_dir && !shell_dir_acceptable(shell_dir, shell_name))
             shell_dir = NULL;
         if (!shell_dir) shell_dir = REAL_SHELL_DIR;
 
         char real_shell[PATH_MAX];
         int rsn = snprintf(real_shell, sizeof(real_shell), "%s/%s",
-                           shell_dir, invoked_name);
+                           shell_dir, shell_name);
         if (rsn < 0 || (size_t)rsn >= sizeof(real_shell)) {
             fprintf(stderr, "compartment-user: shell path too long\n");
             return 126;
@@ -990,24 +1003,56 @@ int main(int argc, char *argv[])
             .audit_log_fd     = -1,
             .profile          = "ai-agent",
         };
-        /* Try profile file first, fall back to built-in.
+        /* Profile resolution, in order:
          *
-         * A rejected profile falls back to the built-in rather than
-         * aborting: shell-replacement mode must never lock the user out,
-         * and the built-in ai-agent policy is strictly tighter than the
-         * unconfined shell that refusing to run would leave behind. The
-         * transactional loader guarantees the rejected file contributed
-         * nothing. */
-        /* Flags 0: shell-replacement mode reads /etc/compartment only.
+         *   1. /etc/compartment/shell-replacement.conf — the operator has
+         *      said in writing what a shell run through the wrapper may do.
+         *      This is what a limited-root deployment installs, and it is
+         *      also the switch that makes this code path FAIL CLOSED (see
+         *      below): an operator who writes that file is confining an
+         *      account, not sandboxing an agent.
+         *   2. the ai-agent profile file, then the built-in — the original
+         *      behaviour, unchanged, for the agent-interception deployment.
+         *
+         * Flags 0: shell-replacement mode reads /etc/compartment only.
          * $HOME belongs to the very user being confined. */
-        int shell_pr = resolve_and_load_profile(&shell_cfg, "ai-agent", 0, 0);
-        if (shell_pr == PROFILE_ERROR)
-            syslog(LOG_WARNING, "compartment-user[%s]: ai-agent profile was "
-                   "rejected — falling back to the built-in policy",
+        int strict_shell = 0;
+        int shell_pr = resolve_and_load_profile(&shell_cfg,
+                                                "shell-replacement", 0, 0);
+        if (shell_pr == PROFILE_ERROR) {
+            /* Not a fall-back: the file exists and says something we cannot
+             * read.  Running the ai-agent policy instead would confine a
+             * root login with a policy written for an AI agent and report
+             * success. */
+            syslog(LOG_ERR, "compartment-user[%s]: "
+                   "shell-replacement.conf was rejected — refusing to run",
                    invoked_name);
-        if (shell_pr != PROFILE_OK)
-            (void)apply_profile_ai_agent(&shell_cfg);
+            fprintf(stderr, TOOL ": /etc/compartment/shell-replacement.conf "
+                    "was rejected — refusing to run\n");
+            return 126;
+        }
+        if (shell_pr == PROFILE_OK) {
+            strict_shell = 1;
+            shell_cfg.profile = "shell-replacement";
+        } else {
+            shell_pr = resolve_and_load_profile(&shell_cfg, "ai-agent", 0, 0);
+            if (shell_pr == PROFILE_ERROR)
+                syslog(LOG_WARNING, "compartment-user[%s]: ai-agent profile "
+                       "was rejected — falling back to the built-in policy",
+                       invoked_name);
+            if (shell_pr != PROFILE_OK)
+                (void)apply_profile_ai_agent(&shell_cfg);
+        }
 
+        /* Fail-closed vs never-lock-the-user-out.
+         *
+         * The agent deployment's contract is that a failed mechanism
+         * degrades to syslog and the login proceeds, because an
+         * unsandboxed agent beats a user locked out of /bin/bash.  For an
+         * account whose whole reason to exist is that it is confined, an
+         * unconfined uid-0 login IS the failure, so shell-replacement.conf
+         * inverts it.  Recovery is a separate real-admin account whose
+         * shell is the stashed binary, plus the console. */
         int shell_degraded = 0;
 
         /* Same preflight as the normal path, but advisory: a degraded
@@ -1020,6 +1065,24 @@ int main(int argc, char *argv[])
                        invoked_name, pf, pf > 1 ? "s" : "");
                 shell_degraded += pf;
             }
+        }
+
+        /* Masks and capability drops are fatal in both modes: they are new
+         * policy, nothing depends on them degrading, and a mask that did
+         * not go on is a hole the profile says is shut. */
+        if (apply_masks(&shell_cfg) != 0) {
+            syslog(LOG_ERR, "compartment-user[%s]: a required mask could not "
+                   "be applied — refusing to run", invoked_name);
+            fprintf(stderr, TOOL ": refusing to run — a mask the profile "
+                    "requires could not be applied\n");
+            return 126;
+        }
+        if (apply_cap_drops(&shell_cfg) != 0) {
+            syslog(LOG_ERR, "compartment-user[%s]: the capability policy "
+                   "could not be applied — refusing to run", invoked_name);
+            fprintf(stderr, TOOL ": refusing to run — the capability policy "
+                    "could not be applied\n");
+            return 126;
         }
 
         if (shell_cfg.use_no_new_privs) {
@@ -1054,6 +1117,13 @@ int main(int argc, char *argv[])
                    invoked_name, shell_degraded,
                    shell_degraded > 1 ? "s" : "",
                    getuid(), getpid(), getppid());
+            if (strict_shell) {
+                fprintf(stderr, TOOL ": refusing to run — %d enforcement "
+                        "mechanism%s failed and shell-replacement.conf is "
+                        "in force\n", shell_degraded,
+                        shell_degraded > 1 ? "s" : "");
+                return 126;
+            }
         }
 
         /* Same ambient-cap clear, PR_SET_DUMPABLE(0) and fd cleanup the
