@@ -11,9 +11,15 @@
 # the exe inode — that is precisely the gap the strict-launch marker
 # closes.
 #
-# Skips cleanly when spike fixtures aren't built (the in-tree
-# strict-launch test owns the fixture build path; this bypass witness
-# only verifies the LSM-layer DENY when the fixtures exist).
+# Fixtures: built here from the vendored sources under
+# tests/strict-launch/fixtures/ (the same two the in-tree strict-launch
+# suite builds). Until 2026-09 this script looked for prebuilt binaries
+# under experimental/strict-launch-marker/build/ — a directory that does
+# not exist in this repository — and told the reader to run
+# `make check-strict-launch` to populate it. That target builds its
+# fixtures into a `mktemp -d` and deletes them on exit, so the path was
+# never populated by anything and BX-11 SKIPped on every host, in every
+# `make check`, in every `make check-release`, since it landed.
 
 set -u
 BYPASS_NAME="BX-11-ld-preload-strict"
@@ -21,18 +27,26 @@ BYPASS_NAME="BX-11-ld-preload-strict"
 
 bypass_check_env
 
-SPIKE_DIR="$(dirname "$0")/../../../experimental/strict-launch-marker"
-LAUNCHER="$SPIKE_DIR/build/slm-launcher"
-ACTOR="$SPIKE_DIR/build/slm-actor"
+TMP=$(mktemp -d /tmp/bypass.XXXXXX)
 
-if [ ! -x "$LAUNCHER" ] || [ ! -x "$ACTOR" ]; then
-    bypass_skip "spike fixtures missing ($LAUNCHER / $ACTOR); run \`make check-strict-launch\` to build them"
+FIX_DIR="$REPO/tests/strict-launch/fixtures"
+WRAPPER_SRC="$REPO/tools/compartment-actor-wrapper.c"
+[ -r "$FIX_DIR/slm-actor.c" ] || bypass_skip "fixture source missing: $FIX_DIR/slm-actor.c"
+[ -r "$WRAPPER_SRC" ]         || bypass_skip "wrapper source missing: $WRAPPER_SRC"
+command -v gcc >/dev/null 2>&1 || bypass_skip "no gcc to build the strict-launch fixtures"
+
+ACTOR_ABS="$TMP/slm-actor"
+LAUNCHER_ABS="$TMP/slm-launcher"
+# Static, exactly as tests/strict-launch/run.sh builds them:
+# strict_validate_launchers refuses a dynamically linked launcher.
+if ! gcc -O2 -Wall -static "$FIX_DIR/slm-actor.c" -o "$ACTOR_ABS" 2>"$TMP/build.log" ||
+   ! gcc -O2 -Wall -static -DWRAPPER_GENERATED \
+        -DTARGET_PATH="\"$ACTOR_ABS\"" -DACTOR_NAME='"slm-actor"' \
+        "$WRAPPER_SRC" -o "$LAUNCHER_ABS" 2>>"$TMP/build.log"; then
+    cat "$TMP/build.log" >&2
+    bypass_skip "strict-launch fixture build failed (see build log above)"
 fi
 
-LAUNCHER_ABS=$(readlink -f "$LAUNCHER")
-ACTOR_ABS=$(readlink -f "$ACTOR")
-
-TMP=$(mktemp -d /tmp/bypass.XXXXXX)
 TARGET="$TMP/sealed.db"
 : >"$TARGET"
 

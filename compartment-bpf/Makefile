@@ -276,8 +276,10 @@ check-howto-examples: compartment-bpf
 # SL-1..SL-10 against the production daemon (not the spike runner) and
 # verifies the new BPF percpu counters increment as expected. Requires
 # root + BPF LSM; the script SKIPs (rc=77) cleanly on developer hosts
-# without a real kernel. Reuses the spike's fixtures under
-# experimental/strict-launch-marker/build/; builds them if missing.
+# without a real kernel. The fixtures are vendored under
+# tests/strict-launch/fixtures/ and built into a temp dir by run.sh; there
+# is no experimental/ directory in this repository (the stale reference to
+# one is what left BX-11 permanently skipped).
 #
 # HIGH-10 (Review-1 fix): trap rc=77 as SKIP so dev hosts without root
 # / BPF LSM / kernel toolchain do not break `make check`. Mirrors
