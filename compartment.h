@@ -944,12 +944,6 @@ static inline int cfg_add_str(const char **arr, int *count, int limit,
     return 0;
 }
 
-/* ── Boolean value parsing (case-insensitive, fail-closed) ──────── */
-
-/* Append a mask path.  A trailing '?' marks the mask optional, which
- * changes exactly one thing: whether a missing CAP_SYS_ADMIN is a warning
- * or a refusal.  A mount that fails for any other reason is fatal either
- * way — a mask that did not go on is a hole the policy says is closed. */
 static inline int cfg_add_mask(Config *c, const char *where,
                                const char *path, int dup)
 {
@@ -973,6 +967,8 @@ static inline int cfg_add_mask(Config *c, const char *where,
     c->mask_count++;
     return 0;
 }
+
+/* ── Boolean value parsing (case-insensitive, fail-closed) ──────── */
 
 static inline int parse_bool(const char *val, int *out)
 {
