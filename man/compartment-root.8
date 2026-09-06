@@ -81,6 +81,21 @@ forms are accepted.
 .BI \-c ", " \-\-rootdir " DIR"
 Root filesystem directory for pivot_root. Required.
 Must be absolute and contain no \fB..\fR components.
+.IP
+Ownership is checked before
+.BR clone (2).
+Under the default identity uid map the directory must be owned by
+.BR root ;
+under a shifted
+.B uid\-map
+it may instead be owned by the host uid the container's root maps to.
+It must never be group- or world-writable: whoever can write the container
+root chooses which binaries exist inside it, and the
+.B nosuid,nodev
+remount only takes the sharpest edge off that.
+(A root-owned directory passes the check under a shifted map but cannot
+then be used: the container's root is an unprivileged host uid that cannot
+create the pivot point.)
 .TP
 .BI \-u ", " \-\-uid " UID"
 Override UID for privilege drop inside the container.
@@ -106,21 +121,33 @@ explicitly; the name is then used only for diagnostics.
 Join an existing network namespace
 .RI ( /var/run/netns/NAME ).
 Name must not contain \fB/\fR.
-.B Known limitation:
-the container always gets a new user namespace, and
+The join happens in the
+.I parent
+process, before
+.BR clone (2),
+and
+.B CLONE_NEWNET
+is dropped so the container inherits the namespace instead of getting a
+fresh one.
+It has to be done there:
 .BR setns (2)
 requires
 .B CAP_SYS_ADMIN
 in the user namespace that
 .I owns
-the target network namespace. A namespace created on the host (by
-.BR "ip netns add" ,
-say) is owned by the initial user namespace, so joining it fails with
-.BR EPERM .
-Use
-.B \-\-loopback
-in the container's own network namespace instead, or place the container
-inside an already-joined namespace from outside.
+the target network namespace, which for anything
+.B "ip netns add"
+created is the initial one \(em the child, in its own brand-new user
+namespace, has that capability nowhere useful.
+.IP
+One consequence: a network namespace owned by the initial user namespace
+cannot have a fresh
+.B sysfs
+mounted over it from inside the container, so
+.I /sys
+falls back to an empty read-only tmpfs.
+.B \-\-verbose
+reports it.
 .TP
 .BR \-l ", " \-\-loopback
 Bring up loopback interface in the new network namespace.
@@ -140,6 +167,139 @@ directory, a bind of \fI/dev/null\fR over anything else. Repeatable.
 Path must be absolute and contain no \fB..\fR components. A path that
 does not exist on the running kernel is skipped; a path that exists and
 cannot be masked is a fatal error.
+.SS "Mount hardening (profile only)"
+.TP
+.BI rootdir\-flags " LIST"
+Comma-separated extra mount flags for the rootdir bind:
+.BR ro ", " noexec .
+.BR nosuid " and " nodev
+are always applied and cannot be turned off, so this directive can only
+tighten.
+.B ro
+is applied
+.I last,
+after
+.IR /proc ", " /dev ", " /sys
+and the pivot point have been created in the tree, and deliberately not
+recursively \(em those three are separate mounts and stay writable.
+.B noexec
+on the container root prevents executing
+.I anything
+inside it, including the target command; it is only useful when the
+executables live on a separate mount.
+.TP
+.BI mount\-ro " PATH"
+Bind \fIPATH\fR inside the new root onto itself and remount it read-only.
+Repeatable.
+The self-bind is necessary because a path inside the container usually has
+no mount of its own to carry flags, and the remount is necessary because a
+bind mount inherits the flags of its source and
+.BR mount (2)
+ignores
+.B MS_REC
+on a remount.
+.BR mount_setattr (2)
+with
+.B AT_RECURSIVE
+is used where available (Linux 5.12+) so submounts are covered.
+.TP
+.BI mount\-noexec " PATH"
+As above, with
+.BR MS_NOEXEC :
+nothing under \fIPATH\fR can be executed. Repeatable.
+.TP
+.BI mount\-nosuid " PATH"
+As above, with
+.BR MS_NOSUID :
+a setuid binary under \fIPATH\fR does not elevate. Repeatable.
+.TP
+.BI mount\-nodev " PATH"
+As above, with
+.BR MS_NODEV :
+a device node under \fIPATH\fR cannot be opened. Repeatable.
+.SS "Filesystem and network (Landlock)"
+.PP
+Landlock is
+.B off by default
+in compartment-root \(em unlike
+.BR compartment-user (1),
+where it is on. A profile written before Landlock existed here therefore
+keeps its previous behaviour. Turn it on with
+.B landlock on
+in the profile, or with any of the path options below, which imply it.
+A policy that carries path rules without turning Landlock on produces a
+warning;
+.B landlock on
+with no path rules is refused, because an empty ruleset with a non-empty
+handled mask denies every filesystem access.
+.PP
+The ruleset is applied after every mount is in place and before the
+capability drop, while the child still holds
+.B CAP_SYS_ADMIN
+in its own user namespace \(em which is what
+.BR landlock_restrict_self (2)
+needs before
+.B no_new_privs
+is set. It survives the
+.BR setuid (2)
+and is inherited by everything the container execs.
+.TP
+.B \-\-landlock
+Enforce Landlock inside the container.
+.TP
+.BI \-\-ro " PATH"
+Read + execute on \fIPATH\fR and everything beneath it. Repeatable.
+.TP
+.BI \-\-rw " PATH"
+Read + write, no execute (W^X). Repeatable.
+.TP
+.BI \-\-rwx " PATH"
+Read + write + execute. Repeatable.
+.TP
+.BI \-\-exec " PATH"
+Read + execute. On a
+.I file
+this is a per-binary grant: a policy naming individual files with
+.B \-\-exec
+and granting execute on no directory is an allow-list of binaries.
+The dynamic loader must be listed too \(em
+.BR execve (2)
+opens the ELF interpreter with
+.B FMODE_EXEC
+and Landlock checks execute on it \(em while shared libraries need only
+read access, because
+.B ld.so
+opens them read-only and Landlock has no mmap hook.
+The grant keys on the file, so a busybox-style multi-call binary cannot be
+split into applets.
+Repeatable.
+.PP
+A trailing
+.B ?
+on any path makes the rule optional; without it, a rule for a path that
+does not exist is a fatal error.
+Landlock is additive, so a
+.B ro
+rule inside a
+.BR rw / rwx
+rule is refused rather than silently doing nothing.
+.PP
+The profile-only directives
+.BR net\-bind " " PORT ,
+.BR net\-connect " " PORT
+and
+.BR net\-default " " deny
+add TCP port rules (Landlock ABI v4, Linux 6.7+). They cover
+.BR bind (2)
+and
+.BR connect (2)
+on TCP and nothing else: no UDP, no unix sockets, no
+.BR listen / accept
+granularity and no per-address rules. They are an allow-list; there is no
+way to express \(lqeverything except port N\(rq. Below ABI v4
+compartment-root warns and the port policy is
+.B not
+active.
 .SS Capabilities
 .TP
 .BI \-A ", " \-\-cap\-allowed " CAP"
@@ -162,6 +322,18 @@ Deny-list mode: block this syscall. Repeatable.
 .TP
 .B \-\-no\-seccomp
 Disable seccomp entirely.
+.PP
+The
+.B seccomp\-default
+profile directive chooses what a denied syscall does:
+.B errno
+(the default,
+.BR EPERM ),
+.B kill
+.RB ( SECCOMP_RET_KILL_PROCESS )
+or
+.B log
+(permit and record).
 .PP
 With none of the above and no \fBblock\fR/\fBallow\fR lines in the
 profile, a built-in deny-list is installed (43 syscalls on x86\-64):
@@ -262,7 +434,30 @@ cannot be used: the kernel checks
 .B CAP_MKNOD
 against the initial user namespace, so it always fails here. Each bind is
 fatal on failure.
-.IR /dev/pts " is created and " /dev/fd ", " /dev/stdin ", " /dev/stdout
+.PP
+A private
+.B devpts
+instance is mounted on
+.I /dev/pts
+.RB ( newinstance,ptmxmode=0666,mode=0620,gid=5 ,
+retried without
+.B gid=5
+when a shifted gid map leaves the host's tty group unmapped), and that
+instance's own multiplexer is bind-mounted over
+.IR /dev/ptmx ,
+so
+.BR posix_openpt (3)
+works inside the container.
+A 64M
+.B tmpfs
+.RB ( nosuid,nodev,noexec ", mode 1777)"
+is mounted on
+.I /dev/shm
+for
+.BR shm_open (3)
+and
+.BR sem_open (3).
+.IR /dev/fd ", " /dev/stdin ", " /dev/stdout
 and
 .I /dev/stderr
 are symlinked into
@@ -321,18 +516,29 @@ to the command, reaps orphans, and exits with the command's status
 (128+\fIn\fR if it was killed by signal \fIn\fR). The reaper is inside
 every namespace and carries the same dropped capabilities, dropped uid and
 .B no-new-privs
-as the command, but it is deliberately
-.B not
-covered by the seccomp filter \- the command installs that for itself
-after the fork, so an allow-list policy that does not mention
-.BR wait4 / kill / rt_sigaction
-cannot break the reaper. It execs nothing. Without it a command
+as the command. It installs the same seccomp filter as the command, but
+only when the policy provably permits every syscall its loop uses:
+.BR wait4 ", " kill ", " rt_sigaction ", " rt_sigprocmask ", "
+.BR rt_sigreturn ", " exit_group " and " write .
+.RB ( rt_sigreturn
+is on that list because the kernel invokes it to leave a signal handler,
+so its absence kills the process the first time a signal is forwarded.)
+When the policy does not cover them the reaper stays unfiltered and
+.B \-\-verbose
+says so: a reaper that dies on its first
+.BR waitpid (2)
+is a worse failure than one filter fewer on a process that execs nothing.
+It execs nothing. Without it a command
 with no signal handlers would ignore Ctrl\-C, orphans would never be
 reaped, and killing
 .B compartment-root
 would leave the container running.
 .SS Privilege drop sequence
-.IP 1. 4
+.IP 0. 4
+Landlock ruleset applied, when the policy turns it on \- while
+.B CAP_SYS_ADMIN
+is still held in the container's user namespace.
+.IP 1.
 Drop bounding-set capabilities (while still root, needs CAP_SETPCAP).
 .IP 2.
 .B setgid/setuid
@@ -353,7 +559,8 @@ Close all FDs >= 3.
 then fork under the PID 1 reaper.
 .IP 8.
 .B seccomp BPF
-filter applied.
+filter applied \- to the command always, and to the reaper when the
+policy covers what it needs.
 .IP 9.
 .B execvp
 the command.
