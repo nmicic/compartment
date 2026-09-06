@@ -1614,8 +1614,13 @@ static void print_help(const char *prog_name)
     printf("Usage: %s [OPTIONS] -- COMMAND [ARGS...]\n", prog_name);
     printf("\nProfile:\n");
     printf("  -p, --profile <name|file>        Load policy from profile file\n");
-    printf("                                   Search: ~/.config/compartment/<name>.conf\n");
-    printf("                                           /etc/compartment/<name>.conf\n");
+    printf("                                   A name resolves to /etc/compartment/<name>.conf\n");
+    printf("                                   and nowhere else; an argument containing '/'\n");
+    printf("                                   is loaded as a path. $HOME is never searched:\n");
+    printf("                                   the policy of a root tool must not come from a\n");
+    printf("                                   directory the caller controls.\n");
+    printf("                                   The file and its directory must be root-owned\n");
+    printf("                                   and not group- or world-writable.\n");
     printf("\nNamespace:\n");
     printf("  -c, --rootdir <dir>              Root filesystem directory (required)\n");
     printf("  -u, --uid <uid>                  Override UID for privilege drop\n");
