@@ -5,9 +5,12 @@
 # run_all.sh — run all compartment test suites
 #
 # Usage:
-#   ./tests/scripts/run_all.sh              # run all tests
-#   ./tests/scripts/run_all.sh --quick      # skip Claude smoke + sandbox proxy
-#   ./tests/scripts/run_all.sh --verbose    # verbose output from test runners
+#   ./tests/scripts/run_all.sh                # run all tests
+#   ./tests/scripts/run_all.sh --quick        # skip Claude smoke + sandbox proxy
+#   ./tests/scripts/run_all.sh --verbose      # verbose output from test runners
+#   ./tests/scripts/run_all.sh --no-external  # skip suites that need a
+#                                             # third-party CLI or an outbound
+#                                             # proxy (also: COMPARTMENT_SKIP_EXTERNAL=1)
 #
 # Every executable tests/scripts/rootless.d/*.sh is discovered and run as its
 # own suite; see tests/scripts/rootless.d/README.md for the contract.
@@ -23,17 +26,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(harness_repo_dir)"
 QUICK=0
 VERBOSE=""
+SKIP_EXTERNAL="${COMPARTMENT_SKIP_EXTERNAL:-0}"
 
 for arg in "$@"; do
     case "${arg}" in
-        --quick)   QUICK=1 ;;
-        --verbose) VERBOSE="--verbose" ;;
+        --quick)       QUICK=1 ;;
+        --verbose)     VERBOSE="--verbose" ;;
+        --no-external) SKIP_EXTERNAL=1 ;;
     esac
 done
 
 SUITES_RUN=0
 SUITES_FAILED=0
+SUITES_SKIPPED=0
 FAILED_SUITES=""
+SKIPPED_SUITES=""
 
 run_suite() {
     local name="$1" script="$2"
@@ -55,6 +62,16 @@ run_suite() {
         echo "^^^ SUITE FAILED ^^^"
         echo ""
     fi
+}
+
+# Record a suite that was not run at all, with the reason.  A suite that
+# needs something the machine does not have must be visibly skipped, never
+# silently dropped and never a failure.
+skip_suite() {
+    SUITES_SKIPPED=$((SUITES_SKIPPED + 1))
+    SKIPPED_SUITES="${SKIPPED_SUITES}  - $1 ($2)"$'\n'
+    echo ""
+    echo "(skipping suite: $1 — $2)"
 }
 
 # Run every executable *.sh in a discovery directory as its own suite.
@@ -113,11 +130,23 @@ run_discovered "${SCRIPT_DIR}/rootless.d" "rootless.d"
 # ── Extended tests (skip with --quick) ────────────────────────────
 
 if [ "${QUICK}" -eq 0 ]; then
+    # sandbox.sh needs unprivileged user namespaces; the suite itself skips
+    # cleanly without them, and its one proxy case skips without a proxy.
     run_suite "Sandbox.sh proxy/network tests" \
         "${SCRIPT_DIR}/run_sandbox_proxy_matrix.sh" ${VERBOSE}
 
-    run_suite "Claude CLI smoke test" \
-        "${SCRIPT_DIR}/run_claude_smoke.sh" ${VERBOSE}
+    # The Claude smoke suite needs a third-party CLI and an authenticated
+    # session, neither of which exists on a build machine.
+    if [ "${SKIP_EXTERNAL}" = "1" ]; then
+        skip_suite "Claude CLI smoke test" "--no-external / COMPARTMENT_SKIP_EXTERNAL=1"
+    elif ! command -v claude > /dev/null 2>&1; then
+        skip_suite "Claude CLI smoke test" "claude CLI not installed"
+    elif [ ! -d "${HOME}/.claude" ]; then
+        skip_suite "Claude CLI smoke test" "no ${HOME}/.claude — CLI not authenticated"
+    else
+        run_suite "Claude CLI smoke test" \
+            "${SCRIPT_DIR}/run_claude_smoke.sh" ${VERBOSE}
+    fi
 else
     echo ""
     echo "(Skipping sandbox proxy and Claude smoke tests — use without --quick to include)"
@@ -130,8 +159,13 @@ echo "╔═══════════════════════�
 echo "║  FINAL SUMMARY                                              ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
-echo "  Suites run:    ${SUITES_RUN}"
-echo "  Suites failed: ${SUITES_FAILED}"
+echo "  Suites run:     ${SUITES_RUN}"
+echo "  Suites failed:  ${SUITES_FAILED}"
+echo "  Suites skipped: ${SUITES_SKIPPED}"
+if [ -n "${SKIPPED_SUITES}" ]; then
+    echo ""
+    printf '%s' "${SKIPPED_SUITES}"
+fi
 if [ -n "${FAILED_SUITES}" ]; then
     echo ""
     printf '%s' "${FAILED_SUITES}"
