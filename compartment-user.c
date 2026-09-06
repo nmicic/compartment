@@ -35,6 +35,10 @@
 
 #include <sys/statfs.h>
 #include <sys/resource.h>
+#include <sys/mount.h>
+#include <sched.h>
+#include <linux/capability.h>
+#include <linux/securebits.h>
 
 /* Shared types, config, syscall table, profile loader, Landlock ruleset
  * builder, audit, env sanitize, seccomp BPF builder — all static inline. */
@@ -232,6 +236,17 @@ static void print_usage(void)
         "  --net-deny            Handle TCP bind and connect; deny every port\n"
         "                        not named above.  Without any of these three\n"
         "                        the network is not restricted at all.\n"
+        "\n"
+        "Capabilities and namespace (root callers):\n"
+        "  --cap-drop CAP        Drop CAP from the bounding set before exec\n"
+        "                        (repeatable; needs CAP_SETPCAP).  Also clears\n"
+        "                        the ambient and inheritable sets and locks the\n"
+        "                        securebits.  SECBIT_NOROOT is NOT set: a root\n"
+        "                        caller keeps every capability not named here.\n"
+        "  --mask PATH           Cover PATH inside a private mount namespace\n"
+        "                        (repeatable; needs CAP_SYS_ADMIN at setup).\n"
+        "                        Append '?' to downgrade a missing\n"
+        "                        CAP_SYS_ADMIN from a refusal to a warning.\n"
         "\n"
         "Syscalls (seccomp BPF):\n"
         "  --block SYSCALL       Block a syscall (by name)\n"
@@ -621,12 +636,236 @@ static void dump_profile(const Config *cfg)
             printf("env-deny %s\n", cfg->env_deny[i]);
     }
 
+    if (cfg->cap_drop_count) {
+        printf("\n# Capability bounding-set drops\n");
+        for (int i = 0; i < cfg->cap_drop_count; i++)
+            printf("cap-drop %s\n", cfg->cap_drop_names[i]);
+    }
+    if (cfg->mask_count) {
+        printf("\n# Mount masks (private mount namespace)\n");
+        for (int i = 0; i < cfg->mask_count; i++)
+            printf("mask %s%s\n", cfg->masks[i],
+                   cfg->mask_optional[i] ? "?" : "");
+    }
+
     printf("\n# Features (a profile may only turn these on)\n");
     printf("landlock on\nseccomp on\nno-new-privs on\nenv-sanitize on\n");
     if (cfg->audit)
         printf("audit on\n");
     if (cfg->audit_log_dir)
         printf("audit-log %s\n", cfg->audit_log_dir);
+}
+
+/* ── Mount masks ──────────────────────────────────────────────────
+ *
+ * Landlock has no access right that covers connect(2) to a unix socket
+ * named by a path: a domain that denies open() on /run/systemd/private
+ * still lets a process talk to systemd through it.  The only way to take
+ * that away from a confined process without a BPF socket hook is to make
+ * the path not be there, which means a private mount namespace and a
+ * cover mount.
+ *
+ * Two properties are load-bearing and easy to get wrong:
+ *
+ *  - MS_PRIVATE|MS_REC on / is mandatory.  On a distribution where / is
+ *    `shared` — which is the systemd default — a cover mount made in a
+ *    fresh namespace propagates straight back to the host and hides the
+ *    socket from every process on the machine, permanently.  unshare(2)
+ *    does not do this for you; util-linux's unshare(1) does, which is why
+ *    the shell one-liner appears to work.
+ *  - It fails closed.  A mask that did not go on is a hole the policy
+ *    claims is shut, so anything but "the path is not there" is fatal.
+ *    The single exception is the one the operator asked for in writing:
+ *    `mask /path?` degrades to a warning when the caller has no
+ *    CAP_SYS_ADMIN and therefore cannot make a namespace at all.
+ */
+static int mask_one(const char *path, int verbose)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT) {
+            if (verbose)
+                fprintf(stderr, TOOL ": mask %s: absent, nothing to hide\n",
+                        path);
+            return 0;
+        }
+        fprintf(stderr, TOOL ": mask %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    int is_dir = S_ISDIR(st.st_mode);
+    int r = is_dir
+        ? mount("tmpfs", path, "tmpfs",
+                MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=0")
+        : mount("/dev/null", path, NULL, MS_BIND, NULL);
+    if (r != 0) {
+        fprintf(stderr, TOOL ": mask %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (verbose)
+        fprintf(stderr, TOOL ": mask %s (%s)\n", path,
+                is_dir ? "empty tmpfs" : "/dev/null");
+    return 0;
+}
+
+static int apply_masks(Config *cfg)
+{
+    if (cfg->mask_count == 0)
+        return 0;
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        int all_optional = 1;
+        for (int i = 0; i < cfg->mask_count; i++)
+            if (!cfg->mask_optional[i]) all_optional = 0;
+        if (errno == EPERM && all_optional) {
+            fprintf(stderr, TOOL ": WARNING: no CAP_SYS_ADMIN — %d optional "
+                    "mask%s skipped; the paths they name stay reachable\n",
+                    cfg->mask_count, cfg->mask_count == 1 ? "" : "s");
+            return 0;
+        }
+        fprintf(stderr, TOOL ": mask: unshare(CLONE_NEWNS): %s\n",
+                strerror(errno));
+        if (errno == EPERM)
+            fprintf(stderr, "  'mask' needs CAP_SYS_ADMIN at setup time.  "
+                    "Append '?' to a mask path to make it optional when the "
+                    "caller is unprivileged.\n");
+        return -1;
+    }
+
+    /* Without this the cover mounts propagate to every peer of the shared
+     * mount they land on — i.e. to the host. */
+    if (mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL) != 0) {
+        fprintf(stderr, TOOL ": mask: making / private: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    for (int i = 0; i < cfg->mask_count; i++)
+        if (mask_one(cfg->masks[i], cfg->verbose) != 0)
+            return -1;
+
+    if (cfg->verbose)
+        fprintf(stderr, TOOL ": %d mask%s applied in a private mount "
+                "namespace\n", cfg->mask_count,
+                cfg->mask_count == 1 ? "" : "s");
+    return 0;
+}
+
+/* ── Capability bounding-set drops ────────────────────────────────
+ *
+ * For a uid-0 process exec'ing a file that carries no file capabilities
+ * the kernel recomputes the permitted set as (full set AND the bounding
+ * set), so dropping a capability from the bounding set here removes it
+ * from the effective set of everything exec'd afterwards — which is the
+ * whole point when the confined subject is root.  PR_CAPBSET_DROP is
+ * one-way: there is no CAPBSET_ADD, and capset(2) cannot raise a
+ * capability that is no longer in the bounding set.
+ *
+ * SECBIT_NOROOT is deliberately NOT set.  With it, the same exec
+ * computes permitted = (inheritable AND file-inheritable) = 0 and the
+ * shell gets no capabilities whatsoever — a different product.  A
+ * limited root has to keep CAP_DAC_OVERRIDE, CAP_KILL, CAP_NET_ADMIN,
+ * CAP_SYSLOG and the rest or it cannot read a log or run `ip`.  What is
+ * set is the locking half: the ambient set cannot be re-raised and the
+ * securebits themselves cannot be relaxed later in the session.
+ */
+static int apply_cap_drops(Config *cfg)
+{
+    if (cfg->cap_drop_count == 0)
+        return 0;
+
+    int privileged = (geteuid() == 0);
+
+    for (int i = 0; i < cfg->cap_drop_count; i++) {
+        int cap = resolve_cap(cfg->cap_drop_names[i]);
+        if (cap < 0) {
+            fprintf(stderr, TOOL ": cap-drop: unknown capability '%s'\n",
+                    cfg->cap_drop_names[i]);
+            return -1;
+        }
+        if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) != 0) {
+            /* EINVAL means this kernel does not have that capability
+             * number at all, which is not a policy failure. */
+            if (errno == EINVAL) {
+                if (cfg->verbose)
+                    fprintf(stderr, TOOL ": cap-drop %s: not present on this "
+                            "kernel, skipped\n", cfg->cap_drop_names[i]);
+                continue;
+            }
+            if (errno == EPERM && !privileged) {
+                fprintf(stderr, TOOL ": WARNING: cap-drop needs CAP_SETPCAP; "
+                        "this process is not root and holds no capabilities "
+                        "to drop\n");
+                return 0;
+            }
+            fprintf(stderr, TOOL ": prctl(PR_CAPBSET_DROP, %s): %s\n",
+                    cfg->cap_drop_names[i], strerror(errno));
+            return -1;
+        }
+    }
+
+    /* Ambient caps survive execve on their own and would hand a dropped
+     * capability straight back; inheritable is the set an ambient raise
+     * is computed from. */
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0 &&
+        errno != EINVAL) {
+        fprintf(stderr, TOOL ": PR_CAP_AMBIENT_CLEAR_ALL: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    {
+        struct __user_cap_header_struct hdr = {
+            .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0
+        };
+        struct __user_cap_data_struct data[2] = {{0, 0, 0}, {0, 0, 0}};
+        if (syscall(SYS_capget, &hdr, data) != 0) {
+            fprintf(stderr, TOOL ": capget: %s\n", strerror(errno));
+            return -1;
+        }
+        data[0].inheritable = 0;
+        data[1].inheritable = 0;
+        if (syscall(SYS_capset, &hdr, data) != 0) {
+            fprintf(stderr, TOOL ": capset (clear inheritable): %s\n",
+                    strerror(errno));
+            return -1;
+        }
+    }
+
+    int sb = prctl(PR_GET_SECUREBITS, 0, 0, 0, 0);
+    if (sb < 0) {
+        fprintf(stderr, TOOL ": PR_GET_SECUREBITS: %s\n", strerror(errno));
+        return -1;
+    }
+    /* NOROOT itself is left alone; the _LOCKED bits freeze whatever it is
+     * now, so nothing later in the session can turn NOROOT off (it is off)
+     * or turn the setuid fixup back on. */
+    int want = sb | SECBIT_NO_CAP_AMBIENT_RAISE |
+                    SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED |
+                    SECBIT_NOROOT_LOCKED |
+                    SECBIT_NO_SETUID_FIXUP_LOCKED;
+    if (prctl(PR_SET_SECUREBITS, want, 0, 0, 0) != 0) {
+        fprintf(stderr, TOOL ": PR_SET_SECUREBITS(0x%x): %s\n",
+                (unsigned)want, strerror(errno));
+        return -1;
+    }
+
+    if (cfg->verbose) {
+        fprintf(stderr, TOOL ": %d capabilit%s dropped from the bounding "
+                "set, securebits 0x%x\n", cfg->cap_drop_count,
+                cfg->cap_drop_count == 1 ? "y" : "ies",
+                (unsigned)prctl(PR_GET_SECUREBITS, 0, 0, 0, 0));
+        FILE *st = fopen("/proc/self/status", "re");
+        if (st) {
+            char line[256];
+            while (fgets(line, sizeof(line), st))
+                if (strncmp(line, "CapBnd:", 7) == 0) {
+                    fprintf(stderr, TOOL ": %s", line);
+                    break;
+                }
+            fclose(st);
+        }
+    }
+    return 0;
 }
 
 /* ── Hardening applied on every path, just before exec ───────────── */
@@ -859,6 +1098,8 @@ int main(int argc, char *argv[])
         {"net-bind",        required_argument, NULL, 4},
         {"net-connect",     required_argument, NULL, 5},
         {"net-deny",        no_argument,       NULL, 6},
+        {"cap-drop",        required_argument, NULL, 7},
+        {"mask",            required_argument, NULL, 8},
         {"user-profiles",   no_argument,       NULL, 2},
         {"dump-profile",    required_argument, NULL, 3},
         {"version",         no_argument,       NULL, 1},
@@ -946,6 +1187,20 @@ int main(int argc, char *argv[])
                 return 1;
             break;
         case  6 : cfg.net_default_deny = 1; break;
+        case  7 : /* --cap-drop */
+            if (resolve_cap(optarg) < 0) {
+                fprintf(stderr, TOOL ": unknown capability: %s\n", optarg);
+                return 1;
+            }
+            if (cfg_add_str(cfg.cap_drop_names, &cfg.cap_drop_count,
+                            MAX_ENV_VARS, CLI_WHERE, "cap-drop",
+                            optarg, 1) != 0)
+                return 1;
+            break;
+        case  8 : /* --mask */
+            if (cfg_add_mask(&cfg, CLI_WHERE, optarg, 1) != 0)
+                return 1;
+            break;
         case  2 : profile_flags |= PROFILE_SEARCH_USER; break;
         case  3 : cfg.profile = optarg; dump = 1; break;
         case  1 : printf("compartment-user %s\n", COMPARTMENT_VERSION); return 0;
@@ -1075,6 +1330,25 @@ int main(int argc, char *argv[])
                     fprintf(stderr, "    net-default deny\n");
             }
         }
+        if (cfg.cap_drop_count) {
+            fprintf(stderr, "  cap-drop: %d capabilit%s\n",
+                    cfg.cap_drop_count,
+                    cfg.cap_drop_count == 1 ? "y" : "ies");
+            for (int i = 0; i < cfg.cap_drop_count; i++)
+                fprintf(stderr, "    cap-drop %s\n", cfg.cap_drop_names[i]);
+        }
+        if (cfg.mask_count) {
+            fprintf(stderr, "  mask: %d path%s (private mount namespace)\n",
+                    cfg.mask_count, cfg.mask_count == 1 ? "" : "s");
+            for (int i = 0; i < cfg.mask_count; i++) {
+                struct stat mst;
+                const char *note = "";
+                if (lstat(cfg.masks[i], &mst) != 0)
+                    note = "   (absent — nothing to hide)";
+                fprintf(stderr, "    mask %s%s%s\n", cfg.masks[i],
+                        cfg.mask_optional[i] ? "?" : "", note);
+            }
+        }
         fprintf(stderr, "  seccomp-default: %s\n", seccomp_action_name(&cfg));
         if (cfg.seccomp_allow_mode) {
             fprintf(stderr, "  seccomp: %s ALLOW-LIST (%d allowed, rest denied)\n",
@@ -1165,6 +1439,21 @@ int main(int argc, char *argv[])
     /* ── 2. Environment sanitize ───────────────────────────────── */
     if (cfg.use_env_sanitize)
         sanitize_env(&cfg);
+
+    /* ── 2b. Mount masks (needs CAP_SYS_ADMIN; before the cap drops) ── */
+    if (apply_masks(&cfg) != 0) {
+        fprintf(stderr, TOOL ": refusing to run — a mask the profile "
+                "requires could not be applied\n");
+        return 1;
+    }
+
+    /* ── 2c. Capability bounding-set drops (after the masks, which need
+     *        CAP_SYS_ADMIN, and before anything that could exec) ────── */
+    if (apply_cap_drops(&cfg) != 0) {
+        fprintf(stderr, TOOL ": refusing to run — the capability policy "
+                "could not be applied\n");
+        return 1;
+    }
 
     /* ── 3. Landlock (filesystem) ──────────────────────────────── */
     if (cfg.use_landlock) {

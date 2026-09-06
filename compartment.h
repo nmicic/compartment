@@ -176,6 +176,24 @@ typedef struct {
     int         mount_flags_count;
     char       *uid_map;        /* "<inside> <outside> <count>\n", NULL = identity */
     char       *gid_map;        /* idem for gids */
+
+    /* User-specific fields (compartment-user only, ignored by
+     * compartment-root, which has cap-allow and mount-mask instead) */
+
+    /* cap-drop: capabilities to remove from the bounding set before exec.
+     * A deny-list rather than compartment-root's cap-allow allow-list,
+     * because the subject here is a root account that has to keep most of
+     * its capabilities to do any administration at all. */
+    const char *cap_drop_names[MAX_ENV_VARS];
+    int         cap_drop_count;
+
+    /* mask: paths to cover inside a private mount namespace.  Needed for
+     * the surface Landlock cannot express — connect(2) to a pathname unix
+     * socket is not a filesystem access right, so /run/systemd/private
+     * cannot be taken away with a path rule. */
+    const char *masks[MAX_PATHS];
+    unsigned char mask_optional[MAX_PATHS];
+    int         mask_count;
 } Config;
 
 /* ── Syscall name → number table ────────────────────────────────────
@@ -928,6 +946,34 @@ static inline int cfg_add_str(const char **arr, int *count, int limit,
 
 /* ── Boolean value parsing (case-insensitive, fail-closed) ──────── */
 
+/* Append a mask path.  A trailing '?' marks the mask optional, which
+ * changes exactly one thing: whether a missing CAP_SYS_ADMIN is a warning
+ * or a refusal.  A mount that fails for any other reason is fatal either
+ * way — a mask that did not go on is a hole the policy says is closed. */
+static inline int cfg_add_mask(Config *c, const char *where,
+                               const char *path, int dup)
+{
+    if (c->mask_count >= MAX_PATHS)
+        return policy_full(where, "mask", path, MAX_PATHS);
+    if (path[0] != '/') {
+        fprintf(stderr, "compartment: %s: mask path must be absolute: %s\n",
+                where, path);
+        return -1;
+    }
+    size_t len = strlen(path);
+    int optional = (len > 1 && path[len - 1] == '?');
+    if (optional) {
+        char *trimmed = xstrdup(path);
+        trimmed[len - 1] = '\0';
+        c->masks[c->mask_count] = trimmed;
+    } else {
+        c->masks[c->mask_count] = dup ? xstrdup(path) : path;
+    }
+    c->mask_optional[c->mask_count] = (unsigned char)optional;
+    c->mask_count++;
+    return 0;
+}
+
 static inline int parse_bool(const char *val, int *out)
 {
     if (strcasecmp(val, "on") == 0 || strcasecmp(val, "yes") == 0 ||
@@ -1091,8 +1137,22 @@ static inline int directive_is_root_only(const char *d)
 static inline int directive_is_user_only(const char *d)
 {
     /* compartment-root has no working directory of its own: it pivots
-     * into the container root. */
-    return strcmp(d, "workdir") == 0;
+     * into the container root.
+     *
+     * `cap-drop` and `mask` have compartment-root equivalents that are not
+     * the same thing, so they stay apart rather than being aliased:
+     * compartment-root's `cap-allow` is an allow-list over a set it builds
+     * from scratch, and its `mount-mask` names paths *inside the new root*
+     * it is about to pivot into.  `mask` here names paths in the caller's
+     * own namespace.  The "belongs to the other tool" warning names the
+     * equivalent so a shared profile says which one it meant. */
+    static const char *const user_only[] = {
+        "workdir", "cap-drop", "cap-bounding", "mask", NULL
+    };
+    for (int i = 0; user_only[i]; i++)
+        if (strcmp(d, user_only[i]) == 0)
+            return 1;
+    return 0;
 }
 
 /* ── Profile file trust ─────────────────────────────────────────── */
@@ -1526,6 +1586,21 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 fclose(fp);
                 return PROFILE_ERROR;
             }
+        } else if (strcmp(directive, "cap-drop") == 0 ||
+                   strcmp(directive, "cap-bounding") == 0) {
+            if (resolve_cap(val) < 0) {
+                fprintf(stderr, "compartment: %s:%d: unknown capability "
+                        "'%s'\n", path, lineno, val);
+                fclose(fp); return PROFILE_ERROR;
+            }
+            if (cfg_add_str(cfg->cap_drop_names, &cfg->cap_drop_count,
+                            MAX_ENV_VARS, where, directive, val, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
+            }
+        } else if (strcmp(directive, "mask") == 0) {
+            if (cfg_add_mask(cfg, where, val, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
+            }
         /* ── Root-specific directives (compartment-root only) ─────── */
         } else if (strcmp(directive, "rootdir") == 0) {
             /* No free(): on a failed transaction the caller still owns
@@ -1798,6 +1873,16 @@ static inline void config_free_oneshot(Config *cfg)
         cfg->cap_allowed_names[i] = NULL;
     }
     cfg->cap_allowed_count = 0;
+    for (int i = 0; i < cfg->cap_drop_count; i++) {
+        free((void *)cfg->cap_drop_names[i]);
+        cfg->cap_drop_names[i] = NULL;
+    }
+    cfg->cap_drop_count = 0;
+    for (int i = 0; i < cfg->mask_count; i++) {
+        free((void *)cfg->masks[i]);
+        cfg->masks[i] = NULL;
+    }
+    cfg->mask_count = 0;
     for (int i = 0; i < cfg->mount_mask_count; i++) {
         free((void *)cfg->mount_masks[i]);
         cfg->mount_masks[i] = NULL;
