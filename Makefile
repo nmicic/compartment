@@ -56,12 +56,24 @@ ifeq ($(call cc-has,$(LD_SEPARATE_CODE)),yes)
 HARDEN_LDFLAGS += $(LD_SEPARATE_CODE)
 endif
 
-# _FORTIFY_SOURCE=3 needs glibc >= 2.35 and gcc >= 12; fall back to 2, and
-# to nothing at all if the libc has no fortification.  -U first: most
+# _FORTIFY_SOURCE=3 needs glibc >= 2.35 AND a compiler with
+# __builtin_dynamic_object_size (gcc >= 12, clang >= 9); fall back to 2,
+# and to nothing at all if the libc has no fortification.  -U first: most
 # distributions predefine it, and redefining is a warning.
-ifeq ($(call cc-has,-O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3),yes)
+#
+# cc-has is the wrong probe for this one. On Ubuntu 22.04 (gcc 11.4,
+# glibc 2.35) `-D_FORTIFY_SOURCE=3` compiles and links with no diagnostic
+# at all — measured, not assumed — while glibc's features.h silently
+# clamps __USE_FORTIFY_LEVEL to 2. The probe said "yes" and the build
+# claimed a level it did not have, so the documented fallback was never
+# taken on the one toolchain it exists for. Ask for the level that is
+# actually in effect instead.
+cc-fortify = $(shell printf '#include <string.h>\n#if !defined __USE_FORTIFY_LEVEL || __USE_FORTIFY_LEVEL != $(1)\n#error level $(1) is not what the libc selected\n#endif\nint main(void){return 0;}\n' | \
+	 $(CC) -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=$(1) -Werror -x c - -o /dev/null > /dev/null 2>&1 && echo yes)
+
+ifeq ($(call cc-fortify,3),yes)
 HARDEN_CFLAGS += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3
-else ifeq ($(call cc-has,-O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2),yes)
+else ifeq ($(call cc-fortify,2),yes)
 HARDEN_CFLAGS += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 endif
 
