@@ -83,6 +83,6 @@ counters catalogued.
 
 ## Run
 
-`make smoke-counters` (3 inode counters), `make check-strict-launch` (9 exec-domain
+`make smoke-counters` (3 inode counters), `make check-strict-launch` (10 exec-domain
 counters), `make smoke-telemetry` (parity/overhead) — all included in `make check`.
 Run on the VM (require root + bpf in the active LSM list).

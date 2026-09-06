@@ -53,8 +53,8 @@ reproduce.
 ## Root cause of the original stall
 
 Stale **stacked LSM programs**. Pinned LSM links survive `pkill` — only `--unpin`
-sweeps them (one clean daemon legitimately attaches 21 links; baseline→22 on pin,
-→baseline on teardown). During the earlier ad-hoc session, repeated
+sweeps them (one clean daemon legitimately attaches 28 links as of v0.8 — it was
+21 when this run was captured; the count returns to baseline on teardown). During the earlier ad-hoc session, repeated
 pin / pkill / re-pin without `--unpin` left multiple enforcement sets stacked on
 every hook, so each syscall ran through many BPF programs — amplified on a 2-CPU
 box also running the daemon poll loop. Once teardown is correct (`--unpin`), the

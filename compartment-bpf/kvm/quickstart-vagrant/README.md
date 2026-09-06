@@ -152,9 +152,8 @@ Two timings matter for V-5 evidence:
   `vagrant up` to the `make smoke` exit-0 inside the second
   provisioning pass.
 
-Reference transcripts live under
-`tests/results/v5-on-ramp-20260512T192129Z-fabe97a/path-c/`. Run
-`ls tests/results/` if the tree contains a newer on-ramp capture.
+Transcripts are written to `tests/results/`, which is a per-run artefact
+directory and is never committed.
 
 ## Failure remediation
 

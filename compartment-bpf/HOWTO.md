@@ -174,7 +174,7 @@ seal /var/lib/aide/aide.db no-write actor=aide strict-launch
 - the launcher path and the target path are both sealed `full` in
   the same profile;
 - env policy is the wrapper's responsibility, not the loader's
-  see §4.1 below). The 16
+  see §4.1 below). The 68
   dangerous dynamic-loader/interpreter env names are rejected by the
   wrapper at build time via the shared
   `tools/compartment-dangerous-env.h` table.
@@ -595,7 +595,7 @@ in profiles. Env policy is the wrapper's responsibility:
    one or more times to add specific variable names to the wrapper's
    allowlist; only those names survive the clearenv-then-allowlist
    filter at runtime.
-3. The 16 dangerous dynamic-loader / interpreter names
+3. The 68 dangerous dynamic-loader / interpreter names
    (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, GLIBC_TUNABLES, GCONV_PATH,
    LOCPATH, NLSPATH, BASH_ENV, ENV, PYTHONPATH, PYTHONSTARTUP,
    PERL5LIB, PERL5OPT, RUBYLIB, RUBYOPT, NODE_OPTIONS) are
@@ -637,16 +637,18 @@ sudo ./compartment-bpf observe --actor aide=/usr/sbin/aide \
 ```
 
 - `--actor NAME=PATH` registers an actor by inode. Repeatable for multi-binary
-  actors. At least one actor (or `--pid`) is required.
-- `--pid PID` seeds from an already-running process instead of spawning one.
+  actors. At least one actor is required.
+- `--pid PID` is **reserved and not implemented** — passing it exits with
+  status 2. Seed from a spawned command instead.
 - `-- COMMAND [ARGS...]` spawns the command and stops observation when it exits
   (or after `--duration` seconds, whichever comes first).
 - `--duration N` sets a hard timeout in seconds; omit to run until SIGINT.
 - `--format profile|compact|jsonl|audit` selects the output format
   (default: `profile`).
 - `--verbose` adds parent chain, dev/ino, and cgroup to each record.
-- `--include-stat` records stat/metadata activity. Off by default because it
-  can saturate maps on busy hosts.
+- `--include-stat` is **reserved and not implemented** — passing it exits
+  with status 2. It is intended to record stat/metadata activity, which is
+  off by default because it can saturate maps on busy hosts.
 - `--no-resolve-paths` emits raw dev/ino only; skips path resolution.
 - `--no-dir-dest` forces per-file fallback rules (testing/compat path).
 - `-o PATH` writes output to PATH (`-` for explicit stdout; default: stdout).
@@ -859,8 +861,8 @@ returned value is in the supported range (`0x0004` ≤ abi ≤ the
 compile-time `COMPARTMENT_ABI_VERSION`), it is used verbatim.
 
 `seal_value` is **96 bytes** in v0.5 and remains 96 bytes through
-v0.7 (ABI v0.6 and v0.7 introduce new behaviour and new audit
-actions without changing the on-wire struct layout; the ABI header's
+v0.8 (ABI v0.6, v0.7 and v0.8 introduce new behaviour, new audit
+actions and new hooks without changing the on-wire struct layout; the ABI header's
 `_Static_assert(sizeof(struct seal_value) == 96, ...)` is the
 authoritative size). The earlier
 `seal_value` size probe (96-byte v0.4/v0.5 vs newer) is no longer
@@ -919,7 +921,7 @@ attach→pin→exit sequence.
 ### 9.2 Running
 
 ```bash
-# Quick smoke (64 cycles, ~5 min):
+# Quick smoke (64 cycles, a few minutes):
 make check-stability-quick
 
 # Full run (1024 cycles, ~45-60 min):

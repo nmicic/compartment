@@ -63,7 +63,7 @@ compartment-user searches for them in order:
 2. **System config** — `/etc/compartment/<name>.conf`
 3. **User config** — `~/.config/compartment/<name>.conf`, **only** when
    `--user-profiles` is given, and never in shell-replacement mode
-4. **Built-in** — `ai-agent` and `strict` (compiled in)
+4. **Built-in** — `ai-agent`, `strict` and `none` (compiled in)
 
 If a file is found, it is loaded. If it exists but does not parse, nothing
 runs and the exit status is non-zero — the built-in is used only when no
@@ -207,7 +207,7 @@ for compartment-user and opt-in for compartment-root):
 | `rwx` | path (read + write + execute) | `rwx $HOME` |
 | `exec` | path (read + execute; on a **file**, a per-binary grant) | `exec /usr/bin/psql` |
 | *(any of the above)* | a trailing `?` makes the rule optional | `ro /lib32?` |
-| `workdir` | path (compartment-user; added as `rw`) | `workdir $HOME/projects` |
+| `workdir` | path (compartment-user; added as `rwx`, not the W^X `rw`) | `workdir $HOME/projects` |
 | `landlock` | `on` only | `landlock on` |
 | `net-bind` | TCP port 0-65535 (repeatable) | `net-bind 8080` |
 | `net-connect` | TCP port 0-65535 (repeatable) | `net-connect 5432` |
@@ -444,8 +444,11 @@ block move_pages
 ```
 
 Inheritance depth is limited to 2 levels to prevent loops.
-`inherit` resolves through the same search order and the same trust
-checks as `--profile`, so a system profile can never pull in a file
+`inherit NAME` first looks for `NAME.conf` **in the directory holding the
+profile doing the inheriting** — that is what makes `examples/strict.conf`'s
+`inherit ai-agent` resolve to `examples/ai-agent.conf`. If there is no
+sibling by that name it falls back to the same search order and the same
+trust checks as `--profile`, so a system profile can never pull in a file
 from `$HOME`. If the inherited profile exists but does not parse,
 the whole load is rejected and nothing runs.
 
@@ -502,7 +505,9 @@ Without `--audit-log`, the directory is chosen in this order:
    compartment: refusing to write the audit log to /var/tmp/compartment-audit-1000
    ```
 
-3. **`/var/log/compartment/`** when running as root, created mode `0700`.
+Running as root short-circuits both of those: the default is
+**`/var/log/compartment/`**, created mode `0700`, and steps 1 and 2 are
+not consulted at all.
 
 Whichever directory is used, it must be owned by the effective uid and
 must not be group- or world-writable. It is opened with
@@ -565,7 +570,7 @@ rule covers, or ship the records off the host.
 One line per event, structured for grep:
 
 ```
-[2026-03-31 01:27:10] user=dev uid=1000 event=COMPARTMENT_START ppid_chain=1234->5678->1 cwd=/home/dev/project tty=/dev/pts/0 command=/bin/echo profile=ai-agent source=built-in landlock=1 seccomp=1 paths=14 blocked=43
+[2026-03-31 01:27:10] user=dev uid=1000 event=COMPARTMENT_START ppid_chain=1234->5678->1 cwd=/home/dev/project tty=/dev/pts/0 command=/bin/echo profile=ai-agent source=built-in landlock=1 seccomp=1 paths=21 blocked=43
 ```
 
 Fields: timestamp, user, uid, event type, PPID chain (who launched us),
@@ -798,14 +803,16 @@ make compartment-root
 2. Resolve username to UID/GID (**host** `/etc/passwd`, before `clone()` —
    for a user that only exists inside the container, pass `--uid`/`--gid`)
 3. Open audit log (host filesystem, before namespace setup)
-4. `clone()` with new namespaces (UTS, mount, PID, IPC, net, user, cgroup)
-4b. Parent: validate `rootdir` ownership, and — when `netns` names one —
-   join that network namespace *before* `clone()`, dropping `CLONE_NEWNET`
-   so the child inherits it
-5. Parent: clear supplementary groups, write `deny` to
-   `/proc/<pid>/setgroups`, write the UID/GID maps (identity `0 0 65536`
-   unless `uid-map`/`gid-map` say otherwise), cgroup assignment
-6. Child: become uid 0 *of the new namespace*, bind `rootdir` onto itself,
+4. Parent, still before `clone()`: validate `rootdir` ownership; clear the
+   parent's own supplementary groups (once `/proc/<pid>/setgroups` is
+   `deny` the child can no longer do it); and — when `netns` names one —
+   join that network namespace, dropping `CLONE_NEWNET` so the child
+   inherits it
+5. `clone()` with new namespaces (UTS, mount, PID, IPC, net, user, cgroup)
+6. Parent: write `deny` to `/proc/<pid>/setgroups`, then the UID/GID maps
+   (identity `0 0 65536` unless `uid-map`/`gid-map` say otherwise), then
+   cgroup assignment
+6b. Child: become uid 0 *of the new namespace*, bind `rootdir` onto itself,
    remount it `nosuid,nodev` (plus anything `rootdir-flags` adds except
    `ro`), `pivot_root`
 7. Child: mount `/proc`, mount read-only `/sys`, populate `/dev` with
@@ -949,11 +956,16 @@ sandbox.sh             — Network namespace + proxy bridge
 Makefile               — Build targets
 HOWTO.md               — This file
 DESIGN.md              — Architecture, security review, lineage from shell-guard
-examples/
-  ai-agent.conf        — Profile for Claude/Codex/Gemini
-  strict.conf          — Locked-down profile (inherits ai-agent)
-  container.conf       — Full namespace isolation profile
-  dev.conf             — Relaxed profile for development
+README.md              — Overview, profile directive reference, file list
+SECURITY.md            — Reporting policy and the known-limitation list
+compartment-bpf/       — Optional BPF-LSM inode-sealing module
+examples/              — 14 profiles and paranoid-ssh.sh; see README.md
+                         for the full list and what each one is for
+man/                   — compartment-user(1), compartment-root(8)
+tools/                 — syscall.py profile generator and its guide
+tests/                 — suites, fixtures and the two runners
+extra/                 — optional egress-proxy helpers
+scripts/               — timestamp.sh
 archive/
   shell-guard/         — Archived shell-replacement tool (~2003, self-contained)
 ```

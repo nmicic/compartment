@@ -28,7 +28,9 @@
 #   v5.15  — Landlock ABI v1 (needs lsm= boot param on Ubuntu mainline)
 #   v6.1   — Landlock ABI v2 (REFER support)
 #   v6.5   — Landlock ABI v3 (TRUNCATE support)
-#   v6.8   — Landlock ABI v4 (IOCTL_DEV support)
+#   v6.7   — Landlock ABI v4 (TCP bind/connect port rules)
+#   v6.10  — Landlock ABI v5 (IOCTL_DEV)
+#   v6.12  — Landlock ABI v6 (scoping)
 
 set -euo pipefail
 

@@ -52,7 +52,7 @@ make
 
 ```bash
 make                    # builds the zero-dependency core tools
-make test               # core suites (Landlock + seccomp + env + inheritance)
+make test               # the rootless suites, quick mode (run_all.sh --quick)
 make test-integration   # every unprivileged suite (sandbox.sh, external CLI)
 sudo make test-root     # the root-only suites
 make hardened           # build with randomized shell stash path
@@ -276,7 +276,7 @@ compartment-user, so keep the two kinds in separate files.
 | `rwx PATH` | both | Read + write + execute |
 | `exec PATH` | both | Read + execute. On a *file* this is a per-binary grant — see below |
 | `PATH?` | both | A trailing `?` makes the rule optional: skipped when the path is absent instead of fatal |
-| `workdir PATH` | compartment-user | Working directory, added as `rw` |
+| `workdir PATH` | compartment-user | Working directory, added as `rwx` (not the W^X `rw`) |
 | `net-bind PORT` | both | Allow `bind(2)` on this TCP port (repeatable) |
 | `net-connect PORT` | both | Allow `connect(2)` to this TCP port (repeatable) |
 | `net-default deny\|ignore` | both | `deny` handles TCP bind and connect and refuses every port not listed. Default `ignore`: the network is not restricted |
@@ -624,7 +624,8 @@ archive/
 
 - **Firejail** (~100K lines) — closest comparison; mature profile ecosystem
   for desktop apps, but large attack surface with CVE history.
-  compartment-user is 100x smaller and auditable in one sitting.
+  compartment-user is well over an order of magnitude smaller and
+  auditable in one sitting.
 - **bwrap** (~3K lines) — mount/PID/network namespaces. Architecturally
   different (namespaces vs Landlock). Use bwrap when you need full mount
   isolation or kernel < 5.13; use compartment-user when you need profiles,
@@ -636,7 +637,8 @@ archive/
   user-deployable with no system configuration changes.
 
 No existing tool combines: zero deps, profile files with inheritance,
-shell-replacement mode, and PPID chain audit logging in ~1600 lines.
+shell-replacement mode, and PPID chain audit logging in under 4000 lines
+of C, header included.
 
 ## Related
 
@@ -651,7 +653,7 @@ This project was developed with AI assistance:
   testing, debugging, and implementation across all C source, shell scripts,
   profiles, and test infrastructure
 - **ChatGPT** (OpenAI), **Gemini** (Google), **Codex** (OpenAI) — independent
-  code review rounds that identified 18 security bugs, all fixed before release
+  code review rounds; DESIGN.md records all 61 findings and their fixes
 - **Human** — architecture, design decisions, review coordination, and final
   approval
 

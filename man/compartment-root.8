@@ -29,6 +29,22 @@ All of this happens
 the old root is detached \- see
 .B HARDENING DETAILS
 below.
+.IP 3b.
+.B Landlock
+\- filesystem and TCP port rules, when the policy turns Landlock on.
+Applied here because every mount is already in place and the child still
+holds
+.B CAP_SYS_ADMIN
+in its own user namespace, which is what
+.BR landlock_restrict_self (2)
+needs before
+.BR no_new_privs .
+An
+.B exec
+rule acts as a binary allow-list that uid 0 inside the container cannot
+escape. Off unless asked for \- see
+.B "Filesystem and network (Landlock)"
+below.
 .IP 4.
 .B Capability drop
 \- all capabilities removed from bounding set except those named via

@@ -14,8 +14,10 @@
 #
 # That is enough to run the whole HARD path for real, including the shell
 # intercept and the compartment-user shell-replacement exec that it depends
-# on. What it cannot cover is the namespace itself; see the report for the
-# manual HARD-mode check on a host where userns is available.
+# on. What it cannot cover is the namespace itself: no machine available to
+# this suite allows an unprivileged user namespace, so the real HARD path
+# has to be checked by hand on a host that does. SECURITY.md records that
+# gap.
 #
 # Usage: ./tests/scripts/rootless.d/sandbox.sh [--verbose]
 

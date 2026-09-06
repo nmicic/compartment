@@ -188,7 +188,11 @@ split into applets, and a shell builtin is not an
 at all.
 .TP
 .BI \-\-workdir " PATH"
-Set working directory (added as \fB\-\-rw\fR).
+Set working directory. It is added as a path rule in its own right \(em
+read, write and execute, the same rights the built-in profile gives
+.IR $HOME ,
+not the W^X rights of
+.BR \-\-rw .
 .TP
 .B \-\-no\-landlock
 Disable Landlock filesystem restrictions.
@@ -386,10 +390,11 @@ if the directory is found with a different owner or a mode other than
 0700,
 .B compartment-user
 refuses to run rather than appending to it.
-.IP 3.
-.I /var/log/compartment
-when running as root, created mode 0700.
 .RE
+.PP
+Running as root short-circuits both of those: the default is
+.IR /var/log/compartment ,
+created mode 0700, and neither step above is consulted.
 .PP
 Neither default is inside a path the built-in profiles grant for writing,
 so the sandboxed process cannot rewrite its own audit trail. Note that
@@ -507,7 +512,7 @@ warning at
 level, including uid, pid, and ppid for audit trail:
 .RS
 .nf
-compartment-user[bash]: INSECURE shell session (1 mechanisms failed) uid=1000 pid=12345 ppid=12340
+compartment-user[bash]: INSECURE shell session (1 mechanism failed) uid=1000 pid=12345 ppid=12340
 .fi
 .RE
 .PP
@@ -572,16 +577,19 @@ The built-in
 profile blocks these syscall families:
 .PP
 .nf
-ptrace, mount, umount2, reboot, kexec_load,
+ptrace, process_vm_readv, process_vm_writev,
+mount, umount2, pivot_root, chroot, unshare, setns,
+mount_setattr, open_tree, move_mount,
+fsopen, fsmount, fsconfig, fspick,
+open_by_handle_at, name_to_handle_at,
+reboot, kexec_load, kexec_file_load,
 init_module, finit_module, delete_module,
-pivot_root, chroot, unshare, setns,
 keyctl, add_key, request_key,
 bpf, userfaultfd, perf_event_open,
-process_vm_readv, process_vm_writev,
 io_uring_setup, io_uring_enter, io_uring_register,
-open_by_handle_at, name_to_handle_at,
-open_tree, move_mount, fsopen, fsmount,
-fsconfig, fspick, mount_setattr, pidfd_getfd
+acct, swapon, swapoff,
+settimeofday, clock_settime, clock_adjtime, adjtimex,
+pidfd_getfd, and on x86-64 ioperm and iopl
 .fi
 .PP
 Environment variables stripped include LD_PRELOAD, cloud credentials

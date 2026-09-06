@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # tests/pin-regression.sh -- V-4 pin/unpin regression suite.
 #
-# Four tests:
+# Five tests:
 #   T4.1 Killed daemon, pinned links: enforcement survives.
 #   T4.2 --unpin removes owned pins, enforcement stops, PIN_ROOT preserved.
 #   T4.3 --unpin <foreign bpffs object> refused; sentinel intact.
 #   T4.4 Reload sshd.conf -> chronyd.conf via (dry-run|unpin|pin) composition:
 #        no stale sshd denial, chronyd denial active.
+#   T4.5 A pin tree of the wrong shape is refused with a pin-shape
+#        diagnostic rather than adopted.
 #
 # Run only inside a dedicated VM. The probe uses sealprobe's
 # truncate-to-same-size operation, which triggers the truncate hooks
@@ -16,7 +18,7 @@
 # Outputs ${RESULTS}/pin-regression.csv -- one row per test:
 #   test,outcome,detail
 #
-# Exits non-zero unless all 4 tests pass.
+# Exits non-zero unless all 5 tests pass.
 
 set -euo pipefail
 

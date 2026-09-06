@@ -87,8 +87,8 @@ Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all 
   cat /sys/kernel/security/lsm   # must include "bpf"
   zgrep BPF_LSM /proc/config.gz  # CONFIG_BPF_LSM=y
   ```
-  Tested on Ubuntu 24.04 LTS (Noble, kernel `6.8`) and Ubuntu 26.04 LTS
-  (kernel `7.0.0-15-generic`).
+  Tested on Ubuntu 24.04 LTS (kernel `6.8.0-139-generic`) and Ubuntu 26.04
+  LTS (kernel `7.0.0-31-generic`).
 
 - Toolchain: `clang` ≥ 12, `libbpf-dev`, `bpftool`, `libsodium-dev`.
   `make check-env` verifies presence.
@@ -162,11 +162,11 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 | `make check` | loader negative-path, multi-actor, error-path, regression (24+ checks) |
 | `tests/bypass/run-all.sh` | 39 bypass scenarios (20 seal-class + 19 exec-domain; kernel hook coverage per flag class) |
 | `tests/strict-launch/run.sh` | 17 strict-launch-marker witnesses |
-| `tests/observe/run.sh` | 21 observe pipeline witnesses (1 skips without AIDE) |
+| `tests/observe/run.sh` | 22 observe pipeline witnesses; 21 pass and 1 skips where AIDE is not installed |
 | `tests/mesh/run-mesh.sh` | 3284 (actor × operation × flag) enforcement matrix trials |
 | `tests/dir-matrix.sh` | 40-cell directory-destination matrix (`make check-dir-matrix`) |
 | `tests/actor-wrapper/run.sh` | 21 wrapper/actor-identity witnesses (`make check-wrapper`) |
-| `tests/matrix.sh` | 24-cell file-flag matrix |
+| `tests/matrix.sh` | file-flag matrix, 4 flags x every op the runner lists (28 cells today; the gate reads the op list rather than a literal) |
 | `tests/bench-runner.sh` | three-mode performance bench with 2σ confidence intervals |
 | `tests/stability/` | pin/unpin churn stability: 8 witnesses quick, 1024 cycles full |
 | `tests/fuzz.sh` | 10 000-iteration fuzz with reproducible seeds |

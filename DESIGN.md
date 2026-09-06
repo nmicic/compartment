@@ -100,7 +100,7 @@ Wired `audit_log_open()` + `audit_log()`. Log opened before `clone()`
 ### Bonus: Portable syscall table
 
 Replaced architecture-split table (35 hardcoded entries for x86_64 +
-aarch64 separately) with 135-entry table using `__NR_*` macros from
+aarch64 separately) with a 200+ entry table using `__NR_*` macros from
 `<sys/syscall.h>`. Single table, portable across architectures
 (x86_64, aarch64, riscv64, s390x, ppc64le, loongarch64).
 
@@ -269,10 +269,15 @@ filter, the privilege drop and `no-new-privs`, `/proc` and `/sys` masking,
 namespace isolation and escape attempts (host mounts, `/proc/1/root`, a
 pre-opened directory fd, a setuid-root binary), the PID 1 reaper and signal
 handling, the network namespace, uid/gid mapping, cgroup path confinement,
-and what `--dry-run` and `--audit` report. `root.d/profile-trust-root.sh`
-covers profile trust under root. Both build their own scratch trees under
-`mktemp -d` and remove everything they created on exit, including on
-failure. Green on kernel 6.8 (Ubuntu 24.04, gcc 13.3) and kernel 7.0
+and what `--dry-run` and `--audit` report.
+`root.d/compartment-root-landlock.sh` covers Landlock inside the
+container, the `exec` binary allow-list, `rootdir-flags` and the
+`mount-*` hardening, `rootdir` ownership, the `--netns` join, and the
+private `devpts` and `/dev/shm`. `root.d/profile-trust-root.sh` covers
+profile trust under root, and `root.d/00-discovery-smoke.sh` proves the
+runner actually discovers what is in the directory. All of them build
+their own scratch trees under `mktemp -d` and remove everything they
+created on exit, including on failure. Green on kernel 6.8 (Ubuntu 24.04, gcc 13.3) and kernel 7.0
 (Ubuntu 26.04, gcc 15.2); the runner prints the assertion totals it
 measured rather than a number kept in this file.
 
