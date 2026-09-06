@@ -123,6 +123,7 @@ CONF="${CONFDIR}/shell-replacement.conf"
 SEALPROBE=/etc/compartment-lr-seal-probe
 AUDITDIR=/var/log/compartment
 PINNED=0
+PIN_PID=""
 MADE_CONFDIR=0
 MADE_AUDITDIR=0
 CONF_BACKUP=""
@@ -145,6 +146,11 @@ unpin_retry() {
 cleanup() {
     local rc=$?
     set +e
+    if [ -n "${PIN_PID}" ]; then
+        kill -TERM "${PIN_PID}" 2>/dev/null
+        wait "${PIN_PID}" 2>/dev/null
+        PIN_PID=""
+    fi
     if [ "${PINNED}" -eq 1 ]; then
         unpin_retry || echo "  NOTE: --unpin did not succeed; check /sys/fs/bpf/compartment"
         PINNED=0
@@ -474,12 +480,31 @@ else
 seal ${SEALPROBE}                            full
 seal /etc/ld.so.cache                        full
 EOF
-    if "${CBPF}" --pin "${T}/seal.conf" >"${T}/pin.log" 2>&1; then
+    # --pin does not return: the loader stays in the foreground holding an
+    # O_PATH fd per sealed inode ("[run] compartment-bpf live. ^C to exit").
+    # The pins are what outlive it, which is the whole point of --pin and the
+    # reason the deployment mandates it over a daemon — so start it, wait for
+    # the links to appear, then stop the loader and test with nothing left to
+    # kill.  That is the state a limited root actually faces.
+    "${CBPF}" --pin "${T}/seal.conf" >"${T}/pin.log" 2>&1 &
+    PIN_PID=$!
+    PIN_WAIT=30
+    while [ "${PIN_WAIT}" -gt 0 ]; do
+        [ -n "$(ls -A /sys/fs/bpf/compartment/links 2>/dev/null)" ] && break
+        kill -0 "${PIN_PID}" 2>/dev/null || break
+        PIN_WAIT=$((PIN_WAIT - 1))
+        sleep 1
+    done
+    if [ -n "$(ls -A /sys/fs/bpf/compartment/links 2>/dev/null)" ]; then
         PINNED=1
-        pass "S1: the seal profile pins"
+        kill -TERM "${PIN_PID}" 2>/dev/null
+        wait "${PIN_PID}" 2>/dev/null
+        PIN_PID=""
+        pass "S1: the seal profile pins, and the pins outlive the loader"
 
-        # Liveness: an UNCONFINED uid-0 login cannot write a sealed file.
-        # This is the half Landlock cannot do.
+        # Liveness with no loader running: an UNCONFINED uid-0 login cannot
+        # write a sealed file.  This is the half Landlock cannot do, and the
+        # half that answers the adversary who was never in the session.
         run_ctl "echo x >> ${SEALPROBE}"
         want_fail "S2: a sealed file resists an unconfined uid-0 write"
 
@@ -503,8 +528,11 @@ EOF
             sed 's/^/    /' "${T}/pin.log"
         fi
     else
+        kill -TERM "${PIN_PID}" 2>/dev/null
+        wait "${PIN_PID}" 2>/dev/null
+        PIN_PID=""
         skip_group "${SEAL_ASSERTIONS}" \
-            "compartment-bpf --pin failed ($(tail -1 "${T}/pin.log"))"
+            "compartment-bpf --pin did not produce pins ($(tail -1 "${T}/pin.log"))"
     fi
 fi
 
