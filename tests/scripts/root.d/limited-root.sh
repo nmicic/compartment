@@ -127,11 +127,26 @@ MADE_CONFDIR=0
 MADE_AUDITDIR=0
 CONF_BACKUP=""
 
+# compartment-bpf refuses to race the pin lifecycle: a --unpin while another
+# pin or unpin holds the pin-root mutex exits non-zero with EBUSY rather than
+# tearing down half a policy.  That is the right behaviour and it means every
+# unpin here needs a bounded retry, including the one in the EXIT trap —
+# a pinned policy left behind seals files the next run needs to remove.
+unpin_retry() {
+    local tries=10
+    while [ "${tries}" -gt 0 ]; do
+        if "${CBPF}" --unpin >>"${1:-/dev/null}" 2>&1; then return 0; fi
+        tries=$((tries - 1))
+        sleep 2
+    done
+    return 1
+}
+
 cleanup() {
     local rc=$?
     set +e
     if [ "${PINNED}" -eq 1 ]; then
-        "${CBPF}" --unpin >/dev/null 2>&1
+        unpin_retry || echo "  NOTE: --unpin did not succeed; check /sys/fs/bpf/compartment"
         PINNED=0
     fi
     # -f: userdel refuses a uid that another process is using, and PID 1
@@ -480,7 +495,7 @@ EOF
         run_lr 'umount -l /sys/fs/bpf'
         want_fail "S6: the confined account cannot unmount bpffs"
 
-        if "${CBPF}" --unpin >>"${T}/pin.log" 2>&1; then
+        if unpin_retry "${T}/pin.log"; then
             PINNED=0
             pass "S7: the legitimate admin can still --unpin"
         else
