@@ -668,16 +668,34 @@ static __always_inline int caller_is_loader(struct caller_id *cid)
 // Common deny tail for both self-protection actions: count first, then emit with the
 // caller's exe identity so an operator can see WHICH binary tried it. Actor
 // name is empty — these denies are not seal-scoped, they are tool-scoped.
+//
+// `err` is the caller's, because the two actions land on different syscalls and
+// each has to answer in that syscall's dialect:
+//
+//   * the bpf_map gate returns -EPERM. bpf(2) reports every "you do not have
+//     the right to this object" as EPERM — bpf_map_get_fd_by_id() itself does,
+//     for a caller without CAP_BPF — so a BPF tool has an EPERM path and no
+//     EACCES path. Measured: with -EACCES, bpftool reports "Permission denied"
+//     and aborts; with -EPERM it reports "Operation not permitted" and aborts
+//     the same way, but libbpf's own callers and anything matching on EPERM
+//     see the errno the syscall is documented to produce. -ENOENT was measured
+//     and rejected: it makes bpftool exit 0 with our maps simply absent, which
+//     disguises a security decision as a missing object and makes an
+//     unauthorised --stats say "no pinned counters found" — indistinguishable
+//     from "no policy is pinned".
+//   * the pin-tamper gate returns -EACCES, which is what every other
+//     compartment deny returns on a path operation and what `rm`, `mv` and
+//     `umount` print as "Permission denied".
 static __always_inline int
 deny_self_protect(__u32 action, void *counter, __u64 dev, __u64 ino,
-                  struct caller_id *cid)
+                  struct caller_id *cid, int err)
 {
 	bump_counter(counter);
 	emit_audit_actor(action, dev, ino,
 	                 cid->valid ? cid->dev : 0,
 	                 cid->valid ? cid->ino : 0,
 	                 (const char *)0);
-	return -EACCES;
+	return err;
 }
 
 // Guard the bpffs pin objects. Ordered so the common case (any inode op on any
@@ -699,7 +717,8 @@ deny_pin_tamper(struct inode *inode, struct caller_id *cid)
 	if (caller_is_loader(cid))
 		return 0;
 	return deny_self_protect(ACTION_DENY_PIN_TAMPER,
-	                         &pin_tamper_denied_total, k.dev, k.ino, cid);
+	                         &pin_tamper_denied_total, k.dev, k.ino, cid,
+	                         -EACCES);
 }
 
 static __always_inline int
@@ -2401,11 +2420,14 @@ int BPF_PROG(comp_move_mount, const struct path *from_path,
 //
 // DELIBERATE: this denies READ-ONLY fds too. A read-only fd is a complete
 // attack: bpf_map__reuse_fd() + a one-instruction BPF program writes the map
-// from program context, measured working on both kernels. The cost is real
-// and is documented: with --self-protect in force, `bpftool map dump` on a
-// compartment map fails with EPERM, and `compartment-bpf --stats` works only
-// when run from an authorised loader binary (it is the same executable, so
-// the normal case is unaffected).
+// from program context, measured working on both kernels. Allowing read-only
+// access so `--stats` and `bpftool map dump` keep working was considered and
+// rejected for exactly that reason: it would leave every seal map writable
+// through a one-instruction program and make the whole gate decorative. The
+// cost is real and is documented: with --self-protect in force,
+// `bpftool map dump` on a compartment map fails, and `compartment-bpf --stats`
+// works only when run from an authorised loader binary (it is the same
+// executable, so the normal case is unaffected).
 //
 // BPF_MAP_CREATE is unaffected: a map that has just been created cannot
 // already be in protected_map_ids.
@@ -2433,5 +2455,5 @@ int BPF_PROG(comp_bpf_map, struct bpf_map *map, fmode_t fmode, int ret)
 	// dev = 0 signals "this ino is not a filesystem inode"; ino carries the
 	// bpf map id so the audit line names the object. See compartment-abi.h.
 	return deny_self_protect(ACTION_DENY_BPF_SELF, &bpf_self_denied_total,
-	                         0, (__u64)id, &cid);
+	                         0, (__u64)id, &cid, -EPERM);
 }
