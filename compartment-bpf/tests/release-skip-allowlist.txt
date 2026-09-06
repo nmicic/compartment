@@ -84,7 +84,19 @@
 ^\[mesh\] SKIP: ME23-mount .* reason=(xfs|tmpfs)-unavailable$
 #
 # ---------------------------------------------------------------------------
-# 6. Removed in 1.4, kept here as a record so nobody re-adds them:
+# 6. Fixtures the guest image does not provide. Ubuntu 24.04's chrony
+#    package ships no NTS bootstrap certificates, and profiles/chronyd.conf
+#    seals two of them, so `--dry-run` on that profile reports two errors
+#    there and pin-regression T4.4 has nothing to reload. Installing chrony
+#    on the 24.04 guest makes T4.4 run and then FAIL for that reason, which
+#    is worse than a stated skip — the profile's portability is the real
+#    problem and is recorded as an open item. This line used to be a CSV row
+#    only, which is why its predecessor entry matched nothing.
+# ---------------------------------------------------------------------------
+^\[pin-regression\] SKIP T4\.4: missing fixture: /etc/chrony/chrony\.conf$
+#
+# ---------------------------------------------------------------------------
+# 7. Removed in 1.4, kept here as a record so nobody re-adds them:
 #      SKIP aide-e2e: aide not installed
 #      SKIP postgres-e2e: pg_lsclusters not present (postgresql-common missing)
 #      SKIP postgres-e2e: no postgres clusters configured
@@ -93,8 +105,9 @@
 #    lists now, so those four witnesses run for real. An allow-listed skip
 #    that a package would close is a package problem, not a gate problem.
 #
-#    Also removed as dead — nothing any suite in `make check` emits matched
-#    them: '[strict-launch] summary: ...', '[bypass] pass=...',
-#    '[mesh] ME-2[0-9] .*SKIP: (doc-only|setup-unavail)', and
-#    'missing fixture: /etc/chrony/chrony.conf' (its only producer wrote a
-#    CSV row and never printed the line).
+#    Also removed as dead — nothing any suite in `make check` emitted
+#    matched them: '[strict-launch] summary: ...', '[bypass] pass=...' and
+#    '[mesh] ME-2[0-9] .*SKIP: (doc-only|setup-unavail)'. The chrony
+#    fixture entry was dead for a different reason — its only producer
+#    wrote a CSV row and never printed the line — and is above, anchored,
+#    now that it does.

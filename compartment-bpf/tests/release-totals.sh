@@ -62,7 +62,7 @@ check loader-refusal  5    's/^\[loader-refusal-witness\] \([0-9]*\) PASS \/ [0-
 check limit-stress    2    's/^\[limit-stress\] \([0-9]*\) PASS \/ [0-9]* FAIL$/\1/p'
 check wrapper         21   's/^Total PASS=\([0-9]*\) FAIL=[0-9]*$/\1/p'
 check profiles        19   's/^\[check-profiles\] \([0-9]*\)\/[0-9]* profiles parsed cleanly$/\1/p'
-check pin-regression  6    's/^pin-regression: \([0-9]*\) passed, [0-9]* failed.*/\1/p'
+check pin-regression  5    's/^pin-regression: \([0-9]*\) passed, [0-9]* failed.*/\1/p'
 check counter-smoke   4    's/^counter-smoke: \([0-9]*\)\/[0-9]* passed, [0-9]* failed$/\1/p'
 check limitations     7    's/^\[limitations\] \([0-9]*\) PASS \/ .*/\1/p'
 
