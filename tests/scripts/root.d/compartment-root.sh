@@ -320,6 +320,11 @@ expect_contains "container root really is the jail" "^0$"
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'grep ^Groups /proc/self/status'
 expect_not_contains "supplementary groups cleared" "Groups:	0"
 
+# A fresh pid namespace: only the reaper, the shell and its own children.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'n=$(ls /proc | grep -c "^[0-9][0-9]*$"); echo "pids=$n"; [ "$n" -lt 10 ] && echo PIDNS_OK'
+expect_contains "host processes not visible in the pid namespace" "PIDNS_OK"
+
 echo ""
 
 # ── Test 7: init, signals and fd hygiene ───────────────────────────
@@ -457,6 +462,32 @@ if grep -qs CONTAINER_EXEC "${WORK}"/audit/*.log; then
     pass "audit log file records CONTAINER_EXEC"
 else
     fail "no CONTAINER_EXEC record in ${WORK}/audit/*.log"
+fi
+
+echo ""
+
+# ── Test 12: shipped allow-list profile end to end ─────────────────
+
+echo "--- Test group: allow-list profile ---"
+
+if [ -f "${REPO_DIR}/examples/container.conf" ]; then
+    # Same syscall allow-list, pointed at this suite's rootdir and user.
+    # Nothing in it mentions wait4/kill/rt_sigaction — which the PID 1
+    # reaper needs — so this also proves the reaper is outside the filter.
+    ALLOW_CONF="${WORK}/allow.conf"
+    grep -vE '^(rootdir|uid|gid|username|audit-log|audit|loopback)[[:space:]]' \
+        "${REPO_DIR}/examples/container.conf" > "${ALLOW_CONF}"
+    printf 'rootdir %s\nusername ctsvc\nuid 60000\ngid 60000\n' "${JAIL}" \
+        >> "${ALLOW_CONF}"
+
+    run_cr --profile "${ALLOW_CONF}" -- /bin/sh -c 'echo ALLOWLIST_OK'
+    expect_rc "allow-list profile: container starts" 0
+    expect_contains "allow-list profile: command ran" "ALLOWLIST_OK"
+
+    run_cr --profile "${ALLOW_CONF}" -- /bin/sh -c 'grep ^Seccomp: /proc/self/status'
+    expect_contains "allow-list profile: filter enforced" "Seccomp:	2"
+else
+    skip "examples/container.conf not present: allow-list profile"
 fi
 
 echo ""

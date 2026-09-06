@@ -521,7 +521,7 @@ separate root-only suite:
 sudo ./tests/scripts/root.d/compartment-root.sh
 ```
 
-It builds its own busybox rootdir under `mktemp -d`, runs 53 assertions
+It builds its own busybox rootdir under `mktemp -d`, runs 57 assertions
 against a real container (start-up, `/dev`, seccomp, privilege drop,
 `/proc` and `/sys` masking, namespace isolation and escape attempts, the
 init reaper, networking, uid mapping, cgroup confinement, reporting), and

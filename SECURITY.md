@@ -48,7 +48,7 @@ documented limitations, including:
 - No formal verification or professional penetration testing
 - Network egress bypass testing not yet automated for sandbox.sh HARD mode
 - compartment-root is tested under real root by
-  `tests/scripts/root.d/compartment-root.sh` — 53 assertions covering
+  `tests/scripts/root.d/compartment-root.sh` — 57 assertions covering
   container start-up, `/dev` device nodes, the default seccomp deny-list,
   the capability and privilege drop, `no-new-privs`, `/proc` and `/sys`
   masking, namespace isolation and escape attempts (host mounts visible in
