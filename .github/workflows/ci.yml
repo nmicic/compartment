@@ -239,9 +239,14 @@ jobs:
         working-directory: compartment-bpf
         run: make check-profiles
 
+      # sudo, but still no BPF: check-parser-actor stages its fixtures
+      # under $TMPDIR and the loader refuses an actor resolved through a
+      # world-writable directory, so an unprivileged run fails on the
+      # fixtures rather than on the parser. 46 assertions of parser and
+      # actor-resolution coverage that CI has never had.
       - name: Parser and actor witnesses
         working-directory: compartment-bpf
-        run: make check-parser-actor
+        run: sudo make check-parser-actor
 
       - name: HOWTO examples still load
         working-directory: compartment-bpf
