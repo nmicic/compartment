@@ -63,6 +63,90 @@ operator setup documented in `kvm/quickstart-vagrant/README.md`.
 Warm-cache measurement: **126 s** (`vagrant up` start → `make smoke`
 exit 0), under the 300 s budget by 174 s.
 
+## Running the suites on a fresh VM
+
+These are the exact commands a clean bring-up needs, in order, with the
+tallies to expect as of this branch (measured on Ubuntu 24.04, kernel
+6.8.0-139-generic, 2 vCPU / 8 GiB).
+
+```sh
+# 0. On the HOST: check the bring-up prerequisites without touching anything
+bash kvm/ubuntu-noble.sh --check        # or ubuntu-resolute.sh --check
+bash kvm/ubuntu-noble.sh                # real bring-up; ~10 min, reboots once
+
+# 1. Copy the tree in. Exclude .git; the guest only needs the sources.
+rsync -a --exclude=.git/ <checkout>/compartment-bpf/ <user>@<vm>:~/compartment-bpf/
+
+# 2. Build. Run every remote command through a login shell so PATH is sane.
+ssh <user>@<vm> "bash -lc 'cd ~/compartment-bpf && make vmlinux.h && make'"
+
+# 3. The gates.
+ssh <user>@<vm> "bash -lc 'cd ~/compartment-bpf && sudo make smoke'"
+ssh <user>@<vm> "bash -lc 'cd ~/compartment-bpf && sudo make check'"
+ssh <user>@<vm> "bash -lc 'cd ~/compartment-bpf && sudo make check-release'"
+ssh <user>@<vm> "bash -lc 'cd ~/compartment-bpf && sudo make check-stability-quick'"
+```
+
+| command | wall time | expected |
+|---|---|---|
+| `make vmlinux.h && make` | ~5 s | exit 0, zero warnings |
+| `sudo make smoke` | ~10 s | `smoke ok` |
+| `sudo make check` | ~7 min | exit 0; see the per-target tallies below |
+| `sudo make check-release` | ~7 min | `[check-release] PASS ...` |
+| `sudo make check-stability-quick` | ~2 min | `stability summary: pass=8 fail=0 skip=0` |
+
+Headline tallies inside `make check`:
+
+| target | expected |
+|---|---|
+| `check-coverage-static` | selftest 11/11, then "every surface is witnessed or explicitly exempted" |
+| `check-mesh` | 3282 trials: 3273 PASS / 0 FAIL / 1 KNOWN-GAP / 8 SKIP |
+| `check-bypass` | 34 PASS / 0 FAIL / 0 SKIP over 34 scripts |
+| `check-strict-launch` | PASS=15 FAIL=0 |
+| `check-observe` | PASS=21 FAIL=0 SKIP=1 (T12, AIDE not installed) |
+| `check-dir-matrix` | 40/40 PASS |
+| `check-wrapper` | PASS=21 FAIL=0 |
+| `check-profiles` | 19/19 profiles parsed cleanly |
+| `check-profile-e2e` | 2 SKIP (aide, postgres not installed) |
+
+Two suites are NOT part of `make check` and have preconditions of their
+own:
+
+* `tests/bypass/run-all.sh` is a **host-side driver** — it rsyncs to a VM
+  and ssh-runs each witness there. Inside a guest use
+  `tests/bypass/run-all.sh --local` (or just `make check-bypass`, which
+  calls `run-local.sh`). `--check` validates the driver's preconditions
+  and `--help` documents every environment knob.
+* `make check-stability-quick` needs the mesh stubs and test tools; the
+  target now builds them. It drives `tests/mesh/run-mesh.sh` concurrently
+  with 64 pin/unpin cycles, so both take the PIN_ROOT test mutex
+  (`tests/lib-pinlock.sh`).
+
+### Skip vocabulary
+
+`make check` is developer-friendly and skips suites the host cannot run.
+`make check-release` is the release gate: it FAILS on any SKIP line that
+does not match a documented entry in `tests/release-skip-allowlist.txt`.
+An unrecognised skip is a failure, because that is exactly how two
+permanently-dead bypass witnesses read as green for several releases.
+
+The skips a fully provisioned VM still legitimately produces:
+
+| skip | why |
+|---|---|
+| `SKIP aide-e2e: aide not installed` | `aide` is not in the kvm scripts' package list |
+| `SKIP postgres-e2e: pg_lsclusters not present ...` | `postgresql-common` likewise |
+| `SKIP  T12: AIDE not present ...` | same, observe suite |
+| `[mesh] ME-22 btrfs/overlay SKIP: anon_bdev ...` | refused by the HIGH-1 loader gate on purpose; see LIMITATIONS.md |
+| `[mesh] ME-22 nfs SKIP: out-of-scope for v0` | documented scope |
+| `missing fixture: /etc/chrony/chrony.conf` | Noble's cloud image uses systemd-timesyncd |
+
+Everything else — `needs root`, `bpf not in active LSM`, `daemon not
+built`, `sealprobe not built`, `bpftool not available`, `fixtures
+missing`, or any wording nobody has written down — fails
+`make check-release`. Installing `aide` and `postgresql-common` in the
+guest closes the four package-driven skips.
+
 ## Choosing a path
 
 | You want                                              | Use      |

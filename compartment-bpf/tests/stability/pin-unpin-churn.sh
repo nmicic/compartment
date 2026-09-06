@@ -196,7 +196,7 @@ START_TS=$(date +%s)
 			touch "$LOOP_A_DONE"
 			exit 1
 		fi
-		# T-STAB-7: a cycle that pins nothing is a SILENT NO-OP, and the
+		# T-STAB-8: a cycle that pins nothing is a SILENT NO-OP, and the
 		# whole point of this loop is the churn. Before this assertion a
 		# profile whose actor path failed to resolve (the /usr/bin/true
 		# symlink case) produced 64 cycles of "pin rc=1 / 0 pins removed"
@@ -326,9 +326,9 @@ LOOP_A_PINNED_N=0
 [ -r "$LOOP_A_PINNED" ] && LOOP_A_PINNED_N=$(cat "$LOOP_A_PINNED" 2>/dev/null || echo 0)
 LOOP_A_PINNED_N=${LOOP_A_PINNED_N:-0}
 if [ "$LOOP_A_PINNED_N" -eq "$STAB_CYCLES" ]; then
-	stab_pass "T-STAB-7 pin witness: $LOOP_A_PINNED_N/$STAB_CYCLES cycles observed a live pin under $STAB_PIN_ROOT/links"
+	stab_pass "T-STAB-8 pin witness: $LOOP_A_PINNED_N/$STAB_CYCLES cycles observed a live pin under $STAB_PIN_ROOT/links"
 else
-	stab_fail "T-STAB-7 pin witness: only $LOOP_A_PINNED_N/$STAB_CYCLES cycles observed a live pin — the churn was (partly) a no-op; see $STAB_DIR/loop-a.log"
+	stab_fail "T-STAB-8 pin witness: only $LOOP_A_PINNED_N/$STAB_CYCLES cycles observed a live pin — the churn was (partly) a no-op; see $STAB_DIR/loop-a.log"
 fi
 
 END_TS=$(date +%s)
