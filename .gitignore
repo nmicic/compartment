@@ -9,6 +9,9 @@ tests/probes/deny_probe
 *.a
 *.so
 
+# ...but *.d must not swallow the test-suite directories
+!tests/scripts/*.d/
+
 # Generated headers (config.py output)
 config.h
 compartment-root-config.h

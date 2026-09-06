@@ -65,16 +65,16 @@ tests/
 │   ├── test-combined.conf      — all three combined
 │   └── test-claude-smoke.conf  — Claude CLI profile
 ├── scripts/
+│   ├── root.d/
+│   │   └── profile-trust-root.sh  — root-only profile trust (dry-run only)
+│   ├── rootless.d/
+│   │   └── profile-trust.sh    — profile trust, parser, audit, env
 │   ├── run_all.sh              — top-level entrypoint
 │   ├── make_fixtures.sh        — create /tmp/compartment-fixtures/
 │   ├── run_compartment_user_matrix.sh
 │   ├── run_child_inheritance_tests.sh
 │   ├── run_sandbox_proxy_matrix.sh
-│   ├── run_claude_smoke.sh
-│   ├── rootless.d/
-│   │   └── profile-trust.sh    — profile trust, parser, audit, env
-│   └── root.d/
-│       └── profile-trust-root.sh  — root-only profile trust (dry-run only)
+│   └── run_claude_smoke.sh
 ├── output/                 — test output files (git-ignored)
 └── README.md               — this file
 ```
