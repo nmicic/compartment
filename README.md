@@ -6,10 +6,25 @@
 Kernel-enforced sandboxing for untrusted processes. Two zero-dependency
 core tools, one shared profile format, plus an optional BPF-LSM module.
 
-> **v1.3.0 note:** `compartment-user` and `compartment-root` are
-> unchanged and remain the zero-dependency core. `compartment-bpf`
-> is a new optional advanced module for kernel-level inode sealing,
-> with its own kernel and toolchain requirements.
+> **v1.4.0 note:** `compartment-root` now starts and runs correctly
+> under real root, and is tested there by root-only suites
+> (`sudo make test-root`); several of its container fixes are security
+> fixes, so read the upgrade notes before deploying it. Profile trust
+> changed: a profile is only honoured if its *source* is trusted, the
+> parser is transactional (a file that fails to parse changes nothing),
+> the security switches are one-way — a profile may tighten policy but
+> never loosen it — and `$HOME` is no longer searched unless
+> `--user-profiles` is given. Landlock policy gained per-file rules and
+> TCP port rules (`net-bind`, `net-connect`, `net-default`) on kernels
+> with Landlock ABI v4 or newer. `make install` no longer deploys the
+> example profiles; `make install-profiles` does. The optional
+> `compartment-bpf` module moves to **v0.8.0**, port ABI **0x0008**,
+> which adds mount, ACL and ioctl coverage — and reclassifies timestamp
+> writes as `no-chmod`-class, so on a directly `no-chmod`-sealed file a
+> non-actor is now denied `touch`, `utimensat(2)` and the
+> timestamp-restoring tail of `cp -p`, `rsync -a`, `tar -x`, `install -p`
+> and `unzip`. See `compartment-bpf/CHANGELOG.md` before upgrading a host
+> that has `no-chmod` seals in the field.
 
 > **Note:** This is an open-source Linux isolation toolkit, not a
 > formally validated security product. The code has been through

@@ -7,7 +7,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.3.x   | Yes       |
+| 1.4.x   | Yes       |
+| 1.3.x   | No        |
 
 ## Reporting a Vulnerability
 
@@ -56,12 +57,16 @@ documented limitations, including:
   `/proc/1/root`, a pre-opened host directory fd, a setuid-root binary
   inside `rootdir`), the PID 1 reaper and signal handling, the network
   namespace, uid/gid mapping, cgroup path confinement and policy reporting
-  — 59 assertions when this was written, all passing on Ubuntu 24.04
+  — 61 assertions in 1.4.0, all passing on Ubuntu 24.04
   (kernel 6.8.0, gcc 13.3) and Ubuntu 26.04 (kernel 7.0.0, gcc 15.2).
-  `tests/scripts/root.d/profile-trust-root.sh` adds 32 more for profile
-  trust under root. Those counts move as suites are added: what is covered
-  is whatever `tests/scripts/root.d/` contains, and the runner prints the
-  totals it measured — run it rather than trusting this paragraph. The
+  `tests/scripts/root.d/compartment-root-landlock.sh` adds 55 more for
+  Landlock inside the container, the `exec` binary allow-list, the mount
+  hardening, `rootdir` ownership, the `--netns` join and devpts/`/dev/shm`;
+  `tests/scripts/root.d/profile-trust-root.sh` adds 32 for profile trust
+  under root; 152 in total with the discovery smoke suite. Those counts
+  move as suites are added: what is covered is whatever
+  `tests/scripts/root.d/` contains, and the runner prints the totals it
+  measured — run it rather than trusting this paragraph. The
   root suites are not part of `make test`, which stays rootless, and they
   are run by the `root-tests` CI job rather than by `make test-integration`
 - The uid/gid map defaults to the identity map, so the user namespace
