@@ -47,4 +47,17 @@ documented limitations, including:
 
 - No formal verification or professional penetration testing
 - Network egress bypass testing not yet automated for sandbox.sh HARD mode
-- compartment-root not tested under actual root (test suite runs rootless)
+- compartment-root is tested under real root by
+  `tests/scripts/root.d/compartment-root.sh` — 53 assertions covering
+  container start-up, `/dev` device nodes, the default seccomp deny-list,
+  the capability and privilege drop, `no-new-privs`, `/proc` and `/sys`
+  masking, namespace isolation and escape attempts (host mounts visible in
+  the container, `/proc/1/root`, a pre-opened host directory fd, a
+  setuid-root binary inside `rootdir`), the PID 1 reaper and signal
+  handling, the network namespace, uid/gid mapping, cgroup path
+  confinement and policy reporting. Verified on Ubuntu 24.04
+  (kernel 6.8.0). The suite is not part of `make test`, which stays
+  rootless, and it is not yet run in CI
+- The uid/gid map defaults to the identity map, so the user namespace
+  provides a capability boundary but no uid isolation unless `uid-map` /
+  `gid-map` are set (see HOWTO.md)

@@ -41,8 +41,10 @@ compartment-user.c      <- includes compartment.h
 
 compartment-root.c      <- includes compartment.h
   |-- Namespace creation (clone flags)
-  |-- pivot_root + /dev + /proc setup
-  |-- UID/GID mapping
+  |-- pivot_root, then /proc + /sys + /dev, then detach the old root
+  |-- Built-in seccomp deny-list + /proc mask table
+  |-- Container init (PID 1 reaper: signal forwarding + orphan reaping)
+  |-- UID/GID mapping (identity by default; uid-map/gid-map to shift)
   |-- Capability drop + preserve (raw prctl + capset, no libcap)
   |-- Cgroup assignment
   |-- Network namespace (join or create)
@@ -196,3 +198,38 @@ balance of safety and usability.
 Tests use `deny_probe`, a purpose-built binary with subcommands for each
 operation (fs_read, fs_write, sc_ptrace_traceme, env_get, spawn_sh, etc.)
 that reports machine-parseable results.
+
+Everything above is rootless. compartment-root needs real root, so it has
+its own suite under `tests/scripts/root.d/`, which the rootless targets do
+not run:
+
+```bash
+sudo ./tests/scripts/root.d/compartment-root.sh
+```
+
+53 assertions against a real container: start-up with a plain-directory
+rootdir, the `/dev` device nodes, the default seccomp filter, the
+privilege drop and `no-new-privs`, `/proc` and `/sys` masking, namespace
+isolation and escape attempts (host mounts, `/proc/1/root`, a pre-opened
+directory fd, a setuid-root binary), the PID 1 reaper and signal handling,
+the network namespace, uid/gid mapping, cgroup path confinement, and what
+`--dry-run` and `--audit` report. It builds its own busybox rootdir under
+`mktemp -d` and removes everything it created on exit, including on
+failure.
+
+### Mount order in compartment-root
+
+`compartment-root` as shipped in 1.3.3 could not start with a
+plain-directory `rootdir`: it detached the old root immediately after
+`pivot_root` and then tried to `mount("proc", ...)`, which the kernel
+refused with `EPERM` ("VFS: Mount too revealing"). `mount_too_revealing()`
+only allows a fresh `proc`/`sysfs` mount inside a user namespace when a
+fully visible mount of the same filesystem already exists in the current
+mount namespace, and detaching `/.pivot_old` removed the last one.
+
+The order is therefore: `pivot_root` → mount `/proc` → mount read-only
+`/sys` → tmpfs `/dev` plus bind-mounts of the old root's device nodes →
+`/proc` masks → `umount2("/.pivot_old", MNT_DETACH)`. Keeping the old root
+attached across those steps is also what makes the device nodes reachable
+at all: `mknod(2)` checks `CAP_MKNOD` against the initial user namespace
+and always fails in a `CLONE_NEWUSER` child.
