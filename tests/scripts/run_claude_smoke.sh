@@ -27,7 +27,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CU="${REPO_DIR}/compartment-user"
-PROFILE="${REPO_DIR}/tests/profiles/test-claude-smoke.conf"
+PROFILE_TEMPLATE="${REPO_DIR}/tests/profiles/test-claude-smoke.conf"
+PROFILE=""   # rendered below, once the CLI has been resolved
 OUTPUT_DIR="${REPO_DIR}/tests/output"
 mkdir -p "${OUTPUT_DIR}"
 
@@ -71,6 +72,25 @@ if [ ! -d "${HOME}/.claude" ]; then
     echo "  PASS: ${PASS}  FAIL: ${FAIL}  SKIP: ${SKIP}"
     exit 0
 fi
+
+# ── Render the profile ─────────────────────────────────────────────
+#
+# The profile maps $HOME rw, which is W^X: no execute.  A CLI installed under
+# $HOME therefore cannot start under it without an explicit execute grant, so
+# resolve the binary, follow it to its real path (npm shims and version
+# managers are symlinks) and substitute its directory for @CLI_DIR@.  Without
+# this the suite failed on any host where the CLI is not in /usr/bin, and
+# reported it as its own failure.
+CLI_PATH="$(command -v claude)"
+CLI_REAL="$(readlink -f "${CLI_PATH}" 2>/dev/null || printf '%s' "${CLI_PATH}")"
+CLI_DIR="$(dirname "${CLI_REAL}")"
+PROFILE="$(mktemp "${OUTPUT_DIR}/claude-smoke.XXXXXX.conf")"
+trap 'rm -f "${PROFILE}"' EXIT
+while IFS= read -r line; do
+    printf '%s\n' "${line//@CLI_DIR@/${CLI_DIR}}"
+done < "${PROFILE_TEMPLATE}" > "${PROFILE}"
+chmod go-w "${PROFILE}"
+echo "CLI: ${CLI_PATH} -> ${CLI_REAL} (exec grant: ${CLI_DIR})"
 
 # Check proxy if requested
 if [ "${WITH_PROXY}" -eq 1 ]; then
