@@ -3285,6 +3285,7 @@ static int self_protect_record_pins(struct compartment_bpf *skel,
 	return 0;
 }
 
+
 // security_bpf_map() is reached from bpf_map_new_fd(). Probe vmlinux BTF for
 // bpf_lsm_bpf_map and confirm the two-argument shape before autoloading the
 // program: the hook is identical on 6.8 and 7.0 (FUNC_PROTO vlen=2 on both,
@@ -3617,6 +3618,17 @@ static int pin_tree_exists(void)
 };
 static const size_t N_KNOWN_MAP_NAMES =
 	sizeof(KNOWN_MAP_NAMES) / sizeof(KNOWN_MAP_NAMES[0]);
+
+/* self_protect_record_pins() inserts one protected_pins entry per name in the
+ * two tables above, plus four fixed paths (/sys/fs/bpf, PIN_ROOT and its two
+ * subdirectories). protected_pins is a HASH with max_entries 64 in
+ * compartment.bpf.c; overflowing it is an E2BIG that fails the pin closed, but
+ * only on a live box, and only for whoever adds the 61st hook. Tie the two
+ * numbers together at build time instead. */
+_Static_assert(4 + sizeof(KNOWN_LINK_NAMES) / sizeof(KNOWN_LINK_NAMES[0])
+		 + sizeof(KNOWN_MAP_NAMES) / sizeof(KNOWN_MAP_NAMES[0]) <= 64,
+	"protected_pins (max_entries 64 in compartment.bpf.c) cannot hold the "
+	"current pin set; grow the map and this assert in the same commit");
 
 static int name_in(const char *name, const char *const *table, size_t n)
 {
@@ -4098,11 +4110,16 @@ static int check_pinned_seal_map_shapes(void)
 // Exit 1 on real errors (open succeeded but read failed, etc.).
 //
 // Return -3 for a permission refusal specifically. With --self-protect in
-// force the caller gets EPERM on every one of the eighteen pins, and printing
-// eighteen identical lines with no explanation is the worst possible operator
-// experience for what is a one-sentence problem ("you are not the loader").
-// The caller prints the first error verbatim, suppresses the rest, and adds
-// the sentence.
+// force the caller gets EPERM on every one of the fifteen counter pins
+// stats_action() opens, and printing fifteen identical lines with no
+// explanation is the worst possible operator experience for what is a
+// one-sentence problem ("you are not the loader"). The caller prints the first
+// error verbatim, suppresses the rest, and adds the sentence.
+//
+// EACCES lands here too, and it is NOT the same thing: a non-root --stats gets
+// EACCES from the bpffs mode-700 pin directory, with no policy self-protection
+// involved at all. stats_action() splits them on errno so the wrong advice is
+// never printed.
 static int read_pinned_counter(const char *path, __u64 *out)
 {
 	int fd = bpf_obj_get(path);
@@ -4285,6 +4302,7 @@ static int stats_action(void)
 	int all_missing = 1;
 	int any_io_err = 0;
 	int any_perm_err = 0;
+	int any_acces_err = 0;
 	char path[PATH_MAX];
 
 	for (size_t i = 0; i < n; i++) {
@@ -4305,7 +4323,10 @@ static int stats_action(void)
 			if (!any_perm_err)
 				fprintf(stderr, "open pinned %s: %s\n",
 					path, strerror(errno));
-			any_perm_err = 1;
+			if (errno == EPERM)
+				any_perm_err = 1;   /* the gate */
+			else
+				any_acces_err = 1;  /* bpffs mode 700 */
 		}
 	}
 
@@ -4317,6 +4338,16 @@ static int stats_action(void)
 			"        loader set. Run --stats from the binary image that pinned the\n"
 			"        policy, or from one authorised with --authorize-loader at pin\n"
 			"        time; ACTION_DENY_BPF_SELF in the audit stream confirms it.\n");
+		return 1;
+	}
+	if (any_acces_err) {
+		/* Not the self-protection gate: the pin directory is mode 700
+		 * and root-owned. Saying "--self-protect" here would send a
+		 * non-root operator after a feature that is not in play. */
+		fprintf(stderr,
+			"[stats] cannot open the pinned counter maps (permission denied on\n"
+			"        " PIN_ROOT "/maps, which is root-owned mode 700).\n"
+			"        Re-run as root.\n");
 		return 1;
 	}
 	if (all_missing) {
