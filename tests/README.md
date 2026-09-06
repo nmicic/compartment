@@ -34,10 +34,10 @@ sudo make test-root            # the root-only suites
 reports:
 
 ```
-  Suites run:     5
+  Suites run:     9
   Suites failed:  0
   Suites skipped: 1
-  Assertions:     pass=116 fail=0 skip=2 (reported by 5/5 suites)
+  Assertions:     pass=320 fail=0 skip=2 (reported by 9/9 suites)
 ```
 
 Those numbers move as suites are added — read them from a run rather than
@@ -52,11 +52,22 @@ filter).
 |-------|--------|---------------|
 | **Filesystem/seccomp/env matrix** | `run_compartment_user_matrix.sh` | Landlock (ro/rw), seccomp deny-list, env sanitization, profiles, dry-run, verify, FD inheritance, and self-tests of the harness's own assertion helpers |
 | **Child inheritance** | `run_child_inheritance_tests.sh` | Sandbox restrictions survive fork/exec across 2 levels |
-| **Discovered rootless suites** | `rootless.d/*.sh` | Anything unprivileged; each script is its own suite (see below) |
-| **Discovered root suites** | `root.d/*.sh` | Root-only paths; run by `sudo make test-root` |
 | **Sandbox proxy/network** | `run_sandbox_proxy_matrix.sh` | sandbox.sh HARD/SOFT modes, network isolation, proxy bridge |
 | **External CLI smoke** | `run_claude_smoke.sh` | A third-party CLI under compartment-user; skipped when the CLI is missing or unauthenticated, or with `--no-external` |
+
+Discovered suites — every executable script in these two directories is run
+as its own suite, in glob order, with no runner edit:
+
+| Suite | Script | What it tests |
+|-------|--------|---------------|
+| **Discovery smoke** | `rootless.d/00-discovery-smoke.sh` | That discovery, the fixture root and the harness helpers work at all |
+| **Aux tools** | `rootless.d/aux-tools.sh` | `tools/syscall.py` profile generation and credential filtering; the `extra/` squid and tinyproxy helpers (ACL baseline, crontab handling, PID-file validation, file modes) |
+| **Core matrix extra** | `rootless.d/core-matrix-extra.sh` | x32-ABI bypass, exact-errno seccomp denials, W^X in both directions, parser limits, `--dry-run` self-consistency, `--verify`, env sanitization observed after exec, child `NoNewPrivs`/`Seccomp` state |
+| **Examples** | `rootless.d/examples.sh` | Every shipped `examples/*.conf` and `paranoid-ssh.sh`: profiles parse, advertised flags exist, host-key verification against a throwaway sshd, `--rw` grants no execute |
 | **Profile trust** | `rootless.d/profile-trust.sh` | Profile search order and file trust, transactional parsing, one-way switches, `$HOME` validation, `COMPARTMENT_SHELL_DIR`, audit-log hardening, environment deny-list, `--dump-profile` |
+| **sandbox.sh** | `rootless.d/sandbox.sh` | `sandbox.sh` HARD-mode shell intercept, dependency checks and `--verify`, driven through stubbed `unshare`/`ip`/`mount` so the path runs without a usable user namespace |
+| **Discovery smoke (root)** | `root.d/00-discovery-smoke.sh` | That the root runner refuses to run unprivileged and discovers `root.d/` |
+| **compartment-root** | `root.d/compartment-root.sh` | A real container: start-up, `/dev` nodes, default seccomp deny-list, privilege and capability drop, `/proc` and `/sys` masking, escape attempts, PID 1 reaper, netns, uid/gid maps, cgroup confinement, reporting |
 | **Profile trust (root)** | `root.d/profile-trust-root.sh` | compartment-root never reads `$HOME`; `/etc/compartment` ownership and mode checks; every `--profile` spelling; root audit directory |
 
 `compartment-root` used to have no automated coverage at all. It now has a
