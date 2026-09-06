@@ -249,10 +249,10 @@ it is written. The built-in profile uses `LD_*`, `DYLD_*`, `BASH_FUNC_*`,
 
 ### What the built-in profile does *not* strip
 
-Model-provider credentials — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`GEMINI_API_KEY` and the like — are **deliberately left in place**.
-compartment-user exists to run those agents; stripping the key the agent
-needs to start would make the tool useless for its main job.
+The `*_API_KEY` variables an agent authenticates its model provider with
+are **deliberately left in place**. compartment-user exists to run those
+agents; stripping the key the agent needs in order to start would make
+the tool useless for its main job.
 
 Cloud, VCS and database credentials (`AWS_*` keys,
 `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_CLIENT_SECRET`, `GITHUB_TOKEN`,
@@ -403,7 +403,7 @@ records off the host.
 One line per event, structured for grep:
 
 ```
-[2026-03-31 01:27:10] user=claude uid=1000 event=COMPARTMENT_START ppid_chain=1234->5678->1 cwd=/home/claude/project tty=/dev/pts/0 command=/bin/echo profile=ai-agent source=built-in landlock=1 seccomp=1 paths=14 blocked=43
+[2026-03-31 01:27:10] user=dev uid=1000 event=COMPARTMENT_START ppid_chain=1234->5678->1 cwd=/home/dev/project tty=/dev/pts/0 command=/bin/echo profile=ai-agent source=built-in landlock=1 seccomp=1 paths=14 blocked=43
 ```
 
 Fields: timestamp, user, uid, event type, PPID chain (who launched us),

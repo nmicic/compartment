@@ -143,11 +143,12 @@ static int apply_profile_ai_agent(Config *cfg)
      * LD_DEBUG, LD_PROFILE, LD_ORIGIN_PATH and whatever the loader grows
      * next, instead of naming three of them and missing the rest.
      *
-     * Deliberately NOT stripped: ANTHROPIC_API_KEY, OPENAI_API_KEY and
-     * other model-provider keys. compartment-user exists to run those
-     * agents; removing their credentials would make the tool useless for
-     * its main job. See the credential note in HOWTO.md — if an agent
-     * must not see a key, do not export it into the agent's environment. */
+     * Deliberately NOT stripped: the *_API_KEY variables an agent
+     * authenticates its model provider with. compartment-user exists to
+     * run those agents; removing the credential they need in order to
+     * start would make the tool useless for its main job. See the
+     * credential note in HOWTO.md — if an agent must not see a key, do
+     * not export it into the agent's environment. */
     const char *deny_env[] = {
         /* Dynamic linker and libc behaviour */
         "LD_*",                             /* whole ld.so family */

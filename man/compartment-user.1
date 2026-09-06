@@ -161,12 +161,11 @@ The built-in profile strips the loader, shell-startup, interpreter and
 git-helper families along with cloud, VCS and database credentials.
 It deliberately does
 .B not
-strip model-provider API keys such as
-.I ANTHROPIC_API_KEY
-or
-.IR OPENAI_API_KEY :
-removing the credential the sandboxed agent needs to start would defeat
-the tool's main purpose.
+strip the
+.I *_API_KEY
+variables an agent authenticates its model provider with: removing the
+credential the sandboxed agent needs in order to start would defeat the
+tool's main purpose.
 Environment sanitization removes what the sandboxed process should not
 have; it cannot protect a secret deliberately handed to it.
 .TP
