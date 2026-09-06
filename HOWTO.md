@@ -1048,7 +1048,9 @@ strict-launch policy, and the shipped auth-path profile uses plain
    profile already does for the account database, `sshd_config`, PAM and
    `ld.so.preload` — every path where the honest answer to "who may write
    this while the policy is loaded?" is "nobody". Prefer it wherever it
-   fits; the residual only applies to the seals that must name a writer.
+   fits: in the shipped profile the only `actor=` seal left is the audit
+   log directory, which has to stay writable by the wrapper, so that is the
+   whole blast radius of this residual there.
 2. **A directive that arms the `PR_SET_MM` denial on its own** — not in
    1.4.0. The hook exists and the gate is the missing half: there is no way
    today to switch it on without adopting the whole strict-launch
