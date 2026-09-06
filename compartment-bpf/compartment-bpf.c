@@ -4096,12 +4096,21 @@ static int check_pinned_seal_map_shapes(void)
 // across libbpf_num_possible_cpus(), and prints the result on stdout.
 // Exit 0 on success. Exit 2 with a stderr line if neither pin exists.
 // Exit 1 on real errors (open succeeded but read failed, etc.).
+//
+// Return -3 for a permission refusal specifically. With --self-protect in
+// force the caller gets EPERM on every one of the eighteen pins, and printing
+// eighteen identical lines with no explanation is the worst possible operator
+// experience for what is a one-sentence problem ("you are not the loader").
+// The caller prints the first error verbatim, suppresses the rest, and adds
+// the sentence.
 static int read_pinned_counter(const char *path, __u64 *out)
 {
 	int fd = bpf_obj_get(path);
 	if (fd < 0) {
 		if (errno == ENOENT)
 			return -2;
+		if (errno == EPERM || errno == EACCES)
+			return -3;
 		fprintf(stderr, "open pinned %s: %s\n", path, strerror(errno));
 		return -1;
 	}
@@ -4275,6 +4284,7 @@ static int stats_action(void)
 	const size_t n = sizeof(entries) / sizeof(entries[0]);
 	int all_missing = 1;
 	int any_io_err = 0;
+	int any_perm_err = 0;
 	char path[PATH_MAX];
 
 	for (size_t i = 0; i < n; i++) {
@@ -4289,8 +4299,26 @@ static int stats_action(void)
 			all_missing = 0;
 		if (entries[i].rc == -1)
 			any_io_err = 1;
+		if (entries[i].rc == -3) {
+			/* errno is still the one bpf_obj_get() set: nothing
+			 * between that return and here touches it. */
+			if (!any_perm_err)
+				fprintf(stderr, "open pinned %s: %s\n",
+					path, strerror(errno));
+			any_perm_err = 1;
+		}
 	}
 
+	if (any_perm_err) {
+		fprintf(stderr,
+			"[stats] the kernel refused this process an fd to the pinned counter\n"
+			"        maps. This normally means the running policy was pinned with\n"
+			"        --self-protect and this executable image is not in its authorised\n"
+			"        loader set. Run --stats from the binary image that pinned the\n"
+			"        policy, or from one authorised with --authorize-loader at pin\n"
+			"        time; ACTION_DENY_BPF_SELF in the audit stream confirms it.\n");
+		return 1;
+	}
 	if (all_missing) {
 		fprintf(stderr, "[stats] no pinned counters found\n");
 		return 2;

@@ -20,7 +20,9 @@
 #   W1  a byte-identical copy at a different inode CANNOT --unpin, and the
 #       failure names --self-protect, the authorised set and the reboot escape
 #   W2  ...and the policy is still fully enforced after that failed attempt
-#   W3  --stats from the unauthorised copy fails too (no telemetry side door)
+#   W3  --stats from the unauthorised copy fails too (no telemetry side door),
+#       once, with an explanation an operator can act on, and never with
+#       "no pinned counters found" — that would read as "no policy pinned"
 #   W4  the pinning image CAN --unpin (flow a)
 #   W5  a successor pre-authorised with --authorize-loader CAN --unpin (flow b)
 #   W6  --authorize-loader refuses a group/world-writable successor
@@ -89,12 +91,23 @@ if { echo tampered > "$TARGET"; } 2>/dev/null; then
 	bypass_fail "W2: the seal stopped being enforced after the refused unpin"
 fi
 
-# W3
-w3=$("$NEXT" --stats 2>&1 | head -1)
+# W3. Two halves: the refusal itself, and that it is legible. With the flag on,
+# every one of the eighteen counter pins refuses, and eighteen bare errno lines
+# with no explanation would be the worst possible answer to a one-sentence
+# problem.
+w3all=$("$NEXT" --stats 2>&1)
+w3=$(printf '%s\n' "$w3all" | head -1)
 case "$w3" in
 	*"Permission denied"*|*"Operation not permitted"*) : ;;
 	*) bypass_fail "W3: --stats from the unauthorised image was not refused ($w3)" ;;
 esac
+printf '%s\n' "$w3all" | grep -q 'authorised loader set' \
+	|| bypass_fail "W3: --stats refusal does not say why or what to do: $(printf '%s' "$w3all" | tr '\n' ' ' | cut -c1-200)"
+printf '%s\n' "$w3all" | grep -q 'no pinned counters found' \
+	&& bypass_fail "W3: --stats reported 'no pinned counters found' for a refusal — indistinguishable from 'no policy is pinned'"
+n_open=$(printf '%s\n' "$w3all" | grep -c '^open pinned ')
+[ "$n_open" -le 1 ] \
+	|| bypass_fail "W3: --stats printed $n_open bare errno lines for one refusal; expected one plus the explanation"
 
 # W4
 sp_unpin "$SP_OWNER" "$TMP/w4.log" \
