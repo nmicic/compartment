@@ -8,6 +8,10 @@ tests/probes/deny_probe
 *.d
 *.a
 *.so
+# ...but not the rootless test suites: "*.d" above matches the directory
+# name tests/scripts/rootless.d, and git will not descend into an excluded
+# directory, so the directory itself has to be re-included.
+!tests/scripts/rootless.d/
 
 # Generated headers (config.py output)
 config.h
