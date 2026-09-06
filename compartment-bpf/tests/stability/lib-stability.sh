@@ -38,6 +38,136 @@ stab_pass() { stab_log "PASS: $*"; STAB_PASS=$((STAB_PASS+1)); }
 stab_fail() { stab_log "FAIL: $*"; STAB_FAIL=$((STAB_FAIL+1)); }
 stab_skip() { stab_log "SKIP: $*"; STAB_SKIP=$((STAB_SKIP+1)); }
 
+# --- profile rendering ------------------------------------------------------
+#
+# The shipped profiles are TEMPLATES: they carry @STAB_ACTOR@ / @STAB_ACTOR_B@
+# where an actor binary path belongs. They used to hard-code /usr/bin/true and
+# /usr/bin/false, which are symlinks on any distro shipping uutils coreutils
+# (Ubuntu 26.04). The loader refuses a symlink leaf, so every seal in the
+# profile failed to resolve, --pin exited 1, and the churn loop became a
+# silent no-op that still reported PASS. See tests/lib-realbin.sh.
+
+. "$REPO/tests/lib-realbin.sh"
+# pinlock_*(): Loop B runs tests/mesh/run-mesh.sh, whose ME-10 phase pins a
+# daemon and reads its counter maps back. Loop A must not --unpin underneath
+# it (and must not pin over it). See tests/lib-pinlock.sh.
+. "$REPO/tests/lib-pinlock.sh"
+
+# stab_profile <template.conf>
+#   Render <template.conf> into $STAB_DIR with the @STAB_ACTOR@ /
+#   @STAB_ACTOR_B@ placeholders replaced by real regular-file ELF paths.
+#   Echoes the rendered path. If no fixture can be produced the template is
+#   echoed unchanged so the caller's own preflight reports the failure
+#   loudly rather than this helper swallowing it.
+stab_profile() {
+	_sp_tpl=$1
+	[ -r "$_sp_tpl" ] || { printf '%s\n' "$_sp_tpl"; return 1; }
+	if ! grep -q '@STAB_ACTOR' "$_sp_tpl" 2>/dev/null; then
+		printf '%s\n' "$_sp_tpl"
+		return 0
+	fi
+	_sp_a=$(realbin_noop 2>/dev/null) || _sp_a=""
+	_sp_b=$(realbin_false 2>/dev/null) || _sp_b=""
+	if [ -z "$_sp_a" ] || [ -z "$_sp_b" ]; then
+		stab_log "stab_profile: no real ELF fixture available (no compiler and no non-symlink candidate); leaving $_sp_tpl unrendered"
+		printf '%s\n' "$_sp_tpl"
+		return 1
+	fi
+	mkdir -p "$STAB_DIR" 2>/dev/null || true
+	_sp_out="$STAB_DIR/$(basename "$_sp_tpl" .conf).rendered.conf"
+	sed -e "s#@STAB_ACTOR_B@#$_sp_b#g" -e "s#@STAB_ACTOR@#$_sp_a#g" \
+		"$_sp_tpl" > "$_sp_out" || { printf '%s\n' "$_sp_tpl"; return 1; }
+	printf '%s\n' "$_sp_out"
+}
+
+# --- pin lifecycle ----------------------------------------------------------
+
+STAB_PIN_ROOT="${STAB_PIN_ROOT:-/sys/fs/bpf/compartment}"
+
+# stab_count_pins [subdir]
+#   Number of pinned BPF objects (files; the links/ and maps/ directories
+#   themselves are preserved by --unpin by design) under PIN_ROOT, or under
+#   PIN_ROOT/<subdir> when given. Always echoes an integer.
+stab_count_pins() {
+	_sc_dir="$STAB_PIN_ROOT"
+	[ -n "${1:-}" ] && _sc_dir="$STAB_PIN_ROOT/$1"
+	if [ ! -d "$_sc_dir" ]; then
+		echo 0
+		return 0
+	fi
+	find "$_sc_dir" -mindepth 1 ! -type d 2>/dev/null | wc -l | tr -d ' '
+}
+
+# stab_pin_once <daemon> <profile> <logfile> [deadline-deciseconds]
+#   Drive exactly one --pin the way the loader actually behaves.
+#
+#   `compartment-bpf --pin` does NOT daemonise, fork or detach, and there is
+#   no --daemonize / --background flag (see usage() in compartment-bpf.c):
+#   it parses, loads, attaches, writes the pins under PIN_ROOT, prints
+#   "[run] compartment-bpf live. ^C to exit." and then blocks in the ringbuf
+#   poll loop until signalled. The pins outlive the process — that is the
+#   whole point of --pin — so the correct drive sequence is
+#   start -> wait for the pins to appear -> signal -> reap.
+#
+#   The previous harness backgrounded --pin and then polled `kill -0` waiting
+#   for it to EXIT, which it never does; the 5 s budget expired at cycle 0 of
+#   64 and the run failed with LOOP_A_HANG_PIN on a completely healthy box.
+#
+#   Exit status:
+#     0  pin landed (STAB_PIN_LINKS = observed link-pin count, always >0)
+#     1  pin refused / failed (loader exited without creating pins)
+#     2  genuine hang: neither pins nor exit inside the deadline
+stab_pin_once() {
+	_sp_daemon=$1
+	_sp_prof=$2
+	_sp_log=$3
+	_sp_deadline=${4:-100}
+
+	STAB_PIN_LINKS=0
+	"$_sp_daemon" --pin "$_sp_prof" >>"$_sp_log" 2>&1 &
+	_sp_pid=$!
+
+	_sp_w=0
+	while :; do
+		STAB_PIN_LINKS=$(stab_count_pins links)
+		if [ "${STAB_PIN_LINKS:-0}" -gt 0 ] &&
+		   grep -q '\[run\] compartment-bpf live' "$_sp_log" 2>/dev/null; then
+			break
+		fi
+		if ! kill -0 "$_sp_pid" 2>/dev/null; then
+			wait "$_sp_pid" 2>/dev/null
+			_sp_rc=$?
+			STAB_PIN_LINKS=$(stab_count_pins links)
+			if [ "${STAB_PIN_LINKS:-0}" -gt 0 ]; then
+				return 0
+			fi
+			echo "stab_pin_once: loader exited rc=$_sp_rc with 0 link pins" >>"$_sp_log"
+			return 1
+		fi
+		_sp_w=$((_sp_w + 1))
+		if [ "$_sp_w" -gt "$_sp_deadline" ]; then
+			stab_capture_stack "$_sp_pid"
+			echo "stab_pin_once: no pins and no exit after ${_sp_deadline}00ms" >>"$_sp_log"
+			kill -KILL "$_sp_pid" 2>/dev/null || true
+			wait "$_sp_pid" 2>/dev/null || true
+			return 2
+		fi
+		sleep 0.1
+	done
+
+	# Pins are on bpffs now and survive loader exit; hand the process the
+	# ^C the banner asks for and reap it.
+	kill -TERM "$_sp_pid" 2>/dev/null || true
+	_sp_w=0
+	while kill -0 "$_sp_pid" 2>/dev/null && [ "$_sp_w" -lt 50 ]; do
+		sleep 0.1
+		_sp_w=$((_sp_w + 1))
+	done
+	kill -KILL "$_sp_pid" 2>/dev/null || true
+	wait "$_sp_pid" 2>/dev/null || true
+	return 0
+}
+
 # Capture a baseline snapshot for delta comparisons after the run.
 # Records: dmesg tail line count, taint value, BPF prog/map counts, RSS of
 # compartment-bpf daemon (if running), MemAvailable, bpf_* slab totals.

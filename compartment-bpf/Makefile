@@ -490,11 +490,15 @@ check-deny-candidate: compartment-bpf
 # The harness also accepts STAB_CYCLES=N for ad-hoc cadences; both
 # targets exist as named entry points so CI / operator scripts don't
 # need to know the env-var spelling.
-check-stability:
+# The harness's Loop B drives tests/mesh/run-mesh.sh, which needs the daemon,
+# the test tools and the 8 mesh stubs. Without these prerequisites every mesh
+# iteration exited 2 ("missing stub") in milliseconds and the churn run spun
+# hundreds of empty iterations before reporting an unrelated SKIP.
+check-stability: compartment-bpf test-tools mesh-stubs
 	@echo "Running stability test ($${STAB_CYCLES:-1024} cycles; requires root)..."
 	sudo STAB_CYCLES=$${STAB_CYCLES:-1024} bash tests/stability/pin-unpin-churn.sh
 
-check-stability-quick:
+check-stability-quick: compartment-bpf test-tools mesh-stubs
 	@echo "Running quick stability test (64 cycles; requires root)..."
 	sudo STAB_CYCLES=64 bash tests/stability/pin-unpin-churn.sh
 
