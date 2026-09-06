@@ -389,27 +389,62 @@ run "${CU}" --no-landlock --no-seccomp --audit-log "${WORK}/audit-loose" -- /bin
 want_rc_nonzero "M7: world-writable audit directory refused"
 want_out "M7: message names the problem" "not a private, self-owned directory"
 
-# Default directory is under the XDG state dir, not /var/tmp.
-STATE="${WORK}/state"
-run env XDG_STATE_HOME="${STATE}" "${CU}" --verbose --no-landlock --no-seccomp \
-    --audit -- /bin/true
-want_out "M7: default audit directory follows XDG_STATE_HOME" "${STATE}/compartment"
-want_no_out "M7: default audit directory is not under /var/tmp" "/var/tmp/compartment-audit"
-
-# A newline in the command must not forge a record.
-NLCMD="${WORK}/ok
-FORGED user=root uid=0 event=NOTHING"
-: > "${NLCMD}"
-env XDG_STATE_HOME="${STATE}" "${CU}" --no-landlock --no-seccomp --audit \
-    -- "${NLCMD}" >/dev/null 2>&1
-LOGF="$(ls "${STATE}/compartment/"*.log 2>/dev/null | head -1)"
-if [ -z "${LOGF}" ]; then
-    fail "M7: audit log file was not created"
-elif [ "$(grep -c 'event=' "${LOGF}")" -eq "$(wc -l < "${LOGF}")" ] &&
-     ! grep -q '^FORGED' "${LOGF}"; then
-    pass "M7: newline in the command cannot forge a log record"
+# The default must be somewhere the sandboxed process cannot reach. It
+# used to be /var/tmp/compartment-audit-$UID (world-writable parent, no
+# ownership check); an intermediate revision of this branch moved it under
+# $HOME, which the built-in ai-agent profile grants rwx.
+AUD="/var/tmp/compartment-audit-$(id -u)"
+if [ -e "${AUD}" ]; then
+    skip "M7: default audit directory tests (${AUD} already exists)"
 else
-    fail "M7: forged record in the audit log ($(cat "${LOGF}"))"
+    OUT="$("${CU}" --verbose --no-landlock --no-seccomp --audit -- /bin/true 2>&1 \
+           | grep 'audit log:')"
+    RC=0
+    want_out "M7: default audit directory is ${AUD}" "${AUD}/"
+    want_no_out "M7: default audit directory is not under \$HOME" "${HOME}/"
+
+    if [ -d "${AUD}" ] && [ "$(stat -c %a "${AUD}")" = "700" ]; then
+        pass "M7: default audit directory is created 0700"
+    else
+        fail "M7: default audit directory is mode $(stat -c %a "${AUD}" 2>/dev/null)"
+    fi
+
+    # A newline in the command must not forge a record.
+    NLCMD="${WORK}/ok
+FORGED user=root uid=0 event=NOTHING"
+    : > "${NLCMD}"
+    "${CU}" --no-landlock --no-seccomp --audit -- "${NLCMD}" >/dev/null 2>&1
+    LOGF="$(ls "${AUD}/"*.log 2>/dev/null | head -1)"
+    if [ -z "${LOGF}" ]; then
+        fail "M7: audit log file was not created"
+    elif [ "$(grep -c 'event=' "${LOGF}")" -eq "$(wc -l < "${LOGF}")" ] &&
+         ! grep -q '^FORGED' "${LOGF}"; then
+        pass "M7: newline in the command cannot forge a log record"
+    else
+        fail "M7: forged record in the audit log ($(cat "${LOGF}"))"
+    fi
+
+    # The whole point of the location: the confined process must not be
+    # able to rewrite its own trail. /var/tmp is in no built-in path rule,
+    # so neither write nor read succeeds.
+    DAYLOG="$(basename "${LOGF:-$(date +%F).log}")"
+    run "${CU}" --audit -- /bin/sh -c ": > '${AUD}/${DAYLOG}'"
+    want_rc_nonzero "M7: sandboxed child cannot write the audit log"
+    want_out "M7: the write is denied by Landlock" "Permission denied"
+
+    run "${CU}" --audit -- /bin/sh -c "head -c 1 '${AUD}/${DAYLOG}'"
+    want_out "M7: sandboxed child cannot read the audit log" "Permission denied"
+
+    # A directory left behind by someone else under sticky /var/tmp must
+    # be fatal, not something we quietly append to.
+    rm -rf "${AUD}"
+    install -d -m 0755 "${AUD}"
+    run "${CU}" --no-landlock --no-seccomp --audit -- /bin/true
+    want_rc_nonzero "M7: a default audit directory with the wrong mode is fatal"
+    want_out "M7: the refusal names the path" "${AUD}"
+    want_out "M7: the refusal names the expected mode" "mode 0700"
+
+    rm -rf "${AUD}"
 fi
 
 echo ""

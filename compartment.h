@@ -1344,58 +1344,111 @@ static inline void audit_log(Config *cfg, const char *event, const char *detail)
 
 /* ── Audit log file (must be opened BEFORE Landlock — fd survives) ── */
 
-/* Create dir and any missing parent. Intermediates get 0755, the leaf the
- * requested mode. */
-static inline int mkdir_parents(const char *dir, mode_t mode)
-{
-    char tmp[PATH_MAX];
-    size_t n = strlen(dir);
-    if (n == 0 || n >= sizeof(tmp)) { errno = ENAMETOOLONG; return -1; }
-    memcpy(tmp, dir, n + 1);
-    while (n > 1 && tmp[n-1] == '/') tmp[--n] = '\0';
+/* ── Audit log directory ─────────────────────────────────────────── */
 
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p != '/') continue;
-        *p = '\0';
-        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
-        *p = '/';
-    }
-    if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
-    return 0;
+/* Where the default log goes matters as much as how it is opened: the
+ * built-in ai-agent profile grants the sandboxed process read, write and
+ * execute on $HOME, so an audit trail under $HOME (or under
+ * $XDG_STATE_HOME, which normally is $HOME) is one the confined process
+ * can rewrite. Neither of the defaults below is inside any path the
+ * built-in profiles grant for writing.
+ *
+ * An administrator can provision a per-user directory that is outside the
+ * ruleset entirely:
+ *
+ *     install -d -m 0755 -o root -g root /var/lib/compartment/audit
+ *     install -d -m 0700 -o alice        /var/lib/compartment/audit/1000
+ */
+#define AUDIT_VARLIB_PARENT "/var/lib/compartment/audit"
+
+/* The per-uid directory is only trustworthy if nobody but root can
+ * replace it, which means the parent must be root-owned and not group- or
+ * world-writable. A parent that simply does not exist is not an error —
+ * the feature is opt-in. */
+static inline int audit_varlib_parent_ok(void)
+{
+    int pfd = open(AUDIT_VARLIB_PARENT,
+                   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (pfd < 0)
+        return 0;                       /* not provisioned; stay quiet */
+
+    struct stat st;
+    int ok = (fstat(pfd, &st) == 0 && st.st_uid == 0 &&
+              !(st.st_mode & (S_IWGRP | S_IWOTH)));
+    close(pfd);
+    if (!ok)
+        fprintf(stderr, "compartment: %s must be root-owned and not group- "
+                "or world-writable — ignoring it\n", AUDIT_VARLIB_PARENT);
+    return ok;
 }
 
-/* Default audit directory. $XDG_STATE_HOME/compartment (or
- * ~/.local/state/compartment) for an ordinary user, /var/log/compartment
- * for root. The old default lived under world-writable /var/tmp. */
+/* Choose the default audit directory. No side effects: nothing is created
+ * and nothing is opened, so --dry-run can report the same answer a real
+ * run would use. */
 static inline int audit_default_dir(char *dir, size_t dirsz)
 {
+    int n;
+
     if (geteuid() == 0) {
-        int n = snprintf(dir, dirsz, "/var/log/compartment");
+        n = snprintf(dir, dirsz, "/var/log/compartment");
         return (n > 0 && (size_t)n < dirsz) ? 0 : -1;
     }
-    const char *xdg = getenv("XDG_STATE_HOME");
-    const char *why = NULL;
-    const char *home = home_dir_usable(getenv("HOME"), &why);
-    int n;
-    if (xdg && xdg[0] == '/')
-        n = snprintf(dir, dirsz, "%s/compartment", xdg);
-    else if (home)
-        n = snprintf(dir, dirsz, "%s/.local/state/compartment", home);
-    else {
-        fprintf(stderr, "compartment: no usable audit log directory "
-                "($XDG_STATE_HOME unset and $HOME %s) — use --audit-log DIR\n",
-                why ? why : "unusable");
+
+    uid_t uid = getuid();
+
+    if (audit_varlib_parent_ok()) {
+        n = snprintf(dir, dirsz, AUDIT_VARLIB_PARENT "/%u", (unsigned)uid);
+        if (n > 0 && (size_t)n < dirsz) {
+            struct stat st;
+            if (lstat(dir, &st) == 0 && S_ISDIR(st.st_mode) &&
+                st.st_uid == uid && (st.st_mode & 07777) == 0700)
+                return 0;
+        }
+    }
+
+    n = snprintf(dir, dirsz, "/var/tmp/compartment-audit-%u", (unsigned)uid);
+    return (n > 0 && (size_t)n < dirsz) ? 0 : -1;
+}
+
+/* Open a directory that must be exactly ours: a real directory rather
+ * than a symlink, owned by want_uid, mode 0700 and nothing looser.
+ * /var/tmp is sticky and world-writable, so another user can create
+ * compartment-audit-<uid> before we do; that has to be fatal, not a
+ * directory we quietly append to. */
+static inline int audit_open_private_dir(const char *path, uid_t want_uid)
+{
+    int dfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dfd < 0) {
+        fprintf(stderr, "compartment: audit dir %s: %s\n",
+                path, strerror(errno));
         return -1;
     }
-    return (n > 0 && (size_t)n < dirsz) ? 0 : -1;
+    struct stat st;
+    if (fstat(dfd, &st) != 0) {
+        fprintf(stderr, "compartment: audit dir %s: %s\n",
+                path, strerror(errno));
+        close(dfd);
+        return -1;
+    }
+    if (st.st_uid != want_uid || (st.st_mode & 07777) != 0700) {
+        fprintf(stderr, "compartment: audit dir %s is uid %u mode %04o — "
+                "expected uid %u mode 0700\n", path, (unsigned)st.st_uid,
+                (unsigned)(st.st_mode & 07777), (unsigned)want_uid);
+        close(dfd);
+        return -1;
+    }
+    return dfd;
 }
 
 static inline int audit_log_open(Config *cfg)
 {
     char dir[PATH_MAX - 32];  /* leave room for /YYYY-MM-DD.log */
-    int explicit_dir = cfg->audit_log_dir != NULL;
+    int dfd;
 
-    if (explicit_dir) {
+    if (cfg->audit_log_dir) {
+        /* Operator's choice: created if missing, then checked for owner
+         * and write bits. Note that an operator-chosen directory inside a
+         * granted rw/rwx path IS reachable by the sandboxed process. */
         int n = snprintf(dir, sizeof(dir), "%s", cfg->audit_log_dir);
         if (n < 0 || (size_t)n >= sizeof(dir)) {
             fprintf(stderr, "compartment: audit log dir path too long\n");
@@ -1405,39 +1458,53 @@ static inline int audit_log_open(Config *cfg)
             fprintf(stderr, "compartment: mkdir %s: %s\n", dir, strerror(errno));
             return -1;
         }
-    } else {
-        if (audit_default_dir(dir, sizeof(dir)) != 0)
+        /* Validate the directory on its own fd, then create the day file
+         * relative to it. O_NOFOLLOW on the final component alone left
+         * the directory component followable: a symlink at the audit path
+         * redirected every record somewhere else. */
+        dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (dfd < 0) {
+            fprintf(stderr, "compartment: audit dir %s: %s\n",
+                    dir, strerror(errno));
             return -1;
-        if (mkdir_parents(dir, 0700) != 0) {
+        }
+        struct stat st;
+        if (fstat(dfd, &st) != 0) {
+            fprintf(stderr, "compartment: audit dir %s: %s\n",
+                    dir, strerror(errno));
+            close(dfd);
+            return -1;
+        }
+        mode_t bad = st.st_mode & (S_IWGRP | S_IWOTH);
+        if ((bad & S_IWGRP) && group_is_private(st.st_uid, st.st_gid))
+            bad &= (mode_t)~S_IWGRP;
+        if (st.st_uid != geteuid() || bad) {
+            fprintf(stderr, "compartment: audit dir %s is not a private, "
+                    "self-owned directory (uid %u, mode %04o)\n",
+                    dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777));
+            close(dfd);
+            return -1;
+        }
+    } else {
+        if (audit_default_dir(dir, sizeof(dir)) != 0) {
+            fprintf(stderr, "compartment: cannot determine an audit log "
+                    "directory — use --audit-log DIR\n");
+            return -1;
+        }
+        /* The admin-provisioned directory is never created here; the two
+         * fallbacks are, mode 0700 (umask cannot widen that). */
+        if (strncmp(dir, AUDIT_VARLIB_PARENT "/",
+                    sizeof(AUDIT_VARLIB_PARENT)) != 0 &&
+            mkdir(dir, 0700) != 0 && errno != EEXIST) {
             fprintf(stderr, "compartment: mkdir %s: %s\n", dir, strerror(errno));
             return -1;
         }
-    }
-
-    /* Validate the directory on its own fd, then create the day file
-     * relative to it. O_NOFOLLOW on the final component alone left the
-     * directory component followable: a symlink at the audit path
-     * redirected every record somewhere else. */
-    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (dfd < 0) {
-        fprintf(stderr, "compartment: audit dir %s: %s\n", dir, strerror(errno));
-        return -1;
-    }
-    struct stat st;
-    if (fstat(dfd, &st) != 0) {
-        fprintf(stderr, "compartment: audit dir %s: %s\n", dir, strerror(errno));
-        close(dfd);
-        return -1;
-    }
-    mode_t bad = st.st_mode & (S_IWGRP | S_IWOTH);
-    if ((bad & S_IWGRP) && group_is_private(st.st_uid, st.st_gid))
-        bad &= (mode_t)~S_IWGRP;
-    if (st.st_uid != geteuid() || bad) {
-        fprintf(stderr, "compartment: audit dir %s is not a private, "
-                "self-owned directory (uid %u, mode %04o)\n",
-                dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777));
-        close(dfd);
-        return -1;
+        dfd = audit_open_private_dir(dir, getuid());
+        if (dfd < 0) {
+            fprintf(stderr, "compartment: refusing to write the audit log "
+                    "to %s\n", dir);
+            return -1;
+        }
     }
 
     time_t now = time(NULL);

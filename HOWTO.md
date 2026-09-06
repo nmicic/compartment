@@ -155,7 +155,7 @@ env-sanitize on
 
 # Audit logging
 audit on
-audit-log $HOME/.local/state/compartment
+audit-log /srv/audit/compartment
 
 # Working directory
 # workdir $HOME/projects
@@ -211,7 +211,7 @@ Used by **both** tools:
 | `no-new-privs` | `on` only | `no-new-privs on` |
 | `env-sanitize` | `on` only | `env-sanitize on` |
 | `audit` | on/off | `audit on` |
-| `audit-log` | directory path | `audit-log /srv/audit/compartment` |
+| `audit-log` | directory path (outside every granted path) | `audit-log /srv/audit/compartment` |
 | `inherit` | profile name | `inherit ai-agent` |
 
 Used by **compartment-root** only:
@@ -332,7 +332,7 @@ compartment-user logs events to stderr and to daily log files.
 ### Enable
 
 ```bash
-# Stderr + default log dir (~/.local/state/compartment/)
+# Stderr + default log dir (see "Log Location" below)
 ./compartment-user --audit -- claude
 
 # Stderr + custom log dir
@@ -345,23 +345,51 @@ audit-log /srv/audit/compartment
 
 ### Log Location
 
-Default: `$XDG_STATE_HOME/compartment/YYYY-MM-DD.log`, or
-`~/.local/state/compartment/YYYY-MM-DD.log` when `$XDG_STATE_HOME` is
-unset. compartment-root running as root uses `/var/log/compartment/`.
-Either directory is created mode 0700.
+The default must be somewhere the sandboxed process cannot rewrite, so
+it is deliberately **not** under `$HOME`: the built-in `ai-agent` profile
+grants the confined process read, write *and* execute there.
 
-The directory must be owned by the effective uid and must not be group-
-or world-writable. It is opened with `O_DIRECTORY|O_NOFOLLOW` and the
-daily file is created relative to that descriptor with `O_NOFOLLOW`, so
-neither the directory nor the file may be a symlink someone else
-controls. Every field written to a record has control characters
-replaced with `_`, so a command path containing a newline cannot forge a
-log line. If auditing was requested and cannot be set up safely,
-compartment-user and compartment-root refuse to run.
+Without `--audit-log`, the directory is chosen in this order:
 
-Earlier releases defaulted to `/var/tmp/compartment-audit-$UID/`. That
-directory sits in a world-writable tree and the old code followed a
-symlink planted at that path.
+1. **`/var/lib/compartment/audit/<uid>/`** — used only if an
+   administrator provisioned it. The parent must be root-owned and not
+   group- or world-writable, and the per-uid directory must be a real
+   directory owned by your real uid with mode `0700`:
+
+   ```bash
+   sudo install -d -m 0755 -o root -g root /var/lib/compartment/audit
+   sudo install -d -m 0700 -o "$USER" "/var/lib/compartment/audit/$(id -u)"
+   ```
+
+   If the parent is writable by anyone but root, compartment-user says so
+   and moves on to step 2 rather than trusting it.
+
+2. **`/var/tmp/compartment-audit-<uid>/`** — created mode `0700`.
+   `/var/tmp` is sticky and world-writable, so another user can create
+   that name first. If the directory is found with a different owner or
+   any mode other than `0700`, compartment-user **refuses to run** rather
+   than appending to it:
+
+   ```
+   compartment: audit dir /var/tmp/compartment-audit-1000 is uid 1 mode 0777
+   — expected uid 1000 mode 0700
+   compartment: refusing to write the audit log to /var/tmp/compartment-audit-1000
+   ```
+
+3. **`/var/log/compartment/`** when running as root, created mode `0700`.
+
+Whichever directory is used, it must be owned by the effective uid and
+must not be group- or world-writable. It is opened with
+`O_DIRECTORY` + `O_NOFOLLOW` and the daily file is created relative to
+that descriptor with `O_NOFOLLOW`, so neither the directory nor the file
+may be a symlink someone else controls. Every field written to a record
+has control characters replaced with `_`, so a command path containing a
+newline cannot forge a log line. If auditing was requested and cannot be
+set up safely, compartment-user and compartment-root refuse to run.
+
+Release 1.3.3 defaulted to `/var/tmp/compartment-audit-$UID/` with no
+ownership or mode check at all, and followed a symlink planted at that
+path.
 
 The log file is opened **before** Landlock is applied. The file descriptor
 has `O_CLOEXEC`, so it does not leak to the exec'd child. This gives us:
@@ -377,20 +405,28 @@ has `O_CLOEXEC`, so it does not leak to the exec'd child. This gives us:
 The fd is closed across the exec, so the child cannot write to the open
 log file.
 
-**It does not follow that the child cannot reach the directory.** Landlock
-is additive and only restricts the rights named in its handled mask:
+Neither default is inside a path the built-in profiles grant for writing,
+so the confined process cannot rewrite or delete its own trail. Verified:
 
-* if the audit directory lies inside a path the profile grants (and the
-  default `~/.local/state/compartment` lies inside the `rwx $HOME` rule
-  the built-in `ai-agent` profile installs), the child can open, read and
-  rewrite yesterday's log;
-* even outside every rule, the handled mask carries no metadata-read
-  right, so `stat()` and `access()` on the directory still succeed.
+```
+$ compartment-user --audit -- /bin/sh -c ': > /var/tmp/compartment-audit-1000/2026-09-06.log'
+/bin/sh: 1: cannot create …/2026-09-06.log: Permission denied
+```
 
-For tamper-evident logging, point `--audit-log` at a directory outside
-every granted path — ideally one the sandboxed user cannot write at all,
-such as a root-owned directory with `compartment-root` — or ship the
-records off the host.
+Two caveats, both about *reading* rather than writing:
+
+* `/var/lib` is granted `ro` by the built-in `ai-agent` profile (dpkg,
+  apt, node modules live there), so a log under
+  `/var/lib/compartment/audit/` is **readable** from inside the sandbox.
+  `/var/tmp` is covered by no rule at all, so a log there is not.
+* the handled mask carries no metadata-read right, so `stat()` and
+  `access()` on any path still succeed regardless.
+
+**An operator-chosen `--audit-log` directory inside a granted `rw` or
+`rwx` path is fully reachable by the sandboxed process** — it can read
+the trail and rewrite it. `--audit-log /tmp/x`, for instance, sits inside
+the `ai-agent` profile's `rw /tmp` rule. Pick a directory that no path
+rule covers, or ship the records off the host.
 
 ### File Permissions
 
@@ -415,7 +451,7 @@ No rotation logic needed — the date **is** the rotation. One file per day.
 Clean up old logs with cron:
 
 ```bash
-find "${XDG_STATE_HOME:-$HOME/.local/state}/compartment" -name '*.log' -mtime +30 -delete
+find "/var/tmp/compartment-audit-$(id -u)" -name '*.log' -mtime +30 -delete
 ```
 
 ---

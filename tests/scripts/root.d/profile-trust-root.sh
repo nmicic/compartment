@@ -60,13 +60,16 @@ VICTIM_GID="$(id -g "${VICTIM_UID}" 2>/dev/null || echo 65534)"
 WORK="$(mktemp -d)"
 CREATED_ETC=0
 CREATED_LOG=0
+CREATED_VARLIB=0
 [ -d /etc/compartment ] || CREATED_ETC=1
 [ -d /var/log/compartment ] || CREATED_LOG=1
+[ -d /var/lib/compartment ] || CREATED_VARLIB=1
 
 cleanup() {
     rm -f /etc/compartment/cptest-*.conf
     [ "${CREATED_ETC}" -eq 1 ] && rmdir /etc/compartment 2>/dev/null
     [ "${CREATED_LOG}" -eq 1 ] && rm -rf /var/log/compartment
+    [ "${CREATED_VARLIB}" -eq 1 ] && rm -rf /var/lib/compartment
     rm -rf "${WORK}"
     return 0
 }
@@ -198,6 +201,54 @@ if [ -d /var/log/compartment ]; then
     fi
 else
     fail "M7: /var/log/compartment was not created"
+fi
+
+echo ""
+
+# ── Admin-provisioned per-user audit directory ────────────────────────
+
+echo "--- Test group: /var/lib/compartment/audit (M7) ---"
+
+if [ "${CREATED_VARLIB}" -eq 0 ]; then
+    skip "/var/lib/compartment already exists — not touching it"
+elif [ -z "${SUDO_USER:-}" ] || ! command -v runuser >/dev/null 2>&1; then
+    skip "no SUDO_USER or runuser — cannot exercise the unprivileged path"
+else
+    U="${SUDO_USER}"
+    UID_N="$(id -u "${U}")"
+    VARLIB="/var/lib/compartment/audit/${UID_N}"
+    VARTMP="/var/tmp/compartment-audit-${UID_N}"
+    rm -rf "${VARTMP}"
+
+    install -d -m 0755 -o root -g root /var/lib/compartment /var/lib/compartment/audit
+    install -d -m 0700 -o "${U}" "${VARLIB}"
+
+    run runuser -u "${U}" -- "${CU}" --verbose --no-landlock --no-seccomp \
+        --audit -- /bin/true
+    want_out "M7: an admin-provisioned directory is preferred" "${VARLIB}/"
+
+    # A parent anyone but root can write is not a trust anchor.
+    chmod 0775 /var/lib/compartment/audit
+    run runuser -u "${U}" -- "${CU}" --verbose --no-landlock --no-seccomp \
+        --audit -- /bin/true
+    want_out "M7: a group-writable parent is reported" "must be root-owned"
+    want_out "M7: a group-writable parent falls back to /var/tmp" "${VARTMP}/"
+    chmod 0755 /var/lib/compartment/audit
+
+    # Wrong mode on the per-uid directory: fall back rather than use it.
+    chmod 0755 "${VARLIB}"
+    run runuser -u "${U}" -- "${CU}" --verbose --no-landlock --no-seccomp \
+        --audit -- /bin/true
+    want_out "M7: a per-uid directory that is not 0700 falls back" "${VARTMP}/"
+    chmod 0700 "${VARLIB}"
+
+    # Someone else squatting the /var/tmp fallback must be fatal.
+    rm -rf /var/lib/compartment/audit "${VARTMP}"
+    install -d -m 0777 -o daemon -g daemon "${VARTMP}"
+    run runuser -u "${U}" -- "${CU}" --no-landlock --no-seccomp --audit -- /bin/true
+    want_rc_nonzero "M7: a squatted /var/tmp audit directory is fatal"
+    want_out "M7: the squat refusal names the owner" "expected uid ${UID_N}"
+    rm -rf "${VARTMP}"
 fi
 
 echo ""

@@ -203,18 +203,68 @@ Log events to stderr and to a file.
 .TP
 .BI \-\-audit\-log " DIR"
 Set audit log directory (implies \fB\-\-audit\fR).
-Default: \fI$XDG_STATE_HOME/compartment\fR, or
-\fI~/.local/state/compartment\fR when
-.I $XDG_STATE_HOME
-is unset, created mode 0700.
 The directory must be owned by the effective uid and must not be group- or
 world-writable; it is opened with
-.B O_DIRECTORY|O_NOFOLLOW
+.B O_DIRECTORY
+and
+.B O_NOFOLLOW
 and the daily file is created relative to that descriptor, so neither the
 directory nor the file may be a symlink.
 If auditing was requested and cannot be set up safely,
 .B compartment-user
 refuses to run.
+.PP
+An operator-chosen directory that lies inside a granted
+.B rw
+or
+.B rwx
+path is reachable by the sandboxed process, which can then read and
+rewrite the trail. Choose one that no path rule covers.
+.PP
+Without
+.BR \-\-audit\-log ,
+the default is chosen in this order:
+.RS
+.IP 1. 4
+.IR /var/lib/compartment/audit/ UID ,
+if an administrator provisioned it. It is used only when the parent
+.I /var/lib/compartment/audit
+is owned by root and is not group- or world-writable, and the per-uid
+directory is a real directory owned by the caller's real uid with mode
+0700. Provision it with:
+.RS
+.nf
+
+install \-d \-m 0755 \-o root \-g root /var/lib/compartment/audit
+install \-d \-m 0700 \-o USER /var/lib/compartment/audit/UID
+
+.fi
+.RE
+.IP 2.
+.IR /var/tmp/compartment\-audit\- UID ,
+created mode 0700. Because
+.I /var/tmp
+is sticky and world-writable, another user can create that name first:
+if the directory is found with a different owner or a mode other than
+0700,
+.B compartment-user
+refuses to run rather than appending to it.
+.IP 3.
+.I /var/log/compartment
+when running as root, created mode 0700.
+.RE
+.PP
+Neither default is inside a path the built-in profiles grant for writing,
+so the sandboxed process cannot rewrite its own audit trail. Note that
+.I /var/lib
+is granted
+.B ro
+by the built-in
+.B ai-agent
+profile, so a log kept there is readable — though not writable or
+removable — from inside the sandbox;
+.I /var/tmp
+is covered by no rule at all and is therefore neither.
 .TP
 .B \-\-unsecure
 Allow execution when enforcement is degraded.
@@ -430,9 +480,12 @@ Per-user profile files.
 .I /etc/compartment/*.conf
 System-wide profile files.
 .TP
-.I ~/.local/state/compartment/
-Default audit log directory (one file per day). Overridden by
-.IR $XDG_STATE_HOME/compartment .
+.IR /var/lib/compartment/audit/ UID /
+Preferred audit log directory when an administrator has provisioned it
+(one file per day).
+.TP
+.IR /var/tmp/compartment\-audit\- UID /
+Fallback audit log directory.
 .SH REQUIREMENTS
 Linux >= 5.13 (Landlock). seccomp BPF requires >= 3.17.
 No external libraries.

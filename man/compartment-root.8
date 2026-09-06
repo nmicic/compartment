@@ -212,6 +212,8 @@ compartment-root reads no other location.
 .I /var/log/compartment/
 Default audit log directory when running as root (one file per day),
 created mode 0700.
+It must be owned by root and mode 0700; compartment-root refuses to run
+if auditing was requested and the directory cannot be used safely.
 .SH REQUIREMENTS
 Linux >= 4.6 (CLONE_NEWCGROUP). Requires root or equivalent capabilities.
 No external libraries (no libseccomp, no libcap).
