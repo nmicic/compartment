@@ -202,9 +202,9 @@ used to repeat them each quoted a different, wrong figure.
   exec'd process
 - **Sandbox.sh** (skipped without user namespaces): HARD/SOFT network
   modes, proxy bridge
-- **Claude CLI smoke**: `claude --version` + `claude --print` under full
-  sandbox, audit logging captures PPID chain, --dry-run policy display.
-  Skipped without the CLI, without its config directory, or with
+- **External CLI smoke** (`run_claude_smoke.sh`): a third-party CLI under
+  full sandbox, audit logging captures the PPID chain, --dry-run policy
+  display. Skipped when that CLI is missing or unauthenticated, or with
   `--no-external`
 
 Tests use `deny_probe`, a purpose-built binary with subcommands for each
