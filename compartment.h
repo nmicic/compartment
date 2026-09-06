@@ -1173,6 +1173,11 @@ static inline void profile_print_search_path(FILE *out, const char *name,
         fprintf(out, "  looked for the file: %s\n", name);
         return;
     }
+    size_t nl = strlen(name);
+    if (nl > 5 && strcmp(name + nl - 5, ".conf") == 0)
+        fprintf(out, "  '%s' has no '/', so it was treated as a profile name "
+                "and '.conf' was appended.\n  To load a file in the current "
+                "directory, write ./%s\n", name, name);
     fprintf(out, "  searched: /etc/compartment/%s.conf", name);
     if (flags & PROFILE_SEARCH_USER)
         fprintf(out, ", ~/.config/compartment/%s.conf", name);

@@ -186,21 +186,56 @@ same way and is equivalent to the built-in.
 
 ### Directives
 
+Used by **compartment-user**:
+
 | Directive | Value | Example |
 |-----------|-------|---------|
 | `ro` | path | `ro /usr` |
-| `rw` | path | `rw $HOME` |
-| `exec` | path | `exec /opt/bin` |
-| `block` | syscall name | `block ptrace` |
-| `env-deny` | variable name or `PREFIX*` | `env-deny LD_*` |
+| `rw` | path (read + write, no execute) | `rw /tmp` |
+| `rwx` | path (read + write + execute) | `rwx $HOME` |
+| `exec` | path (alias for `ro`) | `exec /opt/bin` |
+| `workdir` | path | `workdir $HOME/projects` |
 | `landlock` | `on` only | `landlock on` |
+
+Used by **both** tools:
+
+| Directive | Value | Example |
+|-----------|-------|---------|
+| `block` | syscall name | `block ptrace` |
+| `allow` | syscall name (switches to allow-list) | `allow read` |
+| `seccomp-mode` | `allow` or `deny` | `seccomp-mode allow` |
+| `env-deny` | variable name or `PREFIX*` | `env-deny LD_*` |
+| `env-allow` | variable name or `PREFIX*` (switches to allow-list) | `env-allow PATH` |
+| `env-mode` | `allow` or `deny` | `env-mode allow` |
 | `seccomp` | `on` only | `seccomp on` |
 | `no-new-privs` | `on` only | `no-new-privs on` |
 | `env-sanitize` | `on` only | `env-sanitize on` |
 | `audit` | on/off | `audit on` |
-| `audit-log` | directory path | `audit-log ~/.local/state/compartment` |
-| `workdir` | path | `workdir $HOME/projects` |
+| `audit-log` | directory path | `audit-log /srv/audit/compartment` |
 | `inherit` | profile name | `inherit ai-agent` |
+
+Used by **compartment-root** only:
+
+| Directive | Value | Example | CLI equivalent |
+|-----------|-------|---------|----------------|
+| `rootdir` | path | `rootdir /srv/jail` | `--rootdir` |
+| `uid` | number | `uid 1000` | `--uid` |
+| `gid` | number | `gid 1000` | `--gid` |
+| `username` | user name | `username svc` | `--username` |
+| `netns` | namespace name | `netns sandbox` | `--netns` |
+| `cgroup` | cgroup path | `cgroup /sys/fs/cgroup/svc` | `--cgroup` |
+| `cap-allow` | capability name | `cap-allow net_bind_service` | `--cap-allowed` |
+| `loopback` | on/off | `loopback on` | `--loopback` |
+| `mount-mask` | path | `mount-mask /proc/keys` | `--mount-mask` |
+
+Note the one name that differs between the two spellings: the profile
+directive is `cap-allow`, the command-line flag is `--cap-allowed`.
+Writing `cap-allowed` in a profile produces only an "unknown directive"
+warning and the capability is dropped.
+
+Each tool silently ignores the other's directives — they are recognised
+by the shared parser, so no "unknown directive" warning appears. Keep
+compartment-user and compartment-root policy in separate files.
 
 ### Environment name patterns
 
@@ -368,7 +403,7 @@ records off the host.
 One line per event, structured for grep:
 
 ```
-[2026-03-31 01:27:10] user=claude uid=1000 event=COMPARTMENT_START ppid_chain=1234->5678->1 cwd=/home/claude/project tty=/dev/pts/0 command=/bin/echo profile=ai-agent landlock=1 seccomp=1 paths=14 blocked=30
+[2026-03-31 01:27:10] user=claude uid=1000 event=COMPARTMENT_START ppid_chain=1234->5678->1 cwd=/home/claude/project tty=/dev/pts/0 command=/bin/echo profile=ai-agent source=built-in landlock=1 seccomp=1 paths=14 blocked=43
 ```
 
 Fields: timestamp, user, uid, event type, PPID chain (who launched us),

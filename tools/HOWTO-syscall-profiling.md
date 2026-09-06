@@ -17,7 +17,7 @@ python3 tools/syscall.py check --profile ai-agent -- ./my-program
 
 # 3. If not safe: generate a custom profile
 python3 tools/syscall.py profile -o my-program.conf -- ./my-program
-./compartment-user --profile my-program.conf -- ./my-program
+./compartment-user --profile ./my-program.conf -- ./my-program
 ```
 
 ## Two Modes: Deny vs Allow

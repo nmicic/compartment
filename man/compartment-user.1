@@ -11,24 +11,52 @@ compartment-user \- userspace process isolation with Landlock, seccomp, and envi
 applies kernel-enforced restrictions to a process before executing it.
 No root required. Zero dependencies.
 .PP
-Restrictions are applied in order and are all inherited by child processes:
-.IP 1. 4
+Three of the mechanisms are enforced by the kernel. Once set they are
+inherited across
+.BR fork (2)
+and
+.BR execve (2)
+and cannot be removed by the sandboxed process or any of its descendants:
+.IP \(bu 4
 .B PR_SET_NO_NEW_PRIVS
 \- prevents privilege escalation via setuid binaries.
-.IP 2.
+.IP \(bu
 .B Landlock
 \- filesystem path restrictions (read-only system paths, writable working directory).
-.IP 3.
+.IP \(bu
 .B seccomp BPF
 \- blocks dangerous syscalls (ptrace, mount, bpf, io_uring, etc.).
-.IP 4.
-.B Environment sanitization
-\- strips LD_PRELOAD, cloud credentials, SSH agent socket, etc.
-.IP 5.
-.B Audit logging
-\- file-per-day log with PPID chain and user identity.
 .PP
-All restrictions are irreversible \(em a sandboxed process cannot remove them.
+The rest is applied once, immediately before
+.BR execve (2),
+and is
+.B not
+a kernel restriction:
+.IP \(bu 4
+.B Environment sanitization
+\- strips LD_PRELOAD, cloud credentials, SSH agent socket, etc. from the
+environment handed to the command.
+A sandboxed process may re-export any of these variables for its own
+children, and the loader will honour them; nothing in the kernel prevents
+that.
+Durable environment policy needs
+.BR compartment-bpf .
+.IP \(bu
+.B Working directory
+and
+.B file-descriptor cleanup
+\- both are one-time actions, not ongoing restrictions.
+.IP \(bu
+.B Audit logging
+\- a record, not a restriction. File-per-day log with PPID chain and
+user identity.
+.PP
+The actual order at run time is: audit log opened, preflight check,
+.BR PR_SET_NO_NEW_PRIVS ,
+environment sanitization, Landlock, seccomp,
+.BR chdir (2),
+hardening,
+.BR execve (2).
 .SH OPTIONS
 .SS Profiles
 .TP
@@ -91,10 +119,34 @@ Disable Landlock filesystem restrictions.
 .TP
 .BI \-\-block " SYSCALL"
 Block a syscall by name or number. Repeatable.
+Up to 256 entries; the built-in
+.B ai-agent
+profile already uses 43 of them, and overflowing the limit is a fatal
+error rather than a silent truncation.
+.TP
+.BI \-\-allow " SYSCALL"
+Switch seccomp to allow-list mode and permit
+.IR SYSCALL .
+Everything not named by an
+.B \-\-allow
+flag or an
+.B allow
+profile directive returns
+.BR EPERM .
+Repeatable.
 .TP
 .B \-\-no\-seccomp
 Disable seccomp filtering.
 .SS Environment
+.TP
+.BI \-\-env\-allow " VAR"
+Switch environment handling to allow-list mode and keep
+.IR VAR .
+Everything not named by an
+.B \-\-env\-allow
+flag or an
+.B env-allow
+profile directive is removed. Repeatable.
 .TP
 .BI \-\-env\-deny " VAR"
 Strip an environment variable. Repeatable.
@@ -124,9 +176,28 @@ Do not strip dangerous environment variables.
 .TP
 .B \-\-dry\-run
 Show what restrictions would be applied without executing the command.
+Implies
+.BR \-\-verbose .
+.TP
+.BI \-\-dump\-profile " NAME"
+Resolve
+.I NAME
+the way a real run would and print the effective policy as
+.B .conf
+syntax on standard output, then exit.
+No command is needed.
+Use it to generate a profile file that is guaranteed to match what the
+binary enforces:
+.RS
+.nf
+
+compartment-user \-\-dump\-profile ai\-agent | sudo tee /etc/compartment/my\-agent.conf
+
+.fi
+.RE
 .TP
 .B \-\-verbose
-Print actions to stderr.
+Print actions to stderr, including the resolved profile and its source.
 .TP
 .B \-\-audit
 Log events to stderr and to a file.
@@ -332,7 +403,7 @@ Preview the policy:
 .B compartment-user \-\-dry\-run \-\- claude
 .TP
 Read-only SSH client:
-.B compartment-user \-\-profile ssh.conf \-\- ssh user@host
+.B compartment-user \-\-profile ./examples/ssh.conf \-\- ssh user@host
 .TP
 Check kernel support:
 .B compartment-user \-\-verify
