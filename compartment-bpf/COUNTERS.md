@@ -26,9 +26,13 @@ this catalogue stay in parity (drift fails CI).
 - **Generic model:** each counter is one cell of `(object, operation, outcome)`
   (see OBSERVABILITY model). Future counters slot into the same shape; add the map,
   add it to the `--stats` table, and add a row here — `telemetry-smoke.sh` enforces
-  all three.
+  the last two. It does **not** enforce the other four sites a new counter needs
+  (`KNOWN_MAP_NAMES`, `pin_counter_maps()`, `freeze_seal_maps()` and the usage
+  text in `compartment-bpf.c`); miss `KNOWN_MAP_NAMES` and the pin survives
+  `--unpin` as an orphan. `make check-actor-hook` now greps the pin/freeze pair
+  and this catalogue for both self-protection counters.
 
-## Catalogue (13 counters)
+## Catalogue (15 counters)
 
 All are `BPF_MAP_TYPE_PERCPU_ARRAY` (1 × u64), pinned at
 `/sys/fs/bpf/compartment/maps/<name>`, surfaced by `--stats`.
@@ -48,6 +52,8 @@ All are `BPF_MAP_TYPE_PERCPU_ARRAY` (1 × u64), pinned at
 | `prctl_set_mm_exe_file_denied_total` | (task, prctl, deny) | Any `PR_SET_MM` prctl while a strict policy is loaded → deny. The hook gates the **entire `PR_SET_MM` sub-op family** (EXE_FILE, MAP, AUXV, …), not just `PR_SET_MM_EXE_FILE` — broadened to close the `PR_SET_MM_MAP` exe_file-overwrite bypass. The counter name is retained for operator continuity; it names the protected resource (the exe_file pointer). |
 | `ptrace_access_denied_total` | (task, ptrace, deny) | ptrace access to a protected actor → deny. |
 | `ptrace_traceme_denied_total` | (task, ptrace_traceme, deny) | `PTRACE_TRACEME` by a protected actor → deny. |
+| `bpf_self_denied_total` | (bpf_map, fd_create, deny) | A task that is not one of the authorised loader images asked for an fd — read-only or read-write — to a compartment BPF map, and `comp_bpf_map` refused. Only ever non-zero with `--self-protect`; the program is not even loaded without it. Read-only opens are counted here too, deliberately: a read-only fd is a complete attack, because `bpf_map_freeze()` does not stop a BPF program from writing a map it holds any fd to. Expect a small non-zero value on a box where `bpftool map show` or another BPF tool enumerates map ids. |
+| `pin_tamper_denied_total` | (bpffs_pin, unlink/rename/rmdir/mount, deny) | A non-loader tried to unlink, rename, rmdir or over-mount one of this policy's own bpffs pin objects, the pin directories, or the bpffs mount root. Only ever non-zero with `--self-protect`. A sustained non-zero rate means something on the box is actively trying to take enforcement off — this is the counter to alert on. |
 
 (Exact hook sites: see `emit_audit()` and the per-hook increments in
 `compartment.bpf.c`. The `(object, operation, outcome)` column is the
@@ -55,10 +61,22 @@ catalogue's mapping into the generic telemetry model, not a wire format.)
 
 ## Test coverage matrix (which test asserts each counter's accuracy)
 
-Every counter has an **exact-`==` delta** accuracy assertion. The 3 inode counters
-live in `counter-smoke.sh`; the 10 exec-domain counters in `strict-launch/run.sh`
-(per-witness `name=val` exact deltas). All three suites are gated by `make check`
-(`smoke-counters`, `check-strict-launch`, `smoke-telemetry`).
+Every counter except the two self-protection counters has an **exact-`==`
+delta** accuracy assertion. The 3 inode counters live in `counter-smoke.sh`;
+the 10 exec-domain counters in `strict-launch/run.sh` (per-witness `name=val`
+exact deltas). All three suites are gated by `make check` (`smoke-counters`,
+`check-strict-launch`, `smoke-telemetry`).
+
+The two self-protection counters are **bounded-below (`>0`) rather than
+exact**, and the reason is worth stating rather than hiding: both count denies
+triggered by third-party tools whose syscall counts are not ours to predict —
+a map-id sweep walks however many map ids exist on that box, and `rm -rf`
+issues however many `unlinkat`/`rmdir` calls coreutils chooses. An exact
+assertion here would be a test of the sweeper and of coreutils, not of
+compartment. The invariant that *is* exact, and is asserted, is the subset
+relation: every self-protection deny also increments `deny_total`, so
+`bpf_self_denied_total + pin_tamper_denied_total <= deny_total` (measured
+31 + 3 + 1 umount = 35 = `deny_total` on both 6.8.0-139 and 7.0.0-31).
 
 | counter | accuracy test (exact delta) |
 |---------|-----------------------------|
@@ -75,11 +93,14 @@ live in `counter-smoke.sh`; the 10 exec-domain counters in `strict-launch/run.sh
 | `prctl_set_mm_exe_file_denied_total` | strict-launch SL-7a (PR_SET_MM_EXE_FILE `=1`), SL-7c (PR_SET_MM_MAP `=1`) |
 | `ptrace_access_denied_total` | strict-launch SL-8 (`+1`; falls back to KNOWN-GAP only if the kernel surfaces no ptrace event — on 7.0 it fires) |
 | `ptrace_traceme_denied_total` | strict-launch SL-8c (LSM-direct `+1`) |
-| *(all 13)* | telemetry-smoke TM-1 parity / TM-2 PERCPU type / TM-3 at-rest stability / TM-4 non-perturbing minimal-overhead polling / TM-5 catalogue coverage |
+| `bpf_self_denied_total` | bypass 22-self-protect-map (**`>0`, bounded-below**: the exact count depends on how many map ids the sweeping tool walks, so the witness asserts "moved off zero while `DENY_BPF_SELF` events were emitted" rather than an exact delta) |
+| `pin_tamper_denied_total` | bypass 23-pin-unlink (**`>0`, bounded-below**, same reason: `rm -rf` issues an unpredictable number of unlink/rmdir calls) |
+| *(all 15)* | telemetry-smoke TM-1 parity / TM-2 PERCPU type / TM-3 at-rest stability / TM-4 non-perturbing minimal-overhead polling / TM-5 catalogue coverage |
 
 VM-verified 2026-09-06 (v0.8.0, kernels 6.8.0-139 and 7.0.0-31): counter-smoke
-4/4, strict-launch PASS=17 FAIL=0, telemetry-smoke TM-1..TM-5 with all 13
-counters catalogued.
+4/4, strict-launch PASS=17 FAIL=0, telemetry-smoke TM-1..TM-5 with all 15
+counters catalogued. The two self-protection counters were verified on the
+same two kernels by bypass witnesses 22 and 23.
 
 ## Run
 

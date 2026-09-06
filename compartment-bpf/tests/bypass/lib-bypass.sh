@@ -20,7 +20,7 @@ BYPASS_REAL_DAEMON="$REPO/compartment-bpf"
 # A witness that prints PASS without running anything satisfies the
 # runner's one-label-per-script invariant while asserting nothing: put
 # `bypass_pass "..."` straight after bypass_check_env in any witness here
-# and the whole suite still reports "39 PASS / 0 FAIL / 0 SKIP", rc=0.
+# and the whole suite still reports "44 PASS / 0 FAIL / 0 SKIP", rc=0.
 # Nothing in the corpus could tell the difference.
 #
 # $DAEMON is therefore a per-witness wrapper that records every

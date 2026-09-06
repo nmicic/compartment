@@ -545,6 +545,149 @@ continue to work without the passphrase opt-in.
 
 ---
 
+### 3.6 Self-protection (`--self-protect`) and the upgrade ceremony
+
+`--self-protect` is opt-in, off by default, and only meaningful with `--pin`.
+It answers a different question from the unpin passphrase. The passphrase asks
+*"does the operator running `--unpin` know the secret?"*. `--self-protect` asks
+*"is this even the loader?"* — and it is enforced in the kernel, so it also
+covers the paths that never call `--unpin` at all: `rm` of a pin, `umount` of
+the bpffs, and `bpf(BPF_MAP_GET_FD_BY_ID)` on the seal maps.
+
+```sh
+export COMPARTMENT_BPF_PASSPHRASE='<high-entropy-string>'
+sudo -E /usr/sbin/compartment-bpf --pin --self-protect profiles/aide.conf
+```
+
+What it refuses, for every task whose `mm->exe_file` is not an authorised
+loader image:
+
+* any fd to a compartment BPF map — read-only included, because a read-only fd
+  is enough to write the map from a BPF program (`bpf_map_freeze()` gates only
+  the syscall path);
+* `unlink`, `rename` and `rmdir` of the pin objects, the two pin directories,
+  `/sys/fs/bpf/compartment` and the bpffs mount root;
+* `umount` (including `umount -l`) of the bpffs holding the pins, and mounting
+  a second bpffs over it.
+
+Two prerequisites, both enforced at pin time with a clear refusal:
+
+1. The kernel must have `bpf_lsm_bpf_map` (it does on 6.8 and 7.0). Without it
+   the loader refuses to start rather than claim protection it does not have.
+2. The loader binary must be root-owned and **not** group- or world-writable.
+   A group-writable maintenance binary means the maintenance right belongs to
+   that group, not to root. Install it `root:root 0755`; a binary sitting in a
+   build tree usually is not.
+
+Without the flag, nothing changes: the `comp_bpf_map` program is not even
+loaded, the pin set is the same 28 links v0.8 pinned, and both new counters
+stay 0.
+
+#### The errno an operator sees
+
+| operation, refused | errno | what it looks like |
+|---|---|---|
+| any `bpf()` that would hand out a map fd (`BPF_MAP_GET_FD_BY_ID`, `BPF_OBJ_GET` on a pin) | `EPERM` | `Error: can't get map by id (N): Operation not permitted` |
+| `rm` / `mv` / `rmdir` on a pin object or pin directory | `EACCES` | `rm: cannot remove '…': Permission denied` |
+| `umount` / over-mount of the bpffs holding the pins | `EACCES` | `umount: /sys/fs/bpf: … Permission denied` |
+| `--unpin` or `--stats` from an unauthorised image | `EPERM`, then a named remedy | see below |
+
+`EPERM` on the `bpf()` side is that syscall's own dialect: `bpf(2)` reports
+every "you do not have the right to this object" as `EPERM`, including
+`BPF_MAP_GET_FD_BY_ID` without `CAP_BPF`, so tools have an `EPERM` path and no
+`EACCES` path. `EACCES` on the path side is what every other compartment deny
+returns and what `rm`, `mv` and `umount` print. `ENOENT` was measured as an
+alternative — it makes `bpftool map show` skip our maps and exit 0 — and
+rejected: it disguises a security decision as a missing object, and it makes an
+unauthorised `--stats` print "no pinned counters found", which an operator
+cannot tell from "no policy is pinned".
+
+#### Identity, and why a rebuild matters
+
+The maintenance right is the `(dev, ino)` of an executable image — the same
+identity the `actor=` allowlist uses, for the same reason: `--pin`, `--unpin`
+and `--stats` are three different processes running the same binary.
+
+The set is fixed when the policy is pinned and frozen. The loader deliberately
+cannot extend it afterwards: if it could, anything that can make the loader run
+one more time could widen it.
+
+**A rebuild or a package upgrade replaces the binary and therefore its inode.
+The new binary is a different image and cannot unpin the old policy.** This is
+the whole cost of the feature. There are two supported ceremonies:
+
+```sh
+# (a) the normal one — unpin before you replace the binary
+sudo -E /usr/sbin/compartment-bpf --unpin
+sudo apt install ./compartment-bpf_amd64.deb           # or: make && make install
+sudo -E /usr/sbin/compartment-bpf --pin --self-protect profiles/aide.conf
+
+# (b) pre-authorise the successor, if you need zero policy gap
+sudo -E /usr/sbin/compartment-bpf --pin --self-protect \
+        --authorize-loader /usr/sbin/compartment-bpf.next profiles/aide.conf
+# ...later, the successor can take the old policy down:
+sudo -E /usr/sbin/compartment-bpf.next --unpin
+```
+
+`--authorize-loader` resolves the path to `(dev, ino)` at pin time. Replacing
+the file afterwards does **not** carry the authorisation over — that is the
+point. At most 8 images in total, including the pinning one.
+
+**The rule, in one line: unpin before upgrading the loader, or authorize the
+new binary at pin time; a stranded tree costs a reboot.**
+
+#### If you strand yourself
+
+Running `--unpin` from an unauthorised image fails loudly and tells you so:
+
+```
+unlinkat /sys/fs/bpf/compartment/links/comp_bpf_map: Operation not permitted
+unpin: the running policy was pinned with --self-protect and this
+       executable is not in its authorised loader set, so the kernel
+       refused to remove the pin (ACTION_DENY_PIN_TAMPER in the audit
+       stream). Run --unpin from the binary image that pinned it, or
+       from one authorised with --authorize-loader at pin time. If that
+       image no longer exists (rebuild, package upgrade), the pin tree
+       can only be cleared by rebooting: bpffs is not persistent.
+```
+
+The escape hatch is a reboot, and the worst case is bounded by it: bpffs is
+memory-backed, so the pin tree and every attached program are gone after a
+restart. That is the same reboot an unconfined root can perform anyway, which
+is why stranding is no worse than the residual risk the threat model already
+accepts — but it *is* a reboot, so treat `--self-protect` on a host you cannot
+restart as a decision, not a default.
+
+**On a build host, do not `--pin --self-protect` and then rebuild.** `make`
+relinks `compartment-bpf` into a fresh inode on every invocation (`vmlinux.h`
+depends on the `.PHONY` `check-env` target), so `sudo make check` after a
+self-protected `--pin` leaves a tree that only a reboot can clear.
+
+#### What it costs
+
+`bpftool map show` — the host-wide listing, not just ours — aborts at the first
+compartment map (`Error: can't get map by id (N): Operation not permitted`,
+exit 255) instead of skipping it, so maps *after* ours in id order are not
+listed either. This affects the whole host while a self-protected policy is
+live, and it is the single most visible cost of the feature.
+
+Unaffected: `bpftool prog show`, `bpftool link show`, `bpftool cgroup tree`,
+`bpftool map show id <N>` for a specific non-compartment id, and creating,
+writing, dumping, pinning and unlinking unrelated maps and pins. Use
+`compartment-bpf --stats` — run from an authorised loader image, which is the
+same executable — for this tool's own counters.
+
+Read-only map access is **not** carved out for `--stats` or `bpftool map dump`.
+It was considered and rejected on measurement: a read-only fd is a complete
+attack, because a map spliced into a BPF program with `bpf_map__reuse_fd()` is
+writable from program context regardless of `bpf_map_freeze()`. A read-only
+carve-out would have left every seal map mutable and the gate decorative.
+
+See the `LIMITATIONS.md` self-protection section for the measurement and for
+what the flag does **not** close.
+
+---
+
 ## 4. Counters and audit (operator surface)
 
 `compartment-bpf --stats` prints the v0.3 baseline counters and (since
@@ -570,6 +713,20 @@ ABI v0.4) the strict-launch-marker counters:
 | `prctl_set_mm_exe_file_denied_total` | `PR_SET_MM` denies emitted by `task_prctl` while strict mode is loaded (gates ALL `PR_SET_MM` sub-ops — see note below)               |
 | `ptrace_access_denied_total`         | denies emitted by `ptrace_access_check` (strace, process_vm_writev, pidfd_getfd, /proc/mem)   |
 | `ptrace_traceme_denied_total`        | denies emitted by `ptrace_traceme` (a marked actor calling PTRACE_TRACEME)                    |
+
+### Self-protection counters (`--self-protect` only)
+
+| counter                     | meaning                                                                                          |
+|-----------------------------|--------------------------------------------------------------------------------------------------|
+| `bpf_self_denied_total`     | map-fd requests refused by `comp_bpf_map` for a task that is not an authorised loader image (read-only requests included) |
+| `pin_tamper_denied_total`   | unlink / rename / rmdir / mount attempts on this policy's own bpffs pins, refused for a non-loader |
+
+Both stay 0 unless the policy was pinned with `--self-protect` (without the
+flag `comp_bpf_map` is not loaded at all). `bpf_self_denied_total` picking up a
+small non-zero value is normal on a box where something enumerates BPF map ids
+— `bpftool map show` does. A **sustained** non-zero `pin_tamper_denied_total`
+is the one to alert on: it means something is actively trying to take
+enforcement off.
 
 `audit_drop_total > 0` means the ringbuf consumer fell behind and
 events were dropped — investigate before trusting the audit log

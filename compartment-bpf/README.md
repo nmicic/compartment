@@ -43,6 +43,7 @@ enforces the seal on every matching operation regardless of uid or capability.
 | `sb_mount` / `move_mount` | new mount on a sealed inode or inside a sealed subtree (path shadowing) |
 | `sb_umount` | detaching a filesystem that hosts sealed inodes (`umount`, `umount -l`; `move_mount(2)` is gated by `move_mount`'s from-side) |
 | `bprm_committed_creds` / `task_alloc` / `task_prctl` / `ptrace_*` | actor-strict marker lifecycle and identity-swap hardening |
+| `bpf_map` (opt-in, `--pin --self-protect` only) | any fd — read-only included — to this tool's own BPF maps, for a task that is not an authorised loader image. The same flag adds a pin-tamper branch to `inode_unlink` / `inode_rename` / `inode_rmdir` / `sb_mount` / `sb_umount` covering its own bpffs pins; those are existing hooks, not new links. See `HOWTO.md` §3.6. |
 
 Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all four).
 
@@ -165,7 +166,7 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 | Suite | Coverage |
 |-------|----------|
 | `make check` | loader negative-path, multi-actor, error-path, regression (24+ checks) |
-| `tests/bypass/run-all.sh` | 39 bypass scenarios (20 seal-class + 19 exec-domain; kernel hook coverage per flag class) |
+| `tests/bypass/run-all.sh` | 44 bypass scenarios (25 seal-class + 19 exec-domain; kernel hook coverage per flag class) |
 | `tests/strict-launch/run.sh` | 17 strict-launch-marker witnesses |
 | `tests/observe/run.sh` | 22 observe pipeline witnesses; 21 pass and 1 skips where AIDE is not installed |
 | `tests/mesh/run-mesh.sh` | 3284 (actor × operation × flag) enforcement matrix trials |
@@ -207,6 +208,19 @@ See `LIMITATIONS.md` for the full table. Highlights:
   drops, remove enforcement. Note `bpf(BPF_LINK_DETACH)` does **not** work on
   an LSM link — it returns `-EOPNOTSUPP` — so the pin tree is the surface to
   guard. Combine with capability dropping and bpffs namespace lockdown.
+- **`bpf_map_freeze()` is not map integrity**: freeze closes the syscall write
+  path, but a `CAP_BPF` holder with any fd to a frozen map — `BPF_F_RDONLY` is
+  enough — writes it from a BPF program of its own (measured on 6.8.0-139 and
+  7.0.0-31). So the seal maps are mutable by an unconfined root, and wiping
+  them removes policy with no unlink and no audit event.
+- **Opt-in self-protection** closes both of the two above: `--pin
+  --self-protect` denies map fds and pin removal to anything that is not the
+  loader image. It is off by default because the maintenance right is the
+  loader's `(dev, ino)`, so a rebuilt or upgraded binary cannot unpin the old
+  policy — unpin before upgrading, or pre-authorise the successor with
+  `--authorize-loader` at pin time; a stranded tree costs a reboot. While it is
+  on, `bpftool map show` aborts its host-wide listing at the first compartment
+  map. See `HOWTO.md` §3.6 and `LIMITATIONS.md`.
 - **btrfs / overlayfs anon_bdev**: on these filesystems, `(dev, ino)` can be
   reused across bind-mount views of the same inode; see LIMITATIONS.md.
 - **No cryptographic policy signing** yet.
