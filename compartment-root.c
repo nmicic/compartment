@@ -962,22 +962,34 @@ static int child_func(void *arg)
     /* 6. Set hostname inside UTS namespace */
     if (sethostname("container", 9) < 0) { /* best-effort in userns */ }
 
-    /* 7. Optional: bring up loopback in new network namespace */
+    /* 7. Optional: bring up loopback in new network namespace.
+     *
+     * Not fatal — a container that cannot talk to itself is still a
+     * usable container — but no longer silent: `loopback on` used to
+     * discard both the socket() and the ioctl() result, so a container
+     * with a down lo looked exactly like one with an up lo. */
     if (config->loopback && !config->netns) {
         int sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-        if (sock >= 0) {
+        if (sock < 0) {
+            fprintf(stderr, "compartment-root: warning: loopback socket: "
+                    "%s\n", strerror(errno));
+        } else {
             struct ifreq ifr;
             memset(&ifr, 0, sizeof(ifr));
             strncpy(ifr.ifr_name, "lo", IFNAMSIZ);
             ifr.ifr_flags = IFF_UP | IFF_RUNNING;
-            (void)ioctl(sock, SIOCSIFFLAGS, &ifr);
+            if (ioctl(sock, SIOCSIFFLAGS, &ifr) != 0)
+                fprintf(stderr, "compartment-root: warning: loopback up: "
+                        "%s\n", strerror(errno));
+            else if (config->verbose)
+                fprintf(stderr, "compartment-root: loopback up\n");
             close(sock);
         }
     }
 
     /* 8. Set resource limits — AFTER close_range/FD cleanup below so the
      *    fallback loop can see the original RLIMIT_NOFILE, not the
-     *    lowered value. Moved from here to step 13 below. */
+     *    lowered value. Moved from here to step 19 below. */
 
     /* 9. Drop bounding-set capabilities BEFORE privilege drop
      *    (PR_CAPBSET_DROP needs CAP_SETPCAP — only available as root) */
