@@ -35,7 +35,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `sb_mount` | witnessed | `tests/bypass/07-mount-bind-decoy.sh` |
 | `sb_umount` | witnessed | `tests/bypass/20-umount-shadow.sh` |
 | `move_mount` | witnessed | `tests/bypass/17-mount-inside-sealed-dir.sh` |
-| `bpf_map` | witnessed | `tests/bypass/23-pin-unlink.sh` |
+| `bpf_map` | witnessed | `tests/bypass/22-self-protect-map.sh` |
 ## observe-hook
 
 | surface | status | note |
