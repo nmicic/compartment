@@ -647,9 +647,17 @@ check-release: check-env
 	@command -v bpftool >/dev/null || { echo "[check-release] FAIL: bpftool missing"; exit 1; }
 	@command -v clang >/dev/null || { echo "[check-release] FAIL: clang missing"; exit 1; }
 	@echo "[check-release] preflight OK — running full suite"
-	@log=$$(mktemp); ok=1; \
-	$(MAKE) check 2>&1 | tee "$$log" || ok=0; \
-	if [ "$$ok" -ne 1 ]; then echo "[check-release] FAIL: make check returned non-zero"; rm -f "$$log"; exit 1; fi; \
+	@log=$$(mktemp); \
+	if ! $(MAKE) check > "$$log" 2>&1; then \
+	  cat "$$log"; \
+	  echo "[check-release] FAIL: make check returned non-zero"; rm -f "$$log"; exit 1; \
+	fi; \
+	cat "$$log"; \
+	if grep -q '^FAIL ' "$$log"; then \
+	  echo "[check-release] FAIL: a suite printed a FAIL line:"; \
+	  grep -n '^FAIL ' "$$log" | sed 's/^/  /'; \
+	  rm -f "$$log"; exit 1; \
+	fi; \
 	if grep -nEi 'SKIP.*(needs root|requires root|bpf not in active LSM|daemon not built|sealprobe not built|bpftool not available)' "$$log"; then \
 	  echo "[check-release] FAIL: a core suite SKIPPED for an env reason preflight should have guaranteed away (above)"; \
 	  rm -f "$$log"; exit 1; \
