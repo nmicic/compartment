@@ -52,34 +52,58 @@ AIDE_BIN="$(command -v aide)"
 # O_PATH+fstat. Initialize a baseline DB if one doesn't exist. `aide
 # --init` writes /var/lib/aide/aide.db.new — we copy it to aide.db so
 # both paths exist for the seal load. SKIP loudly if init fails.
-need_init=0
-[ -f /var/lib/aide/aide.db ]     || need_init=1
-[ -f /var/lib/aide/aide.db.new ] || need_init=1
-TMP_INIT_ERR=$(mktemp /tmp/aide-init-err.XXXXXX)
-if [ "$need_init" = "1" ]; then
-	mkdir -p /var/lib/aide /etc/aide /etc/aide/aide.conf.d
-	[ -f /etc/aide/aide.conf ] || {
-		# Minimal config compatible with aide >= 0.18 (database_in= form).
-		# aide on Ubuntu Resolute (0.19.2) rejects the older bare
-		# `database=file:` shorthand. Hash group `p+i+u+g` is enough
-		# to exercise an --init scan without picking heavy checksums.
-		cat > /etc/aide/aide.conf <<'EOF'
+# Always install a bounded configuration for the duration, and put the
+# machine's own back afterwards.
+#
+# The previous version only wrote a config when there was none, so on a
+# guest where the aide package ships /etc/aide/aide.conf the scan was the
+# distro's — the whole filesystem with heavy checksums. On 6.8.0-139 that
+# made `aide --update` exceed its own 120 s cap and the gate went red on
+# a timeout, not on an enforcement result. It also left its config and
+# database behind on a machine that had none.
+#
+# `/etc p+i+u+g` is the smallest thing that still exercises a real scan,
+# and the assertion here is about compartment-bpf's actor allow-list, not
+# about how much of the filesystem AIDE walks.
+AIDE_CONF=/etc/aide/aide.conf
+AIDE_SAVE=$(mktemp -d /tmp/aide-e2e-save.XXXXXX)
+aide_restore() {
+	[ -d "${AIDE_SAVE:-}" ] || return 0
+	if [ -f "$AIDE_SAVE/aide.conf" ]; then cp -a "$AIDE_SAVE/aide.conf" "$AIDE_CONF"
+	else rm -f "$AIDE_CONF"; fi
+	if [ -f "$AIDE_SAVE/aide.db" ]; then cp -a "$AIDE_SAVE/aide.db" /var/lib/aide/aide.db
+	else rm -f /var/lib/aide/aide.db; fi
+	if [ -f "$AIDE_SAVE/aide.db.new" ]; then cp -a "$AIDE_SAVE/aide.db.new" /var/lib/aide/aide.db.new
+	else rm -f /var/lib/aide/aide.db.new; fi
+	rm -rf "$AIDE_SAVE"
+	AIDE_SAVE=""
+}
+trap aide_restore EXIT INT TERM
+
+mkdir -p /var/lib/aide /etc/aide /etc/aide/aide.conf.d
+[ -f "$AIDE_CONF" ]              && cp -a "$AIDE_CONF" "$AIDE_SAVE/aide.conf"
+[ -f /var/lib/aide/aide.db ]     && cp -a /var/lib/aide/aide.db "$AIDE_SAVE/aide.db"
+[ -f /var/lib/aide/aide.db.new ] && cp -a /var/lib/aide/aide.db.new "$AIDE_SAVE/aide.db.new"
+
+# Minimal config compatible with aide >= 0.18 (database_in= form); aide
+# 0.19.2 rejects the older bare `database=file:` shorthand.
+cat > "$AIDE_CONF" <<'EOF'
 database_in=file:/var/lib/aide/aide.db
 database_out=file:/var/lib/aide/aide.db.new
 gzip_dbout=no
 report_url=stdout
 /etc p+i+u+g
 EOF
-	}
-	# Explicit --config so we don't depend on aide's built-in default
-	# (which on Resolute is <none>). Suppress stdout (verbose=5 is loud)
-	# but capture stderr so a SKIP can diagnose what went wrong.
-	if ! aide --init --config=/etc/aide/aide.conf >/dev/null 2>"$TMP_INIT_ERR"; then
-		skip "aide --init failed: $(head -1 "$TMP_INIT_ERR" 2>/dev/null)"
-	fi
-	[ -f /var/lib/aide/aide.db.new ] || skip "aide --init produced no aide.db.new: $(head -1 "$TMP_INIT_ERR" 2>/dev/null)"
-	cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+
+TMP_INIT_ERR=$(mktemp /tmp/aide-init-err.XXXXXX)
+# Explicit --config so we don't depend on aide's built-in default (which
+# on Resolute is <none>). Suppress stdout (verbose=5 is loud) but capture
+# stderr so a SKIP can diagnose what went wrong.
+if ! timeout 300 aide --init --config="$AIDE_CONF" >/dev/null 2>"$TMP_INIT_ERR"; then
+	skip "aide --init failed: $(head -1 "$TMP_INIT_ERR" 2>/dev/null)"
 fi
+[ -f /var/lib/aide/aide.db.new ] || skip "aide --init produced no aide.db.new: $(head -1 "$TMP_INIT_ERR" 2>/dev/null)"
+cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
 
 # --- daemon launch with profiles/aide.conf ----------------------------
 TMP=$(mktemp -d /tmp/aide-e2e.XXXXXX)
@@ -87,6 +111,7 @@ trap '
 	[ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
 	[ -n "${DAEMON_PID:-}" ] && wait "$DAEMON_PID" 2>/dev/null
 	rm -rf "$TMP"
+	aide_restore
 ' EXIT INT TERM
 
 DAEMON_LOG="$TMP/daemon.err"
