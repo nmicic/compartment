@@ -117,7 +117,7 @@ One directive per line. Blank lines and `#` comments are ignored.
 `$HOME` and `$USER` are expanded in values.
 
 ```conf
-# ~/.config/compartment/ai-agent.conf
+# /etc/compartment/my-agent.conf
 
 # Inherit another profile (loads it first, then applies these rules on top)
 # inherit ai-agent
@@ -126,47 +126,18 @@ One directive per line. Blank lines and `#` comments are ignored.
 ro /usr
 ro /lib
 ro /lib64
-ro /lib32
 ro /etc
 ro /bin
-ro /sbin
 ro /proc
 ro /dev
-ro /sys
-ro /run
-ro /var/lib
 rw /tmp
-rw $HOME
+rwx $HOME
 
 # Syscall blocklist (seccomp)
 block ptrace
 block mount
-block umount2
-block reboot
-block kexec_load
-block kexec_file_load
-block init_module
-block finit_module
-block delete_module
-block pivot_root
-block chroot
 block unshare
-block setns
-block keyctl
-block add_key
-block request_key
 block bpf
-block userfaultfd
-block perf_event_open
-block process_vm_readv
-block process_vm_writev
-block acct
-block swapon
-block swapoff
-block settimeofday
-block clock_settime
-block clock_adjtime
-block adjtimex
 
 # Environment deny list ('*' at the end is a prefix match)
 env-deny LD_*
@@ -176,7 +147,7 @@ env-deny PROMPT_COMMAND
 env-deny GIT_SSH_COMMAND
 env-deny JAVA_TOOL_OPTIONS
 
-# Feature toggles (on/off)
+# Feature toggles — these may only be turned on from a profile
 landlock on
 seccomp on
 no-new-privs on
@@ -189,6 +160,29 @@ audit-log $HOME/.local/state/compartment
 # Working directory
 # workdir $HOME/projects
 ```
+
+That is a sketch, not the shipped policy. **Do not transcribe the
+built-in profile into a file by hand** — earlier releases of this guide
+did, and the copy drifted to 28 syscall blocks and 7 environment entries
+against a built-in that had 43 and 34, quietly dropping every
+container-escape block and all credential stripping from anyone who
+followed it.
+
+Print the real thing instead:
+
+```bash
+# See exactly what the tool would apply
+compartment-user --dump-profile ai-agent
+
+# Start a system profile from it
+compartment-user --dump-profile ai-agent | sudo tee /etc/compartment/my-agent.conf
+sudo chmod 644 /etc/compartment/my-agent.conf
+```
+
+`--dump-profile` serialises the resolved policy — built-in, file, and
+anything inherited — back into `.conf` syntax, so what you edit is what
+the binary actually enforces. `examples/ai-agent.conf` is generated the
+same way and is equivalent to the built-in.
 
 ### Directives
 
@@ -276,7 +270,7 @@ The inherited profile is loaded first, then the current file's directives
 are applied on top (additive — paths and blocks accumulate).
 
 ```conf
-# ~/.config/compartment/strict.conf
+# /etc/compartment/strict.conf
 inherit ai-agent
 
 # Add extra syscall blocks on top of ai-agent defaults
@@ -289,6 +283,10 @@ block move_pages
 ```
 
 Inheritance depth is limited to 2 levels to prevent loops.
+`inherit` resolves through the same search order and the same trust
+checks as `--profile`, so a system profile can never pull in a file
+from `$HOME`. If the inherited profile exists but does not parse,
+the whole load is rejected and nothing runs.
 
 ---
 
