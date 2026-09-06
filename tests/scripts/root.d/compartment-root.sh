@@ -82,7 +82,8 @@ cleanup() {
     # Kill anything this suite left running, then unwind mounts.  The
     # container does all of its mounting inside its own mount namespace,
     # so nothing should be left on the host — but check anyway.
-    pkill -9 -f "compartment-root -c ${JAIL}" 2>/dev/null || true
+    # Matches both the -c ${JAIL} runs and the --profile ${WORK}/*.conf ones.
+    pkill -9 -f "compartment-root .*${WORK}" 2>/dev/null || true
     sleep 0.2
     local mp
     while read -r mp; do
