@@ -345,8 +345,10 @@ static void print_usage(void)
         "  --profile strict      Minimal access (ai-agent + extra blocks)\n"
         "  --profile none        No defaults, only explicit rules\n"
         "  --profile FILE.conf   Load profile from file\n"
-        "  --profile NAME        Search ~/.config/compartment/NAME.conf,\n"
-        "                        then /etc/compartment/NAME.conf\n"
+        "  --profile NAME        Search /etc/compartment/NAME.conf\n"
+        "  --user-profiles       Also search ~/.config/compartment/NAME.conf\n"
+        "                        (off by default: the sandboxed process can\n"
+        "                        usually write there)\n"
         "\n"
         "Filesystem (Landlock):\n"
         "  --ro PATH             Read-only + execute access\n"
@@ -732,7 +734,9 @@ int main(int argc, char *argv[])
          * unconfined shell that refusing to run would leave behind. The
          * transactional loader guarantees the rejected file contributed
          * nothing. */
-        int shell_pr = resolve_and_load_profile(&shell_cfg, "ai-agent", 0);
+        /* Flags 0: shell-replacement mode reads /etc/compartment only.
+         * $HOME belongs to the very user being confined. */
+        int shell_pr = resolve_and_load_profile(&shell_cfg, "ai-agent", 0, 0);
         if (shell_pr == PROFILE_ERROR)
             syslog(LOG_WARNING, "compartment-user[%s]: ai-agent profile was "
                    "rejected — falling back to the built-in policy",
@@ -811,10 +815,15 @@ int main(int argc, char *argv[])
         {"insecure",        no_argument,       NULL, 'U'},
         {"unsecure",        no_argument,       NULL, 'U'},  /* alias */
         {"verify",          no_argument,       NULL, 'V'},
+        {"user-profiles",   no_argument,       NULL, 2},
         {"version",         no_argument,       NULL, 1},
         {"help",            no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
+
+    /* Profile resolution: system profiles only unless --user-profiles is
+     * given. $HOME is writable by the process we are confining. */
+    unsigned profile_flags = 0;
 
     int opt;
     while ((opt = getopt_long(argc, argv, "+P:r:w:x:W:b:l:E:e:A:LSNdvaUVh",
@@ -876,6 +885,7 @@ int main(int argc, char *argv[])
         case 'A': cfg.audit_log_dir = optarg; cfg.audit = 1; break;
         case 'U': cfg.allow_insecure = 1; break;
         case 'V': return print_verify();
+        case  2 : profile_flags |= PROFILE_SEARCH_USER; break;
         case  1 : printf("compartment-user %s\n", COMPARTMENT_VERSION); return 0;
         case 'h': print_usage(); return 0;
         default:  print_usage(); return 1;
@@ -901,7 +911,7 @@ int main(int argc, char *argv[])
      * report it as "(built-in)" while the rejected file's already-parsed
      * rules were still in force. */
     if (strcmp(cfg.profile, "none") != 0) {
-        int pr = resolve_and_load_profile(&cfg, cfg.profile, 0);
+        int pr = resolve_and_load_profile(&cfg, cfg.profile, 0, profile_flags);
         if (pr == PROFILE_ERROR) {
             fprintf(stderr, "compartment-user: profile '%s' was rejected — "
                     "refusing to run\n", cfg.profile);
@@ -917,11 +927,15 @@ int main(int argc, char *argv[])
             } else {
                 fprintf(stderr, "compartment-user: unknown profile: %s\n",
                         cfg.profile);
-                profile_print_search_path(stderr, cfg.profile);
+                profile_print_search_path(stderr, cfg.profile, profile_flags);
                 return 1;
             }
         }
     }
+
+    if (cfg.verbose)
+        fprintf(stderr, "compartment-user: profile %s (%s)\n", cfg.profile,
+                cfg.profile_source ? cfg.profile_source : "built-in");
 
     /* CLI --no-* flags always win over profile — if the user explicitly
      * disabled a mechanism on the command line, the profile cannot
@@ -1001,9 +1015,10 @@ int main(int argc, char *argv[])
         audit_log_open(&cfg);  /* non-fatal if it fails */
 
         char detail[512];
-        snprintf(detail, sizeof(detail), "command=%s profile=%s "
+        snprintf(detail, sizeof(detail), "command=%s profile=%s source=%s "
                  "landlock=%d seccomp=%d paths=%d blocked=%d",
                  argv[optind], cfg.profile,
+                 cfg.profile_source ? cfg.profile_source : "built-in",
                  cfg.use_landlock, cfg.use_seccomp,
                  cfg.path_count, cfg.blocked_count);
         audit_log(&cfg, "COMPARTMENT_START", detail);

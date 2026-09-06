@@ -693,6 +693,12 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
 
 /* ── Profile file loading ───────────────────────────────────────── */
 
+/* Resolution flags. A profile file is policy: whoever can write it
+ * decides what the sandbox does, so where we are willing to look for one
+ * and who we are willing to accept it from are explicit choices. */
+#define PROFILE_SEARCH_USER  (1u << 0)  /* also search $HOME/.config/compartment */
+#define PROFILE_OWNER_ROOT   (1u << 1)  /* file and directory must be root-owned */
+
 /* Three-way result. "not found" lets the caller keep searching or fall
  * back to a built-in; "error" means the file exists but its contents are
  * not trustworthy, and nothing may run. Collapsing the two was how a
@@ -701,20 +707,143 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
 #define PROFILE_NOT_FOUND  1
 #define PROFILE_ERROR    (-1)
 
+
+/* ── Profile file trust ─────────────────────────────────────────── */
+
+/* Check the object behind an already-open fd, so the thing we validate
+ * and the thing we read are the same inode. A policy source must be the
+ * expected type, must be owned by root or by the real uid of the caller
+ * (root only when PROFILE_OWNER_ROOT is set), and must not be writable by
+ * group or other. */
+static inline int profile_fd_trusted(int fd, unsigned flags, mode_t want_type,
+                                     const char *what, const char *path)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "compartment: %s %s: %s\n", what, path, strerror(errno));
+        return -1;
+    }
+    if ((st.st_mode & S_IFMT) != want_type) {
+        fprintf(stderr, "compartment: %s %s: not a %s\n", what, path,
+                want_type == S_IFDIR ? "directory" : "regular file");
+        return -1;
+    }
+    if (st.st_uid != 0 &&
+        ((flags & PROFILE_OWNER_ROOT) || st.st_uid != getuid())) {
+        fprintf(stderr, "compartment: %s %s is owned by uid %u — it must be "
+                "owned by root%s\n", what, path, (unsigned)st.st_uid,
+                (flags & PROFILE_OWNER_ROOT) ? "" : " or by you");
+        return -1;
+    }
+    /* A sticky directory (/tmp, /var/tmp) may be world-writable: the
+     * sticky bit is exactly what stops anyone but the owner from
+     * unlinking or renaming the file inside it, which is the only way a
+     * third party could swap the policy we just validated. Regular files
+     * get no such exemption. */
+    int sticky_dir = (want_type == S_IFDIR) && (st.st_mode & S_ISVTX);
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) && !sticky_dir) {
+        fprintf(stderr, "compartment: %s %s is mode %04o — group- or "
+                "world-writable policy is not trusted\n",
+                what, path, (unsigned)(st.st_mode & 07777));
+        fprintf(stderr, "  fix with: chmod go-w %s\n", path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Anyone who can write the containing directory can replace the file, or
+ * repoint a symlink at one they own, so the directory needs the same
+ * check as the file. */
+static inline int profile_dir_trusted(const char *path, unsigned flags)
+{
+    char dir[PATH_MAX];
+    size_t plen = strlen(path);
+    if (plen >= sizeof(dir)) {
+        fprintf(stderr, "compartment: profile path too long: %s\n", path);
+        return -1;
+    }
+    memcpy(dir, path, plen + 1);
+
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        dir[0] = '.'; dir[1] = '\0';
+    } else if (slash == dir) {
+        dir[1] = '\0';               /* "/x.conf" -> "/" */
+    } else {
+        *slash = '\0';
+    }
+
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        fprintf(stderr, "compartment: profile directory %s: %s\n",
+                dir, strerror(errno));
+        return -1;
+    }
+    int r = profile_fd_trusted(dfd, flags, S_IFDIR, "profile directory", dir);
+    close(dfd);
+    return r;
+}
+
+/* Open a profile file for reading, refusing anything an untrusted user
+ * could have written. Symlinks are followed — /etc/alternatives-style
+ * indirection is legitimate — but the target, the directory named by the
+ * path, and (when they differ) the directory the target really lives in
+ * all have to pass. On failure *rc carries PROFILE_NOT_FOUND or
+ * PROFILE_ERROR. */
+static inline FILE *profile_fopen_trusted(const char *path, unsigned flags,
+                                          int *rc)
+{
+    *rc = PROFILE_ERROR;
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            *rc = PROFILE_NOT_FOUND;
+            return NULL;
+        }
+        fprintf(stderr, "compartment: profile %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+
+    if (profile_fd_trusted(fd, flags, S_IFREG, "profile", path) != 0) {
+        close(fd);
+        return NULL;
+    }
+    if (profile_dir_trusted(path, flags) != 0) {
+        close(fd);
+        return NULL;
+    }
+
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved) && strcmp(resolved, path) != 0 &&
+        profile_dir_trusted(resolved, flags) != 0) {
+        close(fd);
+        return NULL;
+    }
+
+    FILE *fp = fdopen(fd, "r");
+    if (!fp) {
+        fprintf(stderr, "compartment: profile %s: %s\n", path, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    *rc = PROFILE_OK;
+    return fp;
+}
+
 /* Forward declaration needed because the loader calls
  * resolve_and_load_profile for "inherit" directives. */
-static inline int resolve_and_load_profile(Config *cfg, const char *name, int depth);
-static inline int load_profile_file(Config *cfg, const char *path, int depth);
+static inline int resolve_and_load_profile(Config *cfg, const char *name,
+                                           int depth, unsigned flags);
+static inline int load_profile_file(Config *cfg, const char *path, int depth,
+                                    unsigned flags);
 
-static inline int load_profile_into(Config *cfg, const char *path, int depth)
+static inline int load_profile_into(Config *cfg, const char *path, int depth,
+                                    unsigned flags)
 {
-    FILE *fp = fopen(path, "re");  /* "e" = O_CLOEXEC */
-    if (!fp) {
-        if (errno == ENOENT || errno == ENOTDIR)
-            return PROFILE_NOT_FOUND;
-        fprintf(stderr, "compartment: %s: %s\n", path, strerror(errno));
-        return PROFILE_ERROR;
-    }
+    int orc;
+    FILE *fp = profile_fopen_trusted(path, flags, &orc);
+    if (!fp) return orc;
 
     char line[MAX_LINE];
     char expanded[PATH_MAX];
@@ -886,11 +1015,11 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth)
                     int n = snprintf(sibling, sizeof(sibling),
                                      "%s/%s.conf", dir_copy, val);
                     if (n > 0 && (size_t)n < sizeof(sibling))
-                        found = load_profile_file(cfg, sibling, depth + 1);
+                        found = load_profile_file(cfg, sibling, depth + 1, flags);
                 }
             }
             if (found == PROFILE_NOT_FOUND)
-                found = resolve_and_load_profile(cfg, val, depth + 1);
+                found = resolve_and_load_profile(cfg, val, depth + 1, flags);
             if (found == PROFILE_NOT_FOUND) {
                 fprintf(stderr, "compartment: %s:%d: inherited profile '%s' "
                         "not found\n", path, lineno, val);
@@ -977,12 +1106,13 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth)
  * Without this, a profile rejected on line N had already applied lines
  * 1..N-1 — and the caller then layered the built-in on top and reported
  * the result as "(built-in)". */
-static inline int load_profile_file(Config *cfg, const char *path, int depth)
+static inline int load_profile_file(Config *cfg, const char *path, int depth,
+                                    unsigned flags)
 {
     Config tmp = *cfg;   /* arrays are by value; strings added to tmp and
                           * then discarded leak, which is fine because a
                           * rejected profile always ends the process */
-    int rc = load_profile_into(&tmp, path, depth);
+    int rc = load_profile_into(&tmp, path, depth, flags);
     if (rc == PROFILE_OK)
         *cfg = tmp;
     return rc;
@@ -991,47 +1121,69 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
 /* Print, for a name that could not be resolved, exactly where we looked.
  * An explicit path is not a search — say so instead of inventing
  * "~/.config/compartment//abs/path.conf". */
-static inline void profile_print_search_path(FILE *out, const char *name)
+static inline void profile_print_search_path(FILE *out, const char *name,
+                                             unsigned flags)
 {
     if (strchr(name, '/')) {
         fprintf(out, "  looked for the file: %s\n", name);
         return;
     }
-    fprintf(out, "  searched: /etc/compartment/%s.conf, "
-            "~/.config/compartment/%s.conf\n", name, name);
+    fprintf(out, "  searched: /etc/compartment/%s.conf", name);
+    if (flags & PROFILE_SEARCH_USER)
+        fprintf(out, ", ~/.config/compartment/%s.conf", name);
+    else if (!(flags & PROFILE_OWNER_ROOT))
+        fprintf(out, "  (pass --user-profiles to also search "
+                "~/.config/compartment/)");
+    fputc('\n', out);
 }
 
-static inline int resolve_and_load_profile(Config *cfg, const char *name, int depth)
+/* Search order:
+ *   1. an explicit --profile /path/file.conf (a name containing '/')
+ *   2. /etc/compartment/<name>.conf
+ *   3. $HOME/.config/compartment/<name>.conf — compartment-user only, and
+ *      only when the caller passed --user-profiles
+ *   4. the caller's built-in
+ *
+ * $HOME used to come first, which meant the sandboxed process could write
+ * its own next-run policy: the built-in ai-agent profile grants RWX on
+ * $HOME, so an agent could drop a file there and un-sandbox every future
+ * invocation of the same command line. A profile loaded from /etc also
+ * drops PROFILE_SEARCH_USER, so a system profile can never pull in a user
+ * file through 'inherit'. */
+static inline int resolve_and_load_profile(Config *cfg, const char *name,
+                                           int depth, unsigned flags)
 {
     /* If it contains a slash, treat as explicit path */
     if (strchr(name, '/')) {
-        int r = load_profile_file(cfg, name, depth);
+        int r = load_profile_file(cfg, name, depth, flags);
         if (r == PROFILE_OK) cfg->profile_source = xstrdup(name);
         return r;
     }
 
-    /* Search: ~/.config/compartment/<name>.conf, /etc/compartment/<name>.conf */
-    const char *home = getenv("HOME");
     char path[PATH_MAX];
     int r;
 
-    if (home) {
-        int n = snprintf(path, sizeof(path), "%s/.config/compartment/%s.conf", home, name);
-        if (n > 0 && (size_t)n < sizeof(path)) {
-            r = load_profile_file(cfg, path, depth);
-            if (r != PROFILE_NOT_FOUND) {
-                if (r == PROFILE_OK) cfg->profile_source = xstrdup(path);
-                return r;
-            }
-        }
-    }
-
-    int en = snprintf(path, sizeof(path), "/etc/compartment/%s.conf", name);
-    if (en > 0 && (size_t)en < sizeof(path)) {
-        r = load_profile_file(cfg, path, depth);
+    int n = snprintf(path, sizeof(path), "/etc/compartment/%s.conf", name);
+    if (n > 0 && (size_t)n < sizeof(path)) {
+        r = load_profile_file(cfg, path, depth, flags & ~PROFILE_SEARCH_USER);
         if (r != PROFILE_NOT_FOUND) {
             if (r == PROFILE_OK) cfg->profile_source = xstrdup(path);
             return r;
+        }
+    }
+
+    if (flags & PROFILE_SEARCH_USER) {
+        const char *home = getenv("HOME");
+        if (home && home[0] == '/') {
+            n = snprintf(path, sizeof(path),
+                         "%s/.config/compartment/%s.conf", home, name);
+            if (n > 0 && (size_t)n < sizeof(path)) {
+                r = load_profile_file(cfg, path, depth, flags);
+                if (r != PROFILE_NOT_FOUND) {
+                    if (r == PROFILE_OK) cfg->profile_source = xstrdup(path);
+                    return r;
+                }
+            }
         }
     }
 

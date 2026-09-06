@@ -232,7 +232,13 @@ env-sanitize on
 audit on
 ```
 
-Search order: `--profile /path/file.conf` → `~/.config/compartment/<name>.conf` → `/etc/compartment/<name>.conf` → built-in.
+Search order: `--profile /path/file.conf` → `/etc/compartment/<name>.conf` →
+`~/.config/compartment/<name>.conf` (compartment-user with `--user-profiles`
+only) → built-in. compartment-root searches `/etc/compartment/` only.
+
+Every profile file must be a regular file owned by root or by you (root only
+for compartment-root), in a directory with the same ownership, and neither
+may be group- or world-writable.
 
 See [HOWTO.md](HOWTO.md) for full format reference.
 

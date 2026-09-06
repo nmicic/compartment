@@ -103,7 +103,11 @@ int main(int argc, char *argv[])
         if ((strcmp(argv[i], "--profile") == 0 || strcmp(argv[i], "-p") == 0)
             && i + 1 < argc) {
             config.profile = argv[i + 1];
-            int pr = resolve_and_load_profile(&config, config.profile, 0);
+            /* PROFILE_OWNER_ROOT and no $HOME search: this process is
+             * root, and the profile decides rootdir, username, cap-allow
+             * and the seccomp policy. */
+            int pr = resolve_and_load_profile(&config, config.profile, 0,
+                                              PROFILE_OWNER_ROOT);
             if (pr == PROFILE_ERROR) {
                 fprintf(stderr, "compartment-root: profile '%s' was rejected "
                         "— refusing to run\n", config.profile);
@@ -112,7 +116,7 @@ int main(int argc, char *argv[])
             if (pr == PROFILE_NOT_FOUND) {
                 fprintf(stderr, "compartment-root: unknown profile: %s\n",
                         config.profile);
-                profile_print_search_path(stderr, config.profile);
+                profile_print_search_path(stderr, config.profile, PROFILE_OWNER_ROOT);
                 return 1;
             }
             break;

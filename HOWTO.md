@@ -60,13 +60,50 @@ Instead of CLI flags, profiles can be defined in `.conf` files.
 compartment-user searches for them in order:
 
 1. **Explicit path** — `--profile /path/to/file.conf`
-2. **User config** — `~/.config/compartment/<name>.conf`
-3. **System config** — `/etc/compartment/<name>.conf`
+2. **System config** — `/etc/compartment/<name>.conf`
+3. **User config** — `~/.config/compartment/<name>.conf`, **only** when
+   `--user-profiles` is given, and never in shell-replacement mode
 4. **Built-in** — `ai-agent` and `strict` (compiled in)
 
-If a file is found, it is loaded. Otherwise the built-in profile is used
-(if one exists with that name). This means you can override the built-in
-`ai-agent` profile by placing a file at `~/.config/compartment/ai-agent.conf`.
+If a file is found, it is loaded. If it exists but does not parse, nothing
+runs and the exit status is non-zero — the built-in is used only when no
+file was found at all.
+
+compartment-root never looks in `$HOME`; it searches `/etc/compartment/`
+only, and requires the file to be owned by root.
+
+### Why `$HOME` is not searched by default
+
+The built-in `ai-agent` profile grants the sandboxed process read, write
+**and execute** on `$HOME`. If `~/.config/compartment/` outranked `/etc`,
+an agent could write its own next-run policy and the following invocation
+of the same command line would run unconfined. `--user-profiles` is the
+opt-in for deployments where the invoking user is trusted to write their
+own policy — an interactive developer sandboxing a build, say — and it is
+never honoured when compartment-user is standing in for a login shell.
+
+### Profile file trust
+
+Every profile file is checked on the file descriptor it is read from:
+
+* it must be a regular file;
+* it must be owned by **root** or by **you** (by root only for
+  compartment-root);
+* it must not be group- or world-writable;
+* its containing directory must pass the same ownership and write check.
+
+Symlinks are followed, so `/etc/alternatives`-style indirection works, but
+the target and the directory the target really lives in are checked too. A
+sticky directory (`/tmp`, `/var/tmp`) may be world-writable: the sticky bit
+is what prevents anyone but the owner from replacing the file.
+
+A violation is fatal and names the fix:
+
+```
+compartment: profile /home/you/.config/compartment/ai-agent.conf is mode 0664
+— group- or world-writable policy is not trusted
+  fix with: chmod go-w /home/you/.config/compartment/ai-agent.conf
+```
 
 ### Format
 

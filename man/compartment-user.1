@@ -39,9 +39,26 @@ Built-in profiles:
 .BR strict ", "
 .BR none .
 File search order:
-.IR ~/.config/compartment/NAME.conf ,
-.IR /etc/compartment/NAME.conf .
+.IR /etc/compartment/NAME.conf ,
+then
+.I ~/.config/compartment/NAME.conf
+but only with
+.BR \-\-user\-profiles .
 An explicit file path (containing \fB/\fR) loads directly.
+Every profile file must be a regular file owned by root or by the real uid of
+the caller, must not be group- or world-writable, and its containing directory
+must satisfy the same conditions.
+A profile that exists but does not parse is fatal; the built-in is used only
+when no file was found.
+.TP
+.B \-\-user\-profiles
+Also search
+.I ~/.config/compartment/NAME.conf
+for profiles.
+Off by default: the sandboxed process usually has write access to
+.IR $HOME ,
+so a profile found there could switch its own sandbox off.
+Never honoured in shell-replacement mode.
 .SS "Filesystem (Landlock)"
 .TP
 .BI \-\-ro " PATH"
