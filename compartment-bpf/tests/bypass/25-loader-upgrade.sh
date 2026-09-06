@@ -101,8 +101,12 @@ case "$w3" in
 	*"Permission denied"*|*"Operation not permitted"*) : ;;
 	*) bypass_fail "W3: --stats from the unauthorised image was not refused ($w3)" ;;
 esac
-printf '%s\n' "$w3all" | grep -q 'authorised loader set' \
-	|| bypass_fail "W3: --stats refusal does not say why or what to do: $(printf '%s' "$w3all" | tr '\n' ' ' | cut -c1-200)"
+# The explanation is wrapped prose, so assert on tokens that cannot straddle a
+# line break rather than on a phrase that can.
+printf '%s\n' "$w3all" | grep -q -- '--self-protect' \
+	|| bypass_fail "W3: --stats refusal does not say why: $(printf '%s' "$w3all" | tr '\n' ' ' | cut -c1-240)"
+printf '%s\n' "$w3all" | grep -q -- '--authorize-loader' \
+	|| bypass_fail "W3: --stats refusal does not say what to do: $(printf '%s' "$w3all" | tr '\n' ' ' | cut -c1-240)"
 printf '%s\n' "$w3all" | grep -q 'no pinned counters found' \
 	&& bypass_fail "W3: --stats reported 'no pinned counters found' for a refusal — indistinguishable from 'no policy is pinned'"
 n_open=$(printf '%s\n' "$w3all" | grep -c '^open pinned ')
