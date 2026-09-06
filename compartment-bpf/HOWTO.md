@@ -560,7 +560,7 @@ sudo -E /usr/sbin/compartment-bpf --pin --self-protect profiles/aide.conf
 ```
 
 What it refuses, for every task whose `mm->exe_file` is not an authorised
-loader image:
+loader image — measured identically on 6.8.0-139 and 7.0.0-31:
 
 * any fd to a compartment BPF map — read-only included, because a read-only fd
   is enough to write the map from a BPF program (`bpf_map_freeze()` gates only
@@ -589,6 +589,18 @@ Two prerequisites, both enforced at pin time with a clear refusal:
 Without the flag, nothing changes: the `comp_bpf_map` program is not even
 loaded, the pin set is the same 28 links v0.8 pinned, and both new counters
 stay 0.
+
+That default is a real exposure and not a neutral one, which is the reason
+this flag exists. **With the flag off, `bpf_map_freeze()` is not map
+integrity.** Freezing gates the *syscall* path only, so a `CAP_BPF` holder
+that obtains any fd to a frozen compartment map — `BPF_F_RDONLY` is enough —
+splices it into a BPF program of its own with `bpf_map__reuse_fd()` and
+writes it from *program* context: measured on both kernels, the syscall write
+stays `EPERM`, the program write returns 0 and the value reads back. Wiping
+the seal entries that way removes policy with no unlink, no umount and no
+audit event at all. So on a default build the load-bearing control is not the
+freeze — it is keeping `CAP_BPF` off every workload and every root login.
+`tests/bypass/26-frozen-map-honesty.sh` re-measures the gap on every run.
 
 #### The errno an operator sees
 
@@ -717,8 +729,45 @@ the file or inode data plane changes either way: the pin-tamper branch costs
 one array lookup and one integer compare on any filesystem that is not the
 bpffs holding the pins.
 
-See the `LIMITATIONS.md` self-protection section for the measurement behind the
-read-only decision and for what the flag does **not** close.
+#### What it does not close
+
+Six residuals, in the order an operator meets them. `LIMITATIONS.md`'s
+self-protection section carries the full table, including two adjacent
+upstream gaps (`mount --move` of the pin bpffs, and the unpin sentinel not
+being a bpffs object).
+
+1. **A reboot with `lsm=` changed, or `kexec`.** bpffs is not persistent and
+   the BPF LSM is only in the chain because the kernel command line put it
+   there. Root can come back with no compartment at all, and nothing enforced
+   from inside a running kernel survives that. Secure Boot plus a signed,
+   locked bootloader is the answer and it is outside this tool; compartment's
+   contribution is that the change is not silent.
+2. **A map fd stolen from a *running* loader.** `pidfd_getfd(2)` and
+   `SCM_RIGHTS` clone an existing fd without calling `bpf_map_new_fd()`, so
+   `comp_bpf_map` never sees them. Both need `PTRACE_MODE_ATTACH` on the
+   loader, and in daemonless `--pin` mode there is no loader process to
+   attach to. `lsm/file_receive` would close the `SCM_RIGHTS` half.
+3. **A stranded pin tree** after an unauthorised loader change. Bounded by a
+   reboot, and avoided by one of the two ceremonies above: `--unpin` before
+   replacing the binary, or `--authorize-loader` at pin time.
+4. **`bpftool map show` aborts host-wide** at the first compartment map while
+   the flag is on. Accepted cost; the upstream fix worth proposing is one
+   line in bpftool — `continue` on `EPERM`/`EACCES` in its map-listing loop.
+5. **Mount-namespace reachability.** An operator can be in a namespace that
+   cannot see the pin tree while enforcement is live. `--unpin` warns instead
+   of reporting success, but cannot fix it; recovery is `nsenter` into the
+   namespace holding the bpffs, or a reboot.
+6. **`CAP_BPF` itself.** This flag raises the cost of using the capability
+   against this tool; it does not take the capability off the box.
+
+That last one is the limited-root profile's job, and the two controls
+compose: `--self-protect` puts the maps and the pin tree behind the loader's
+binary identity for every caller, while a limited-root deployment takes
+`CAP_BPF` away from a confined uid-0 session and makes it the only route to
+the seals. **Neither replaces the other.** The complete list of what the
+session-side control does not protect against is the top-level `HOWTO.md`,
+"Limited root over SSH", section 8; `LIMITATIONS.md` has the measurement
+behind the read-only decision and the full residual table for this side.
 
 ---
 

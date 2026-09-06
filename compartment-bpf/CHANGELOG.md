@@ -112,11 +112,26 @@ maps after ours in id order are not listed either. `bpftool prog show`,
 fully usable. Measured on bpftool 7.4 and 7.7. Returning `-ENOENT` would avoid
 it (measured: exit 0, our maps simply absent) at the cost of making an
 unauthorised `--stats` indistinguishable from "no policy pinned"; the honest
-errno was kept.
+errno was kept. Runtime cost, from `make bench-bpf-syscall`: of order
+100-250 ns per map-fd creation with the flag on, roughly 10-17 % of the
+thinnest `bpf(2)` call that hands one out; read the nanoseconds, since the
+percentage moves with the baseline. With the flag off it is nil.
 
 **Unchanged without the flag.** `comp_bpf_map` is not autoloaded, the pinned
 link set is the same 28 links, the two new action codes never fire, and both
-new counters stay 0.
+new counters stay 0. `bpf_map_freeze()` is not map integrity in that build —
+see the correction above — so the load-bearing control is keeping `CAP_BPF`
+off every workload and every root login.
+
+**What it does not close**, in six lines: a reboot with `lsm=` changed or a
+`kexec`; a map fd stolen from a *running* loader via `pidfd_getfd(2)` or
+`SCM_RIGHTS`, neither of which calls `bpf_map_new_fd()`; a pin tree stranded
+by an unauthorised loader change, which costs a reboot; the host-wide
+`bpftool map show` listing, whose upstream fix is one line (`continue` on
+`EPERM`/`EACCES` in its map-listing loop); an operator in a mount namespace
+that cannot see the pin tree; and `CAP_BPF` itself, which is the limited-root
+profile's job. The two controls compose and neither replaces the other. Full
+table in `LIMITATIONS.md`.
 
 ### Behaviour change — timestamp writes are now `no-chmod`-class
 

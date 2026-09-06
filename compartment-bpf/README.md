@@ -214,14 +214,23 @@ See `LIMITATIONS.md` for the full table. Highlights:
   enough — writes it from a BPF program of its own (measured on 6.8.0-139 and
   7.0.0-31). So the seal maps are mutable by an unconfined root, and wiping
   them removes policy with no unlink and no audit event.
-- **Opt-in self-protection** closes both of the two above: `--pin
-  --self-protect` denies map fds and pin removal to anything that is not the
-  loader image. It is off by default because the maintenance right is the
-  loader's `(dev, ino)`, so a rebuilt or upgraded binary cannot unpin the old
-  policy — unpin before upgrading, or pre-authorise the successor with
-  `--authorize-loader` at pin time; a stranded tree costs a reboot. While it is
-  on, `bpftool map show` aborts its host-wide listing at the first compartment
-  map. See `HOWTO.md` §3.6 and `LIMITATIONS.md`.
+- **Opt-in self-protection** closes both of the two above, measured on
+  6.8.0-139 and 7.0.0-31: `--pin --self-protect` denies every map fd
+  (read-only included — a read-only fd is a complete attack, so no carve-out)
+  and every pin unlink, rename, over-mount and bpffs `umount` to anything that
+  is not an authorised loader image. Off by default, for three costs: a
+  rebuilt or upgraded binary is a different inode and cannot unpin the old
+  policy (unpin before upgrading, or pre-authorise the successor with
+  `--authorize-loader` at pin time — a stranded tree costs a reboot);
+  `bpftool map show` aborts its host-wide listing at the first compartment
+  map while it is on; and the gate costs of order 100–250 ns per map-fd
+  creation, ~10–17 % of that call, where the default build costs nothing
+  because the program is not loaded. Six things it does **not** close — a
+  reboot with `lsm=` changed or `kexec`, an fd stolen from a *running* loader,
+  a stranded tree, the `bpftool` listing, mount-namespace reachability, and
+  `CAP_BPF` itself — are in `LIMITATIONS.md`. The last of those is the
+  limited-root profile's job: the two controls compose and neither replaces
+  the other. See `HOWTO.md` §3.6.
 - **btrfs / overlayfs anon_bdev**: on these filesystems, `(dev, ino)` can be
   reused across bind-mount views of the same inode; see LIMITATIONS.md.
 - **No cryptographic policy signing** yet.

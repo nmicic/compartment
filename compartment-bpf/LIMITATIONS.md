@@ -262,20 +262,153 @@ performing routine maintenance (LVM snapshot, volume detach, `remount,ro` for
 - Future signed-policy design notes — cryptographic policy signing,
   sealed-agent mode, and future exec-trust seal work not yet shipped.
 
-## Self-protection (`--pin --self-protect`) — what it does not close
+## Self-protection (`--pin --self-protect`) — what it closes, what it costs, what it leaves open
 
-The flag is opt-in and off by default. It closes the map, pin and mount
-surfaces described in the three corrected rows above. These remain open, and
-they are the honest boundary of what a control enforced from inside a running
-kernel can do against an unconfined root:
+One section, so that the whole trade can be read before the flag is turned
+on. It is **opt-in and off by default**. Everything below was measured on
+kernel 6.8.0-139 and 7.0.0-31, with bpftool 7.4 and 7.7. `HOWTO.md` §3.6 is
+the operator walkthrough — the flags, the two prerequisites, the two upgrade
+ceremonies and the stranding recovery.
+
+### What it closes
+
+Three rows in the table above — **CAP_BPF + direct map mutation**,
+**Privileged removal of the LSM links** and **Privileged-tenant
+strict-launch marker forgery** — describe surfaces that are open to an
+unconfined root holding `CAP_BPF` in the default build. `--self-protect`
+closes all three in the kernel, for every task whose `mm->exe_file` inode is
+not in the authorised loader set. Identical results on both kernels:
+
+| Path to enforcement | default build (`--pin`) | `--pin --self-protect` |
+|---|---|---|
+| `BPF_MAP_GET_FD_BY_ID`, read-write | fd granted | `EPERM`, `DENY_BPF_SELF` |
+| `BPF_MAP_GET_FD_BY_ID`, `BPF_F_RDONLY` | fd granted | `EPERM` — read-only is not carved out; see below |
+| `BPF_OBJ_GET` on a map pin | fd granted | `EPERM` |
+| BPF-program write to a frozen seal map | **succeeds** | no fd to start from |
+| strict-launch marker forge through a pidfd | **succeeds** | no fd to start from |
+| `rm` / `mv` / `rmdir` of a link pin, a map pin or a pin directory | succeeds; that hook stops enforcing | `EACCES`, `DENY_PIN_TAMPER` |
+| `rm -rf` of the pin root | succeeds; enforcement gone | `EACCES`; pins intact and still enforcing |
+| `umount` / `umount -l` of the bpffs holding the pins | succeeds, or orphans the policy | `EACCES`, `DENY_UMOUNT` |
+| over-mounting a second bpffs (`move_mount(2)` included) | succeeds, shadows the tree | `EACCES`, `DENY_PIN_TAMPER` |
+| `--unpin` or `--stats` from an image at another inode | works | refused, once, with the remedy named |
+| `--unpin` from the pinning image | works | works, drains to 0 |
+
+The gate is one extra attach point, `comp_bpf_map` on `bpf_map_new_fd()`,
+plus a pin-tamper branch on `comp_inode_unlink`, `comp_inode_rename`,
+`comp_inode_rmdir`, `comp_sb_mount` and `comp_move_mount`, and a bpffs
+refusal in `comp_sb_umount`. Denials increment `bpf_self_denied_total` or
+`pin_tamper_denied_total`, both subsets of `deny_total`, and each carries
+the calling image's inode in the audit stream. Without the flag the
+`comp_bpf_map` program is not loaded at all: the pin set is the same 28
+links v0.8 pinned, the armed set is 29, and both new counters stay 0.
+
+### The fact the flag exists to answer, restated for the default build
+
+With the flag **off**, `bpf_map_freeze()` is not map integrity. It gates
+`map_get_sys_perms()` on the syscall path only, so a `CAP_BPF` holder that
+obtains any fd to a frozen compartment map — `BPF_F_RDONLY` is enough —
+splices it into a BPF program of its own with `bpf_map__reuse_fd()` and
+writes it from program context: the syscall write stays `EPERM`, the program
+write returns 0, and the value reads back. Every compartment map is reachable
+that way, and wiping the seal entries removes policy with no unlink, no
+umount and no audit event at all. The full row is above; the point of
+repeating it here is that **freezing is not the control** — either
+`--self-protect` is on, or keeping `CAP_BPF` off every workload and every
+root login is the control.
+
+`tests/bypass/26-frozen-map-honesty.sh` re-measures that gap on every run as
+an *honest witness*: it asserts the gap rather than its absence, so if a
+kernel or a future default ever closes it the witness fails with the text to
+fix, and this document cannot keep a limitation it no longer has.
+
+### Why read-only map access is not carved out
+
+`--stats` and `bpftool map dump` would both be more convenient with a
+read-only exemption. It was considered and rejected on the measurement
+above: a read-only fd is a complete attack, not a lesser one, so an
+exemption would have left every seal map writable from program context and
+made the gate decorative. `--stats` still works from an authorised loader
+image — in the normal case the same executable that pinned the policy — and
+from an unauthorised one it prints one errno line plus a sentence naming the
+remedy, rather than a page of bare errnos.
+
+### The errno choices
+
+Split by syscall rather than made uniform, and each one is what a tool on
+that path already knows how to report:
+
+* **`-EPERM` for a denied map fd** (`comp_bpf_map`). `bpf(2)` reports every
+  "you do not have the right to this object" as `EPERM`, including
+  `BPF_MAP_GET_FD_BY_ID` for a caller without `CAP_BPF`, so a BPF tool has
+  an `EPERM` path and no `EACCES` path.
+* **`-EACCES` for pin tamper** (the five inode and mount branches, and the
+  bpffs `umount` refusal under the existing `DENY_UMOUNT`). That is what
+  every other compartment path deny returns, and what `rm`, `mv` and
+  `umount` print.
+* **`-ENOENT` was measured and rejected.** It would make `bpftool map show`
+  skip our maps and exit 0, which is the only thing it buys, and it
+  disguises a security decision as a missing object: an unauthorised
+  `--stats` would print "no pinned counters found", which an operator cannot
+  tell from "no policy is pinned".
+
+### What it costs
+
+* **`bpftool map show`, host-wide, aborts** at the first compartment map
+  (`Error: can't get map by id (N): Operation not permitted`, exit 255), so
+  maps *after* ours in id order are not listed either. `prog show`,
+  `link show`, `cgroup tree`, `map show id <N>` for a non-compartment id and
+  every unrelated map, pin and dump operation are unaffected. The upstream
+  fix worth proposing is one line in bpftool: `continue` on `EPERM`/`EACCES`
+  in its map-listing loop instead of aborting the walk.
+* **Runtime**, from `make bench-bpf-syscall` (median of seven 200 000-call
+  runs of `BPF_MAP_GET_FD_BY_ID` + `close`, the thinnest syscall that
+  reaches the hook). Flag **off** is free — every run landed within ±0.5 %
+  of the no-policy baseline, including one that measured faster, because the
+  program is not loaded. Flag **on** costs of order **100–250 ns per map-fd
+  creation, roughly 10–17 %** of that call. Read the nanoseconds rather than
+  the percentage: the percentage moves with whatever else the box is doing
+  to the baseline, 7.0 reproduced to within 23 ns across three runs and 6.8
+  spread wider on an otherwise busy 2-vCPU guest. Nothing on the file or
+  inode data plane changes either way — the pin-tamper branch is one array
+  lookup and one integer compare on any filesystem that is not the bpffs
+  holding the pins. Measure on your own hardware if you have a latency
+  budget on `bpf(2)`.
+* **The upgrade ceremony.** The maintenance right is the `(dev, ino)` of a
+  binary image, so a rebuilt or upgraded loader is a different image and
+  cannot unpin the old policy. Either `--unpin` before replacing the binary,
+  or name the successor with `--authorize-loader` at pin time (resolved to
+  `(dev, ino)` then, so replacing *that* file afterwards does not carry the
+  authorisation over). A tree stranded by getting this wrong costs a reboot.
+
+### What it does not close
+
+Six residuals, and they are the honest boundary of what a control enforced
+from inside a running kernel can do against an unconfined root. Two adjacent
+upstream gaps follow them.
 
 | Surface | Why it stays open | Where the answer lives |
 |---|---|---|
 | **Reboot with `lsm=` changed, or `kexec`** | bpffs is not persistent and the BPF LSM is only in the chain because `lsm=` on the kernel command line put it there. Root can edit the bootloader config, or `kexec` straight into a kernel with no `bpf` LSM, and come back with no compartment at all. Nothing enforced from inside a running kernel survives that. | Out of scope for this tool: Secure Boot plus a signed, locked bootloader; measured boot; `/boot` in a separate integrity domain. Compartment's only contribution is that the change is not silent — the policy stops existing, so anything watching `--stats` or the ringbuf sees enforcement stop. |
 | **A map fd stolen from a *running* loader** | `pidfd_getfd(2)` and `SCM_RIGHTS` clone an existing fd without going through `bpf_map_new_fd()`, so `comp_bpf_map` never sees them and the gate does not apply. | Both require `PTRACE_MODE_ATTACH` on the loader; `comp_ptrace_access_check` already gates that for strict actors. In daemonless `--pin` mode there is no loader process to attach to, so there is no fd to steal. `lsm/file_receive` would close the `SCM_RIGHTS` half and is tracked with the fd-handover work. |
-| **A stranded pin tree after a rebuild or upgrade** | The maintenance right is `(dev, ino)` of a binary image. A rebuild or package upgrade produces a new inode, which is by construction a different image. If nobody pre-authorised it and the old image is gone, nothing on the running box can unpin. | Bounded by the same reboot: bpffs is memory-backed, so a restart clears the tree. The ceremony that avoids needing one is in `HOWTO.md` §3.6. This is exactly why the flag is opt-in. |
-| **`bpftool map show` on the whole host** | Denying fd creation makes bpftool abort its map listing at the first compartment map (`Error: can't get map by id (N): Operation not permitted`, exit 255) — maps *after* ours in id order are not listed either. Measured on bpftool 7.4 and 7.7. `bpftool prog show`, `link show` and `cgroup tree` are unaffected, and creating, writing, dumping, pinning and unlinking unrelated maps and pins all still work. | Accepted cost of the feature, which is why it is opt-in. `compartment-bpf --stats` reads this tool's own counters from an authorised image; `bpftool map show id <N>` still works for a specific non-compartment id. Returning `-ENOENT` instead would make bpftool skip our maps and exit 0 (measured), but it would also make an unauthorised `--stats` report "no pinned counters found" — indistinguishable from "no policy is pinned" — so the honest errno was kept. |
+| **A stranded pin tree after a rebuild or upgrade** | The maintenance right is `(dev, ino)` of a binary image. A rebuild or package upgrade produces a new inode, which is by construction a different image. If nobody pre-authorised it and the old image is gone, nothing on the running box can unpin. | Bounded by a reboot: bpffs is memory-backed, so a restart clears the tree. Two ceremonies avoid needing one — `--unpin` before replacing the binary, or `--authorize-loader PATH` at pin time for a zero-gap handover — both in `HOWTO.md` §3.6 and witnessed in both directions by `tests/bypass/25-loader-upgrade.sh`. This is exactly why the flag is opt-in. |
+| **`bpftool map show` on the whole host** | Denying fd creation makes bpftool abort its map listing at the first compartment map (`Error: can't get map by id (N): Operation not permitted`, exit 255) — maps *after* ours in id order are not listed either. Measured on bpftool 7.4 and 7.7. `bpftool prog show`, `link show` and `cgroup tree` are unaffected, and creating, writing, dumping, pinning and unlinking unrelated maps and pins all still work. | Accepted cost of the feature, which is why it is opt-in. `compartment-bpf --stats` reads this tool's own counters from an authorised image; `bpftool map show id <N>` still works for a specific non-compartment id. The upstream fix is one line in bpftool — `continue` on `EPERM`/`EACCES` in the map-listing loop — and is worth proposing. Returning `-ENOENT` instead would make bpftool skip our maps and exit 0 (measured), but it would also make an unauthorised `--stats` report "no pinned counters found" — indistinguishable from "no policy is pinned" — so the honest errno was kept. |
 | **Mount-namespace reachability** | An operator can be in a mount namespace that cannot see the pin tree at all, in which case `--unpin` has nothing to unlink even though enforcement is live. | Not fixable from the loader, but no longer silent: `--unpin` warns instead of reporting success when the pin tree is invisible while compartment programs are still loaded. Recovery is `nsenter` into the namespace holding the bpffs, or a reboot. |
-| **`mount --move` of the pin bpffs** | `do_move_mount_old()` has no `security_move_mount()` call, and `security_sb_mount()` only sees the mount *destination*, so relocating `/sys/fs/bpf` elsewhere is invisible to both gates. The result is the same orphan the over-mount and umount paths produce: pins gone from `PIN_ROOT`, enforcement live. This is the same upstream gap the `mount(2)` `MS_MOVE` source side already has for ordinary seals, not something `--self-protect` introduces. | Nothing to attach; re-check on each kernel bump. It needs `CAP_SYS_ADMIN`, and the policy is still enforcing afterwards — what is lost is the ability to find and remove it, which a reboot restores. |
-| **The unpin sentinel is not a bpffs object** | `--self-protect` protects the tool's kernel state. The ED-11 unpin sentinel lives at `/run/compartment-bpf/unpin-sentinel`, not on bpffs, so `protected_pins` does not cover it and any root can delete it. | Deleting it does not remove enforcement — the pins are still loader-only — it only downgrades `--unpin` to the legacy no-passphrase path, and `--unpin` still has to come from an authorised loader image. Treat the passphrase gate as a control against *non*-`CAP_BPF` root, exactly as HOWTO §3 already says; `--self-protect` is the one that answers `CAP_BPF`. |
-| **`CAP_BPF` itself** | Self-protection raises the cost of using `CAP_BPF` against this tool; it does not remove the capability from the box. | The limited-root profile's job. The two controls compose and neither replaces the other. |
+| **`CAP_BPF` itself** | Self-protection raises the cost of using `CAP_BPF` against this tool; it does not remove the capability from the box. Anything that still holds it can load its own programs, and can strip enforcement the moment this policy is unpinned. | The limited-root profile's job — `cap-drop CAP_BPF` on interactive root, `CapabilityBoundingSet=` on units. The two controls compose and neither replaces the other; see below. |
+| *(adjacent)* **`mount --move` of the pin bpffs** | `do_move_mount_old()` has no `security_move_mount()` call, and `security_sb_mount()` only sees the mount *destination*, so relocating `/sys/fs/bpf` elsewhere is invisible to both gates. The result is the same orphan the over-mount and umount paths produce: pins gone from `PIN_ROOT`, enforcement live. This is the same upstream gap the `mount(2)` `MS_MOVE` source side already has for ordinary seals, not something `--self-protect` introduces. | Nothing to attach; re-check on each kernel bump. It needs `CAP_SYS_ADMIN`, and the policy is still enforcing afterwards — what is lost is the ability to find and remove it, which a reboot restores. |
+| *(adjacent)* **The unpin sentinel is not a bpffs object** | `--self-protect` protects the tool's kernel state. The ED-11 unpin sentinel lives at `/run/compartment-bpf/unpin-sentinel`, not on bpffs, so `protected_pins` does not cover it and any root can delete it. | Deleting it does not remove enforcement — the pins are still loader-only — it only downgrades `--unpin` to the legacy no-passphrase path, and `--unpin` still has to come from an authorised loader image. Treat the passphrase gate as a control against *non*-`CAP_BPF` root, exactly as HOWTO §3 already says; `--self-protect` is the one that answers `CAP_BPF`. |
+
+### It composes with the limited-root profile, and neither replaces the other
+
+The two controls shipped in 1.4.0 answer opposite halves of the same
+sentence. `--self-protect` puts this tool's maps and pin tree behind the
+loader's own binary identity, for every caller on the box — but it does not
+take `CAP_BPF` away from anyone, and a holder of that capability keeps every
+other use of `bpf(2)`. The limited-root deployment takes `CAP_BPF` away from
+a confined uid-0 session and makes it the only route to the seals — but it
+does nothing to defend `CAP_BPF` itself, so any root process that was never
+in the session still owns the pins with the flag off.
+
+Deploy both, and read the other side's limits before you do: the top-level
+`HOWTO.md`, "Limited root over SSH" §8, is the complete list of what the
+session-side control does not protect against, and item 11 there is this
+dependency stated from the other direction.
