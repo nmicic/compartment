@@ -400,9 +400,11 @@ packages:
   # tests/profile-e2e/aide.sh, tests/profile-e2e/postgres.sh and observe
   # T12 SKIP, and each skip had to be carried in
   # tests/release-skip-allowlist.txt — four allow-listed skips on every
-  # release, for two packages.
+  # release, for three packages. postgresql (not just -common) is needed
+  # because postgres.sh asserts against a live, online cluster.
   - aide
   - postgresql-common
+  - postgresql
 
 write_files:
   - path: /etc/ssh/sshd_config.d/99-allow-root.conf
