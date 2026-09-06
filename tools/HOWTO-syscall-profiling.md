@@ -136,13 +136,13 @@ AI agents run for hours. Use `--duration` to capture a representative sample:
 ```bash
 # Profile for 5 minutes, following child processes
 python3 syscall.py profile --seccomp-mode allow --duration 300 \
-    -o claude.conf -- claude --model claude-opus-4-6
+    -o my-agent.conf -- my-agent --model some-model
 
 # Review what was observed
-python3 syscall.py trace --duration 300 -- claude --model claude-opus-4-6
+python3 syscall.py trace --duration 300 -- my-agent --model some-model
 
 # Check if the ai-agent default would have been fine
-python3 syscall.py check --profile ai-agent --duration 300 -- claude
+python3 syscall.py check --profile ai-agent --duration 300 -- my-agent
 ```
 
 > **Important:** A single profiling run will miss rare code paths.
@@ -203,14 +203,14 @@ bare name is searched for in order:
 # User profile
 mkdir -p ~/.config/compartment
 python3 syscall.py profile -m allow --with-env \
-    -o ~/.config/compartment/claude.conf -- claude
+    -o ~/.config/compartment/my-agent.conf -- my-agent
 
 # System profile (as root)
 python3 syscall.py profile -m allow --with-env \
-    -o /etc/compartment/claude.conf -- claude
+    -o /etc/compartment/my-agent.conf -- my-agent
 
 # Use by name (no path needed)
-compartment-user --profile claude -- claude
+compartment-user --profile my-agent -- my-agent
 ```
 
 ## Profile Inheritance
