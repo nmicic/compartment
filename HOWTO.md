@@ -355,6 +355,23 @@ The real shell directory defaults to `/bin/shells` and can be overridden:
   `/bin/.shells_a7f3b2c1e4cc`) so the path isn't guessable.
   `sandbox.sh` also randomizes the path per invocation.
 
+`COMPARTMENT_SHELL_DIR` comes from the caller — in a login-shell
+deployment, from the very user being confined — so it is honoured only
+when it is an absolute path with no `..` component and both the directory
+and the shell binary inside it are owned by root or by you and are
+neither group- nor world-writable. Otherwise compartment-user prints a
+warning and uses the compile-time `REAL_SHELL_DIR`.
+
+**The sandbox is applied before the exec either way.** An accepted
+`COMPARTMENT_SHELL_DIR` changes *which binary* runs, never *whether* it
+is confined. For a hardened deployment, do not set the variable at all
+and rely on `make hardened`.
+
+In shell-replacement mode the profile is read from
+`/etc/compartment/ai-agent.conf` or the compiled-in default;
+`~/.config/compartment/` is never searched, and `--user-profiles` does
+not apply.
+
 ---
 
 ## Corporate Environment: Sandboxing Without Root

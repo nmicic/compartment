@@ -178,8 +178,31 @@ shell), the program enters shell-replacement mode:
 it applies the
 .B ai-agent
 profile and execs the real shell from the stash directory
-(compile-time \fBREAL_SHELL_DIR\fR or the \fBCOMPARTMENT_SHELL_DIR\fR
-environment variable).
+(compile-time \fBREAL_SHELL_DIR\fR, or the \fBCOMPARTMENT_SHELL_DIR\fR
+environment variable when that names a directory worth trusting).
+The profile is read from
+.I /etc/compartment/ai-agent.conf
+or the compiled-in default;
+.I $HOME
+is never searched in this mode.
+.PP
+.B COMPARTMENT_SHELL_DIR
+is caller-supplied, so it is honoured only when it is an absolute path
+with no \fB..\fR component and both the directory and the shell binary
+inside it are owned by root or by the real uid of the caller and are
+neither group- nor world-writable.
+Otherwise it is ignored with a warning on standard error and the
+compile-time
+.B REAL_SHELL_DIR
+is used instead.
+Either way the sandbox is applied before the exec: an accepted
+.B COMPARTMENT_SHELL_DIR
+changes which binary runs, never whether it is confined.
+.PP
+Shell-replacement mode performs the same preflight check, ambient
+capability clearing,
+.BR PR_SET_DUMPABLE (2)
+reset and file-descriptor cleanup as the normal path.
 .PP
 .B "IMPORTANT:"
 Shell-replacement mode
@@ -292,7 +315,10 @@ Command executed successfully under sandbox.
 Configuration error, missing command, or profile load failure.
 .TP
 .B 126
-Shell-replacement mode failed (enforcement error or path traversal rejected).
+Reserved. Shell-replacement mode no longer refuses to run: a rejected
+.B COMPARTMENT_SHELL_DIR
+is a warning and a fall back to the compile-time stash directory, and an
+enforcement failure is logged to syslog.
 .TP
 .B 127
 Command not found or not executable under Landlock restrictions.

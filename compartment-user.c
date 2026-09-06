@@ -678,6 +678,87 @@ static int print_verify(void)
 #define REAL_SHELL_DIR "/bin/shells"
 #endif
 
+/* ── Hardening applied on every path, just before exec ───────────── */
+
+static void apply_hardening(void)
+{
+    /* Clear ambient capabilities — prevents inherited caps from parent */
+    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+
+    /* Disable coredumps — prevents pipe core_pattern bypass and
+     * also restricts /proc/self access from other same-UID processes */
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+
+    /* Close inherited file descriptors — Landlock only restricts new
+     * open() calls, not already-open fds leaked from the parent.
+     * close_range() available since Linux 5.9, glibc 2.34. */
+    if (close_range(3, ~0U, 0) != 0) {
+        /* Fallback for older kernels — use rlimit to find upper bound */
+        struct rlimit rl;
+        int max_fd = 4096;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < (rlim_t)max_fd)
+            max_fd = (int)rl.rlim_cur;
+        for (int cfd = 3; cfd < max_fd; cfd++) close(cfd);
+    }
+}
+
+/* ── COMPARTMENT_SHELL_DIR validation ────────────────────────────── */
+
+/* The env var comes from the caller — in a login-shell deployment, from
+ * the very user being confined — and it decides which binary the "shell"
+ * actually is. The 'hardened' Makefile target randomises REAL_SHELL_DIR
+ * precisely so that path is unguessable; an unchecked override defeats
+ * that. Honour it only when the directory and the shell binary inside it
+ * are owned by root or by the caller and are not group- or
+ * world-writable. Anything else is a warning and a fall back to the
+ * compile-time REAL_SHELL_DIR — never a refusal, because this code path
+ * must not be able to lock a user out of their account.
+ *
+ * The sandbox is applied before the exec either way. */
+static int shell_dir_acceptable(const char *dir, const char *shell_name)
+{
+    if (dir[0] != '/') {
+        fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
+                "'%s': must be absolute\n", dir);
+        return 0;
+    }
+    for (const char *p = dir; *p; p++) {
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0') &&
+            (p == dir || p[-1] == '/')) {
+            fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
+                    "'%s': contains '..'\n", dir);
+            return 0;
+        }
+    }
+
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
+                "'%s': %s\n", dir, strerror(errno));
+        return 0;
+    }
+    /* Same ownership and write rules as a profile file: root or the real
+     * uid, nothing group- or world-writable. */
+    int ok = profile_fd_trusted(dfd, 0, S_IFDIR, "shell directory", dir) == 0;
+    if (ok) {
+        int sfd = openat(dfd, shell_name, O_RDONLY | O_CLOEXEC);
+        if (sfd < 0) {
+            fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
+                    "'%s': %s/%s: %s\n", dir, dir, shell_name, strerror(errno));
+            ok = 0;
+        } else {
+            ok = profile_fd_trusted(sfd, 0, S_IFREG, "shell binary",
+                                    shell_name) == 0;
+            close(sfd);
+        }
+    }
+    close(dfd);
+    if (!ok)
+        fprintf(stderr, "compartment-user: falling back to %s\n",
+                REAL_SHELL_DIR);
+    return ok;
+}
+
 int main(int argc, char *argv[])
 {
     /*
@@ -691,28 +772,9 @@ int main(int argc, char *argv[])
     char *invoked_name = basename(argv[0]);
     if (strcmp(invoked_name, "compartment-user") != 0) {
         const char *shell_dir = getenv("COMPARTMENT_SHELL_DIR");
+        if (shell_dir && !shell_dir_acceptable(shell_dir, invoked_name))
+            shell_dir = NULL;
         if (!shell_dir) shell_dir = REAL_SHELL_DIR;
-
-        /* Validate shell_dir: must be absolute and must not contain ".." */
-        if (shell_dir[0] != '/') {
-            fprintf(stderr, "compartment-user: COMPARTMENT_SHELL_DIR must be absolute: %s\n",
-                    shell_dir);
-            return 126;
-        }
-        /* Check for ".." traversal in shell_dir */
-        {
-            const char *p = shell_dir;
-            while (*p) {
-                if (p[0] == '.' && p[1] == '.' &&
-                    (p[2] == '/' || p[2] == '\0') &&
-                    (p == shell_dir || p[-1] == '/')) {
-                    fprintf(stderr, "compartment-user: COMPARTMENT_SHELL_DIR contains '..': %s\n",
-                            shell_dir);
-                    return 126;
-                }
-                p++;
-            }
-        }
 
         char real_shell[PATH_MAX];
         int rsn = snprintf(real_shell, sizeof(real_shell), "%s/%s",
@@ -756,6 +818,18 @@ int main(int argc, char *argv[])
 
         int shell_degraded = 0;
 
+        /* Same preflight as the normal path, but advisory: a degraded
+         * environment must not stop a login. */
+        {
+            int pf = preflight_check(&shell_cfg);
+            if (pf > 0) {
+                syslog(LOG_WARNING, "compartment-user[%s]: %d preflight "
+                       "check%s failed — enforcement may be degraded",
+                       invoked_name, pf, pf > 1 ? "s" : "");
+                shell_degraded += pf;
+            }
+        }
+
         if (shell_cfg.use_no_new_privs) {
             if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
                 syslog(LOG_WARNING, "compartment-user[%s]: "
@@ -789,6 +863,10 @@ int main(int argc, char *argv[])
                    shell_degraded > 1 ? "s" : "",
                    getuid(), getpid(), getppid());
         }
+
+        /* Same ambient-cap clear, PR_SET_DUMPABLE(0) and fd cleanup the
+         * normal path performs — these were omissions, not choices. */
+        apply_hardening();
 
         execv(real_shell, argv);
         fprintf(stderr, "compartment-user: exec %s: %s\n",
@@ -1100,25 +1178,7 @@ int main(int argc, char *argv[])
     }
 
     /* ── 6. Hardening (defense in depth) ─────────────────────── */
-
-    /* Clear ambient capabilities — prevents inherited caps from parent */
-    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
-
-    /* Disable coredumps — prevents pipe core_pattern bypass and
-     * also restricts /proc/self access from other same-UID processes */
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-
-    /* Close inherited file descriptors — Landlock only restricts new
-     * open() calls, not already-open fds leaked from the parent.
-     * close_range() available since Linux 5.9, glibc 2.34. */
-    if (close_range(3, ~0U, 0) != 0) {
-        /* Fallback for older kernels — use rlimit to find upper bound */
-        struct rlimit rl;
-        int max_fd = 4096;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < (rlim_t)max_fd)
-            max_fd = (int)rl.rlim_cur;
-        for (int cfd = 3; cfd < max_fd; cfd++) close(cfd);
-    }
+    apply_hardening();
 
     /* ── 7. exec ───────────────────────────────────────────────── */
     if (cfg.verbose)
