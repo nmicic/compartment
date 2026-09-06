@@ -68,7 +68,7 @@ fi
 # suite installs. The previous version ran `apt-get install -y` on the
 # host, unprompted, and never removed the package: a test suite that
 # modifies the machine it is measuring is not a test suite.
-SUITE_TOTAL=86
+SUITE_TOTAL=101
 bail_skip() {
     skip_group "${SUITE_TOTAL}" "$1"
     echo ""
@@ -326,6 +326,24 @@ echo "--- Test group: /proc and /sys masking (M6) ---"
 MASK_LIST="$("${CR}" --dry-run --verbose -c "${JAIL}" "${CRUSER[@]}" -- /bin/true 2>&1 |
              sed -n 's|^    \(/proc/[^ ]*\)$|\1|p')"
 MASK_COUNT="$(printf '%s\n' "${MASK_LIST}" | grep -c '^/proc/')"
+
+# The list above comes from the tool, so a path deleted from
+# default_proc_masks[] would simply stop being scanned. This is the
+# tracked half: every one of these must still be in the tool's own list,
+# and every one is scanned whether the tool names it or not. /proc/sys
+# unmasked is a container escape and /proc/sysrq-trigger unmasked is a
+# host DoS; neither may quietly leave the table.
+MASK_REQUIRED="/proc/acpi /proc/bus /proc/fs /proc/irq /proc/kallsyms
+/proc/kcore /proc/keys /proc/latency_stats /proc/modules /proc/sched_debug
+/proc/scsi /proc/sys /proc/sysrq-trigger /proc/timer_list /proc/timer_stats"
+for _r in ${MASK_REQUIRED}; do
+    if printf '%s\n' "${MASK_LIST}" | grep -qx -- "${_r}"; then
+        pass "mask table still contains ${_r}"
+    else
+        fail "mask table no longer contains ${_r}"
+    fi
+done
+MASK_LIST="$(printf '%s\n%s\n' "${MASK_LIST}" "${MASK_REQUIRED}" | tr ' ' '\n' | grep '^/proc/' | sort -u)"
 # The container-side scan takes the list as a single-line word list: a raw
 # newline inside a `for f in ...` list is a syntax error in dash/ash.
 MASK_LINE="$(printf '%s ' ${MASK_LIST})"
