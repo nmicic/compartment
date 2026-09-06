@@ -148,7 +148,7 @@ int main(int argc, char *argv[])
         case 'p': /* already handled in pre-scan */ break;
         case 'c':
             free(config.rootdir);
-            config.rootdir = strdup(optarg);
+            config.rootdir = xstrdup(optarg);
             break;
         case 'u': {
             char *endptr;
@@ -176,7 +176,7 @@ int main(int argc, char *argv[])
         }
         case 'U':
             free(config.username);
-            config.username = strdup(optarg);
+            config.username = xstrdup(optarg);
             break;
         case 'a': { /* --seccomp-allowed */
             int nr = resolve_syscall(optarg);
@@ -202,15 +202,15 @@ int main(int argc, char *argv[])
         }
         case 'n':
             free(config.netns);
-            config.netns = strdup(optarg);
+            config.netns = xstrdup(optarg);
             break;
         case 'C':
             if (config.cgroups_count < MAX_PATHS)
-                config.cgroups[config.cgroups_count++] = strdup(optarg);
+                config.cgroups[config.cgroups_count++] = xstrdup(optarg);
             break;
         case 'A':
             if (config.cap_allowed_count < MAX_ENV_VARS)
-                config.cap_allowed_names[config.cap_allowed_count++] = strdup(optarg);
+                config.cap_allowed_names[config.cap_allowed_count++] = xstrdup(optarg);
             break;
         case 'E':
             if (config.env_deny_count < MAX_ENV_VARS)
@@ -225,7 +225,7 @@ int main(int argc, char *argv[])
             break;
         case 'M':
             if (config.mount_mask_count < MAX_PATHS)
-                config.mount_masks[config.mount_mask_count++] = strdup(optarg);
+                config.mount_masks[config.mount_mask_count++] = xstrdup(optarg);
             break;
         case 'L': config.audit_log_dir = optarg; config.audit = 1; break;
         case 'l': config.loopback = 1; break;

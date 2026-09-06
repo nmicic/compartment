@@ -498,6 +498,21 @@ static inline int resolve_cap(const char *name)
     return -1;
 }
 
+/* ── Allocation helper ──────────────────────────────────────────── */
+
+/* A sandboxing tool must never continue with a partially materialised
+ * policy: a NULL path or environment-variable name silently drops a rule
+ * (or is dereferenced later). Fail loudly instead of degrading. */
+static inline char *xstrdup(const char *s)
+{
+    char *p = strdup(s);
+    if (!p) {
+        fputs("compartment: out of memory\n", stderr);
+        exit(1);
+    }
+    return p;
+}
+
 /* ── Boolean value parsing (case-insensitive, fail-closed) ──────── */
 
 static inline int parse_bool(const char *val, int *out)
@@ -614,7 +629,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
 
         if (strcmp(directive, "ro") == 0) {
             if (cfg->path_count < MAX_PATHS) {
-                cfg->paths[cfg->path_count].path = strdup(val);
+                cfg->paths[cfg->path_count].path = xstrdup(val);
                 cfg->paths[cfg->path_count].mode = PATH_RO;
                 cfg->path_count++;
             } else {
@@ -625,7 +640,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             }
         } else if (strcmp(directive, "rw") == 0) {
             if (cfg->path_count < MAX_PATHS) {
-                cfg->paths[cfg->path_count].path = strdup(val);
+                cfg->paths[cfg->path_count].path = xstrdup(val);
                 cfg->paths[cfg->path_count].mode = PATH_RW;
                 cfg->path_count++;
             } else {
@@ -636,7 +651,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             }
         } else if (strcmp(directive, "exec") == 0) {
             if (cfg->path_count < MAX_PATHS) {
-                cfg->paths[cfg->path_count].path = strdup(val);
+                cfg->paths[cfg->path_count].path = xstrdup(val);
                 cfg->paths[cfg->path_count].mode = PATH_EXEC;
                 cfg->path_count++;
             } else {
@@ -647,7 +662,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             }
         } else if (strcmp(directive, "rwx") == 0) {
             if (cfg->path_count < MAX_PATHS) {
-                cfg->paths[cfg->path_count].path = strdup(val);
+                cfg->paths[cfg->path_count].path = xstrdup(val);
                 cfg->paths[cfg->path_count].mode = PATH_RWX;
                 cfg->path_count++;
             } else {
@@ -696,7 +711,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 cfg->seccomp_allow_mode = 0;
         } else if (strcmp(directive, "env-deny") == 0) {
             if (cfg->env_deny_count < MAX_ENV_VARS)
-                cfg->env_deny[cfg->env_deny_count++] = strdup(val);
+                cfg->env_deny[cfg->env_deny_count++] = xstrdup(val);
             else {
                 fprintf(stderr, "compartment: %s:%d: error: env-deny limit (%d) reached, refusing to weaken policy\n",
                         path, lineno, MAX_ENV_VARS);
@@ -705,7 +720,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             }
         } else if (strcmp(directive, "env-allow") == 0) {
             if (cfg->env_allow_count < MAX_ENV_VARS) {
-                cfg->env_allow[cfg->env_allow_count++] = strdup(val);
+                cfg->env_allow[cfg->env_allow_count++] = xstrdup(val);
                 cfg->env_allow_mode = 1;
             } else {
                 fprintf(stderr, "compartment: %s:%d: error: env-allow limit (%d) reached, refusing to weaken policy\n",
@@ -719,7 +734,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             else
                 cfg->env_allow_mode = 0;
         } else if (strcmp(directive, "workdir") == 0) {
-            cfg->workdir = strdup(val);
+            cfg->workdir = xstrdup(val);
         } else if (strcmp(directive, "landlock") == 0) {
             if (parse_bool(val, &cfg->use_landlock) != 0) {
                 fprintf(stderr, "compartment: %s:%d: invalid value for landlock: '%s' (use on/off)\n", path, lineno, val);
@@ -746,7 +761,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 fclose(fp); return -1;
             }
         } else if (strcmp(directive, "audit-log") == 0) {
-            cfg->audit_log_dir = strdup(val);
+            cfg->audit_log_dir = xstrdup(val);
             cfg->audit = 1;
         } else if (strcmp(directive, "inherit") == 0) {
             if (depth >= MAX_INHERIT_DEPTH) {
@@ -786,7 +801,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
         /* ── Root-specific directives (compartment-root only) ─────── */
         } else if (strcmp(directive, "rootdir") == 0) {
             free(cfg->rootdir);
-            cfg->rootdir = strdup(val);
+            cfg->rootdir = xstrdup(val);
         } else if (strcmp(directive, "uid") == 0) {
             char *endptr;
             errno = 0;
@@ -813,13 +828,13 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             cfg->gid = (gid_t)v;
         } else if (strcmp(directive, "username") == 0) {
             free(cfg->username);
-            cfg->username = strdup(val);
+            cfg->username = xstrdup(val);
         } else if (strcmp(directive, "netns") == 0) {
             free(cfg->netns);
-            cfg->netns = strdup(val);
+            cfg->netns = xstrdup(val);
         } else if (strcmp(directive, "cgroup") == 0) {
             if (cfg->cgroups_count < MAX_PATHS)
-                cfg->cgroups[cfg->cgroups_count++] = strdup(val);
+                cfg->cgroups[cfg->cgroups_count++] = xstrdup(val);
             else {
                 fprintf(stderr, "compartment: %s:%d: error: cgroup limit (%d) reached\n",
                         path, lineno, MAX_PATHS);
@@ -828,7 +843,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             }
         } else if (strcmp(directive, "cap-allow") == 0) {
             if (cfg->cap_allowed_count < MAX_ENV_VARS)
-                cfg->cap_allowed_names[cfg->cap_allowed_count++] = strdup(val);
+                cfg->cap_allowed_names[cfg->cap_allowed_count++] = xstrdup(val);
             else {
                 fprintf(stderr, "compartment: %s:%d: error: cap-allow limit (%d) reached\n",
                         path, lineno, MAX_ENV_VARS);
@@ -842,7 +857,7 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
             }
         } else if (strcmp(directive, "mount-mask") == 0) {
             if (cfg->mount_mask_count < MAX_PATHS)
-                cfg->mount_masks[cfg->mount_mask_count++] = strdup(val);
+                cfg->mount_masks[cfg->mount_mask_count++] = xstrdup(val);
             else {
                 fprintf(stderr, "compartment: %s:%d: error: mount-mask limit (%d) reached\n",
                         path, lineno, MAX_PATHS);
@@ -865,7 +880,7 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name, int de
     /* If it contains a slash, treat as explicit path */
     if (strchr(name, '/')) {
         int r = load_profile_file(cfg, name, depth);
-        if (r == 0) cfg->profile_source = strdup(name);
+        if (r == 0) cfg->profile_source = xstrdup(name);
         return r;
     }
 
@@ -877,7 +892,7 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name, int de
         int n = snprintf(path, sizeof(path), "%s/.config/compartment/%s.conf", home, name);
         if (n > 0 && (size_t)n < sizeof(path)) {
             if (load_profile_file(cfg, path, depth) == 0) {
-                cfg->profile_source = strdup(path);
+                cfg->profile_source = xstrdup(path);
                 return 0;
             }
         }
@@ -885,7 +900,7 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name, int de
 
     snprintf(path, sizeof(path), "/etc/compartment/%s.conf", name);
     if (load_profile_file(cfg, path, depth) == 0) {
-        cfg->profile_source = strdup(path);
+        cfg->profile_source = xstrdup(path);
         return 0;
     }
 
@@ -1023,7 +1038,7 @@ static inline void sanitize_env(Config *cfg)
         char *saved[MAX_ENV_VARS];
         for (int i = 0; i < cfg->env_allow_count; i++) {
             const char *val = getenv(cfg->env_allow[i]);
-            saved[i] = val ? strdup(val) : NULL;
+            saved[i] = val ? xstrdup(val) : NULL;
         }
 
         clearenv();
