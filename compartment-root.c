@@ -7,9 +7,10 @@
  * Creates a fully isolated container using Linux namespaces:
  *   1. clone() with NEWUTS, NEWNS, NEWPID, NEWIPC, NEWNET, NEWUSER, NEWCGROUP
  *   2. Parent: UID/GID range mapping + cgroup assignment (host context)
- *   3. Child: pivot_root into new root (old root fully unmounted)
- *   4. Child: Minimal /dev, mount /proc, mask sensitive paths
- *   5. Child: Hostname isolation, optional loopback
+ *   3. Child: pivot_root into new root
+ *   4. Child: mount /proc, populate /dev, mask sensitive paths — all while
+ *      the old root is still attached (mount_too_revealing, see step 3)
+ *   5. Child: detach the old root, then hostname isolation, optional loopback
  *   6. Child: Resource limits (rlimits)
  *   7. Child: Capability bounding-set drop (raw prctl — while still root)
  *   8. Child: PR_SET_KEEPCAPS + privilege drop (setuid/setgid)
@@ -494,10 +495,24 @@ static int child_func(void *arg)
      *   b) Bind-mount new root onto itself (pivot_root requires mount point)
      *   c) chdir into new root
      *   d) pivot_root(".", ".pivot_old")
-     *   e) umount old root, remove pivot point
-     *   f) chdir("/")
+     *   e) chdir("/")
+     *   f) mount /proc (step 4) and populate /dev (step 5) — WHILE the old
+     *      root is still attached under /.pivot_old
+     *   g) umount old root, remove pivot point (step 6)
      *
-     * After this, there is no FD or path to the old root — unlike chroot,
+     * ORDER MATTERS.  Steps f and g used to be the other way round, which
+     * made the tool unusable: mounting a fresh procfs (or sysfs) from inside
+     * a user namespace is gated by the kernel's mount_too_revealing()
+     * check (fs/namespace.c).  It only permits the mount if a *fully
+     * visible* mount of the same filesystem already exists in the current
+     * mount namespace.  Detaching /.pivot_old removes the last visible
+     * procfs, so a subsequent mount("proc", ...) is refused with EPERM
+     * ("VFS: Mount too revealing" in dmesg).  Keeping the old root attached
+     * until /proc, /sys and /dev are in place satisfies the check — and
+     * gives us the host device nodes to bind from (mknod is unavailable in
+     * a user namespace; see step 5).
+     *
+     * After step g there is no FD or path to the old root — unlike chroot,
      * which can be escaped via fchdir() to an open FD outside the root.
      */
     if (!config->rootdir) {
@@ -535,37 +550,17 @@ static int child_func(void *arg)
         exit(EXIT_FAILURE);
     }
 
-    /* e) Unmount and remove old root */
-    if (umount2("/.pivot_old", MNT_DETACH) != 0) {
-        perror("compartment-root: umount2 old root");
-        exit(EXIT_FAILURE);
-    }
-    (void)rmdir("/.pivot_old");
-
-    /* f) Now "/" is the new root, old root is gone */
+    /* e) Now "/" is the new root; the old root is still attached at
+     *    /.pivot_old and stays there until step 6. */
     if (chdir("/") != 0) {
         perror("compartment-root: chdir /");
         exit(EXIT_FAILURE);
     }
 
-    /* 4. Minimal /dev — tmpfs with only safe devices */
-    (void)mkdir("/dev", 0755);
-    if (mount("tmpfs", "/dev", "tmpfs",
-              MS_NOSUID | MS_NOEXEC, "size=64k,mode=0755") == 0) {
-        mknod("/dev/null",    S_IFCHR | 0666, makedev(1, 3));
-        mknod("/dev/zero",    S_IFCHR | 0666, makedev(1, 5));
-        mknod("/dev/full",    S_IFCHR | 0666, makedev(1, 7));
-        mknod("/dev/random",  S_IFCHR | 0666, makedev(1, 8));
-        mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
-        (void)mkdir("/dev/pts", 0755);
-        if (symlink("/proc/self/fd",   "/dev/fd")     < 0) { /* best-effort */ }
-        if (symlink("/proc/self/fd/0", "/dev/stdin")  < 0) { /* best-effort */ }
-        if (symlink("/proc/self/fd/1", "/dev/stdout") < 0) { /* best-effort */ }
-        if (symlink("/proc/self/fd/2", "/dev/stderr") < 0) { /* best-effort */ }
-    }
-    /* If /dev mount fails (no CAP_SYS_ADMIN inside userns), use existing /dev */
-
-    /* 5. Mount /proc + mask sensitive paths */
+    /* 4. Mount /proc + mask sensitive paths.
+     *
+     * Must run before the old root is detached — see the mount_too_revealing
+     * note above. */
     (void)mkdir("/proc", 0555);
     if (mount("proc", "/proc", "proc",
               MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) != 0) {
@@ -585,6 +580,23 @@ static int child_func(void *arg)
             fclose(fcap);
         }
     }
+
+    /* 5. Minimal /dev — tmpfs with only safe devices */
+    (void)mkdir("/dev", 0755);
+    if (mount("tmpfs", "/dev", "tmpfs",
+              MS_NOSUID | MS_NOEXEC, "size=64k,mode=0755") == 0) {
+        mknod("/dev/null",    S_IFCHR | 0666, makedev(1, 3));
+        mknod("/dev/zero",    S_IFCHR | 0666, makedev(1, 5));
+        mknod("/dev/full",    S_IFCHR | 0666, makedev(1, 7));
+        mknod("/dev/random",  S_IFCHR | 0666, makedev(1, 8));
+        mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
+        (void)mkdir("/dev/pts", 0755);
+        if (symlink("/proc/self/fd",   "/dev/fd")     < 0) { /* best-effort */ }
+        if (symlink("/proc/self/fd/0", "/dev/stdin")  < 0) { /* best-effort */ }
+        if (symlink("/proc/self/fd/1", "/dev/stdout") < 0) { /* best-effort */ }
+        if (symlink("/proc/self/fd/2", "/dev/stderr") < 0) { /* best-effort */ }
+    }
+    /* If /dev mount fails (no CAP_SYS_ADMIN inside userns), use existing /dev */
 
     /* Default masks: hide kernel tunables and memory */
     (void)mount("tmpfs", "/proc/sys", "tmpfs",
@@ -611,6 +623,14 @@ static int child_func(void *arg)
         (void)mount("tmpfs", config->mount_masks[i], "tmpfs",
                     MS_RDONLY | MS_NOSUID | MS_NOEXEC, "size=0");
     }
+
+    /* g) Detach the old root — everything that needed it (procfs
+     *    visibility, host device nodes) is now in place. */
+    if (umount2("/.pivot_old", MNT_DETACH) != 0) {
+        perror("compartment-root: umount2 old root");
+        exit(EXIT_FAILURE);
+    }
+    (void)rmdir("/.pivot_old");
 
     /* 6. Set hostname inside UTS namespace */
     if (sethostname("container", 9) < 0) { /* best-effort in userns */ }
