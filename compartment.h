@@ -851,16 +851,18 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
              * isolation: container uid 0 is host uid 0 for DAC purposes.
              * "0 100000 65536" maps the container onto an unprivileged
              * subuid range instead. */
-            unsigned long inside, outside, count;
+            /* unsigned long long, not unsigned long: on a 32-bit build
+             * UINT32_MAX + 1 would wrap and reject every valid range. */
+            unsigned long long inside, outside, count;
+            const unsigned long long UID_LIMIT = (unsigned long long)UINT32_MAX + 1ULL;
             char extra[2];
-            if (sscanf(val, "%lu %lu %lu %1s",
+            if (sscanf(val, "%llu %llu %llu %1s",
                        &inside, &outside, &count, extra) != 3 ||
                 count == 0 ||
-                inside  > (unsigned long)UINT32_MAX ||
-                outside > (unsigned long)UINT32_MAX ||
-                count   > (unsigned long)UINT32_MAX ||
-                inside  + count > (unsigned long)UINT32_MAX + 1UL ||
-                outside + count > (unsigned long)UINT32_MAX + 1UL) {
+                inside  >= UID_LIMIT || outside >= UID_LIMIT ||
+                count   >  UID_LIMIT ||
+                inside  + count > UID_LIMIT ||
+                outside + count > UID_LIMIT) {
                 fprintf(stderr, "compartment: %s:%d: invalid %s: '%s' "
                         "(expected: <container-start> <host-start> <count>)\n",
                         path, lineno, directive, val);
@@ -868,7 +870,8 @@ static inline int load_profile_file(Config *cfg, const char *path, int depth)
                 return -1;
             }
             char map[64];
-            snprintf(map, sizeof(map), "%lu %lu %lu\n", inside, outside, count);
+            snprintf(map, sizeof(map), "%llu %llu %llu\n",
+                     inside, outside, count);
             if (directive[0] == 'u') {
                 free(cfg->uid_map);
                 cfg->uid_map = strdup(map);
