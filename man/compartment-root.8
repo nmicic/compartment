@@ -96,6 +96,21 @@ explicitly; the name is then used only for diagnostics.
 Join an existing network namespace
 .RI ( /var/run/netns/NAME ).
 Name must not contain \fB/\fR.
+.B Known limitation:
+the container always gets a new user namespace, and
+.BR setns (2)
+requires
+.B CAP_SYS_ADMIN
+in the user namespace that
+.I owns
+the target network namespace. A namespace created on the host (by
+.BR "ip netns add" ,
+say) is owned by the initial user namespace, so joining it fails with
+.BR EPERM .
+Use
+.B \-\-loopback
+in the container's own network namespace instead, or place the container
+inside an already-joined namespace from outside.
 .TP
 .BR \-l ", " \-\-loopback
 Bring up loopback interface in the new network namespace.
