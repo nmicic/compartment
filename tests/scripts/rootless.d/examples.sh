@@ -26,6 +26,26 @@ SKIP=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
+
+# One skip standing in for a block of N assertions, so pass+fail+skip is
+# the same number on every machine (tests/scripts/lib/harness.sh).
+skip_group() {
+    local n="$1" reason="$2"
+    SKIP=$((SKIP + n))
+    echo "  SKIP: ${reason} (${n} assertions)"
+}
+
+# The suite declares its own assertion count, counting this check, so a
+# block that silently stops running fails instead of shrinking the total.
+harness_expect_total() {
+    local want="$1"
+    local got=$((PASS + FAIL + SKIP + 1))
+    if [ "${got}" -eq "${want}" ]; then
+        pass "suite ran all ${want} assertions"
+    else
+        fail "suite ran ${got} assertions, declared ${want} — a block was added, removed or silently skipped"
+    fi
+}
 vsay() { [ -n "${VERBOSE}" ] && echo "    $*" || true; }
 
 WORK="$(mktemp -d -t compartment-examples-XXXXXXXX)"
@@ -227,7 +247,7 @@ echo "--- Test group: host-key verification against a local sshd ---"
 if ! command -v ssh >/dev/null 2>&1 || \
    ! command -v ssh-keygen >/dev/null 2>&1 || \
    [ ! -x /usr/sbin/sshd ]; then
-    skip "host-key verification (needs ssh, ssh-keygen and /usr/sbin/sshd)"
+    skip_group 3 "host-key verification (needs ssh, ssh-keygen and /usr/sbin/sshd)"
 else
     free_port() {
         if command -v python3 >/dev/null 2>&1; then
@@ -315,11 +335,11 @@ EOF
                 fi
             fi
         else
-            skip "second sshd did not start"
+            skip "a changed host key is refused (second sshd did not start)"
         fi
         stop_sshd
     else
-        skip "throwaway sshd did not start: $(head -1 "${WORK}/sshd.log" 2>/dev/null)"
+        skip_group 3 "throwaway sshd did not start: $(head -1 "${WORK}/sshd.log" 2>/dev/null)"
     fi
 
     rm -f "${KH}"
@@ -329,6 +349,13 @@ fi
 echo ""
 
 # ── Summary ────────────────────────────────────────────────────────
+
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total 61
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

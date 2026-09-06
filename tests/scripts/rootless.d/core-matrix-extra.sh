@@ -425,5 +425,11 @@ else
 fi
 
 echo ""
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total 53
 harness_summary "core-matrix-extra" || exit 1
 exit 0

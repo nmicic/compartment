@@ -30,6 +30,26 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
 
+# One skip standing in for a block of N assertions, so pass+fail+skip is
+# the same number on every machine (tests/scripts/lib/harness.sh).
+skip_group() {
+    local n="$1" reason="$2"
+    SKIP=$((SKIP + n))
+    echo "  SKIP: ${reason} (${n} assertions)"
+}
+
+# The suite declares its own assertion count, counting this check, so a
+# block that silently stops running fails instead of shrinking the total.
+harness_expect_total() {
+    local want="$1"
+    local got=$((PASS + FAIL + SKIP + 1))
+    if [ "${got}" -eq "${want}" ]; then
+        pass "suite ran all ${want} assertions"
+    else
+        fail "suite ran ${got} assertions, declared ${want} — a block was added, removed or silently skipped"
+    fi
+}
+
 echo "=== Profile trust / parser / audit test suite ==="
 echo ""
 
@@ -417,8 +437,26 @@ want_out "M7: message names the problem" "not a private, self-owned directory"
 # ownership check); an intermediate revision of this branch moved it under
 # $HOME, which the built-in ai-agent profile grants rwx.
 AUD="/var/tmp/compartment-audit-$(id -u)"
-if [ -e "${AUD}" ]; then
-    skip "M7: default audit directory tests (${AUD} already exists)"
+# /var/tmp is world-writable and sticky, so any local user can pre-create
+# this directory — and so does any earlier --audit run. Skipping on it
+# turned ten assertions into one `skip` and took mutation M19 (audit log
+# moved into $HOME) from caught-by-nine-assertions to escaped, with one
+# mkdir. A leftover that is ours is removed; one that is not is an
+# environment failure, not a reason to stop testing.
+AUD_BLOCKED=""
+if [ -e "${AUD}" ] || [ -L "${AUD}" ]; then
+    if [ -L "${AUD}" ] || [ ! -d "${AUD}" ]; then
+        AUD_BLOCKED="${AUD} exists and is not a plain directory"
+    elif [ "$(stat -c %u "${AUD}" 2>/dev/null)" != "$(id -u)" ]; then
+        AUD_BLOCKED="${AUD} is owned by uid $(stat -c %u "${AUD}" 2>/dev/null), not by you"
+    else
+        rm -rf "${AUD}"
+        [ -e "${AUD}" ] && AUD_BLOCKED="${AUD} could not be removed"
+    fi
+fi
+if [ -n "${AUD_BLOCKED}" ]; then
+    fail "M7: the default audit directory is not testable here (${AUD_BLOCKED})"
+    skip_group 9 "M7: the remaining default-audit-directory assertions"
 else
     OUT="$("${CU}" --verbose --no-landlock --no-seccomp --audit -- /bin/true 2>&1 \
            | grep 'audit log:')"
@@ -577,6 +615,13 @@ want_out "source: the audit line records where the policy came from" "source=bui
 echo ""
 
 # ── Summary ───────────────────────────────────────────────────────────
+
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total 97
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

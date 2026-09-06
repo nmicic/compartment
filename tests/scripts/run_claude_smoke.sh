@@ -45,6 +45,26 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
 
+# One skip standing in for a block of N assertions, so pass+fail+skip is
+# the same number on every machine (tests/scripts/lib/harness.sh).
+skip_group() {
+    local n="$1" reason="$2"
+    SKIP=$((SKIP + n))
+    echo "  SKIP: ${reason} (${n} assertions)"
+}
+
+# The suite declares its own assertion count, counting this check, so a
+# block that silently stops running fails instead of shrinking the total.
+harness_expect_total() {
+    local want="$1"
+    local got=$((PASS + FAIL + SKIP + 1))
+    if [ "${got}" -eq "${want}" ]; then
+        pass "suite ran all ${want} assertions"
+    else
+        fail "suite ran ${got} assertions, declared ${want} — a block was added, removed or silently skipped"
+    fi
+}
+
 echo "=== Claude CLI smoke test ==="
 echo ""
 
@@ -56,20 +76,22 @@ if [ ! -x "${CU}" ]; then
 fi
 
 if ! command -v claude >/dev/null 2>&1; then
-    echo "SKIP: claude CLI not installed"
-    skip "claude CLI not found"
+    echo "SKIP: external CLI not installed"
+    skip_group 5 "external CLI not found"
     echo ""
     echo "=== Results ==="
     echo "  PASS: ${PASS}  FAIL: ${FAIL}  SKIP: ${SKIP}"
+    echo "SUMMARY external-cli-smoke: pass=${PASS} fail=${FAIL} skip=${SKIP}"
     exit 0
 fi
 
 if [ ! -d "${HOME}/.claude" ]; then
-    echo "SKIP: ~/.claude/ not found (not authenticated)"
-    skip "claude not authenticated"
+    echo "SKIP: the CLI is present but not authenticated"
+    skip_group 5 "external CLI not authenticated"
     echo ""
     echo "=== Results ==="
     echo "  PASS: ${PASS}  FAIL: ${FAIL}  SKIP: ${SKIP}"
+    echo "SUMMARY external-cli-smoke: pass=${PASS} fail=${FAIL} skip=${SKIP}"
     exit 0
 fi
 
@@ -110,11 +132,15 @@ echo "--- Test: Claude --version under compartment-user ---"
 
 VERSION_OUT=$("${CU}" --profile "${PROFILE}" -- claude --version 2>&1) || true
 
-if echo "${VERSION_OUT}" | grep -qi "claude\|version\|[0-9]\.[0-9]"; then
-    pass "claude --version runs under sandbox"
+# `grep -qi "claude|version|[0-9].[0-9]"` was satisfied by
+# "compartment-user: exec ...: Permission denied" and by
+# "command not found" — every error message this test can produce.
+# Anchor on a version number at the start of a line instead.
+if printf '%s\n' "${VERSION_OUT}" | grep -qE '^[0-9]+\.[0-9]+'; then
+    pass "the CLI reports a version under the sandbox"
     echo "    Version: $(echo "${VERSION_OUT}" | head -1)"
 else
-    fail "claude --version failed under sandbox"
+    fail "the CLI printed no version under the sandbox"
     echo "    Output: ${VERSION_OUT}"
 fi
 
@@ -151,9 +177,11 @@ else
     elif [ -z "${CLAUDE_OUT}" ]; then
         fail "Claude produced no output"
     else
-        # Got a response but not the expected sentinel — count as pass
+        # Got a response but not the expected sentinel.
         # since the point is "Claude runs under sandbox without crashing"
-        pass "Claude ran under sandbox (no sentinel, response: $(echo "${CLAUDE_OUT}" | head -1))"
+        # A response that is not the sentinel proves the process ran, not
+        # that it did the right thing. That is a skip, never a pass.
+        skip "the CLI answered without the sentinel: $(echo "${CLAUDE_OUT}" | head -1)"
     fi
 fi
 
@@ -203,11 +231,17 @@ echo ""
 
 # ── Summary ───────────────────────────────────────────────────────
 
+rm -rf "${AUDIT_DIR}"
+
+harness_expect_total 5
+
 echo "=== Results ==="
 echo "  PASS: ${PASS}"
 echo "  FAIL: ${FAIL}"
 echo "  SKIP: ${SKIP}"
 echo ""
+# Every exit path prints exactly one of these; the runners require it.
+echo "SUMMARY external-cli-smoke: pass=${PASS} fail=${FAIL} skip=${SKIP}"
 
 if [ "${FAIL}" -gt 0 ]; then
     echo "SOME TESTS FAILED"

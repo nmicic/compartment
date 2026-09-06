@@ -89,8 +89,13 @@ want_rc_nonzero() {
     fi
 }
 
+# Declared assertion count for the whole suite (see harness_expect_total).
+LANDLOCK_RULES_TOTAL=89
+
 if [ "${ABI}" -lt 1 ]; then
-    skip "Landlock not available on this kernel — no rule semantics to test"
+    skip_to_total "${LANDLOCK_RULES_TOTAL}" \
+        "Landlock not available on this kernel — no rule semantics to test"
+    harness_expect_total "${LANDLOCK_RULES_TOTAL}"
     harness_summary "landlock-rules" || exit 1
     exit 0
 fi
@@ -531,4 +536,10 @@ want_no_out "and produces no warning" "rewrite its own audit trail"
 
 echo ""
 
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total "${LANDLOCK_RULES_TOTAL}"
 harness_summary "landlock-rules" || exit 1

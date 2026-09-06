@@ -37,6 +37,26 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
 
+# One skip standing in for a block of N assertions, so pass+fail+skip is
+# the same number on every machine (tests/scripts/lib/harness.sh).
+skip_group() {
+    local n="$1" reason="$2"
+    SKIP=$((SKIP + n))
+    echo "  SKIP: ${reason} (${n} assertions)"
+}
+
+# The suite declares its own assertion count, counting this check, so a
+# block that silently stops running fails instead of shrinking the total.
+harness_expect_total() {
+    local want="$1"
+    local got=$((PASS + FAIL + SKIP + 1))
+    if [ "${got}" -eq "${want}" ]; then
+        pass "suite ran all ${want} assertions"
+    else
+        fail "suite ran ${got} assertions, declared ${want} — a block was added, removed or silently skipped"
+    fi
+}
+
 echo "=== compartment-root Landlock / mount hardening suite ==="
 echo ""
 
@@ -587,6 +607,13 @@ want_out "and the container still runs" "REAPER_SKIP_OK"
 echo ""
 
 # ── Summary ────────────────────────────────────────────────────────
+
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total 56
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

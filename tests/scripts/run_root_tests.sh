@@ -77,7 +77,25 @@ run_suite() {
         TOTAL_SKIP=$((TOTAL_SKIP + s))
         SUITES_REPORTING=$((SUITES_REPORTING + 1))
     done < <(sed -n 's/^SUMMARY [^:]*: pass=\([0-9]*\) fail=\([0-9]*\) skip=\([0-9]*\).*/\1 \2 \3/p' "${out}")
+
+    # Exactly one SUMMARY line per suite. A suite that exits 0 without one
+    # used to count as a passing suite contributing zero assertions, and
+    # the only trace was the "reported by N/M suites" counter that nothing
+    # asserts on; two lines from one suite would double-count. The bypass
+    # runner in compartment-bpf/ enforces the same invariant on its own
+    # labels — this is the core runner catching up.
+    local nsummary
+    nsummary=$(grep -c '^SUMMARY [^:]*: pass=' "${out}" || true)
     rm -f "${out}"
+    if [ "${nsummary}" -ne 1 ] && [ "${rc}" -eq 0 ]; then
+        rc=1
+        SUITES_FAILED=$((SUITES_FAILED + 1))
+        FAILED_SUITES="${FAILED_SUITES}  - ${name} (${nsummary} SUMMARY lines, expected exactly 1)"$'\n'
+        echo ""
+        echo "^^^ SUITE FAILED: ${nsummary} SUMMARY lines, expected exactly 1 ^^^"
+        echo ""
+        return 0
+    fi
 
     if [ "${rc}" -eq 0 ]; then
         echo ""
