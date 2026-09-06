@@ -266,11 +266,22 @@ run_cr -c "${JAIL}" "${CRUSER[@]}" -A CAP_NET_BIND_SERVICE -- /bin/sh -c \
 expect_contains "cap-allow: effective set kept" "CapEff:	0000000000000400"
 expect_contains "cap-allow: ambient set raised" "CapAmb:	0000000000000400"
 
+# 'no-new-privs off' in a profile is a fatal parse error (a profile may only
+# tighten policy), so the container never starts.  compartment-root also
+# forces the flag back on in main() as a second line of defence, but the
+# parser refuses first — assert the refusal, not the forced-on container.
 NNP_CONF="${WORK}/nnp.conf"
 printf 'rootdir %s\nusername ctsvc\nuid 60000\ngid 60000\nno-new-privs off\n' "${JAIL}" > "${NNP_CONF}"
 run_cr --profile "${NNP_CONF}" -- /bin/sh -c 'grep ^NoNewPrivs /proc/self/status'
-expect_contains "'no-new-privs off' refused by a profile" "NoNewPrivs:	1"
+expect_rc_not "'no-new-privs off' refused by a profile" 0
 expect_contains "'no-new-privs off' diagnosed" "cannot be disabled"
+expect_contains "'no-new-privs off' names the one-way rule" \
+    "may only tighten policy"
+
+# The container itself is unconditionally no-new-privs, with or without a
+# profile saying anything about it.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'grep ^NoNewPrivs /proc/self/status'
+expect_contains "no-new-privs is on without any profile" "NoNewPrivs:	1"
 
 echo ""
 
