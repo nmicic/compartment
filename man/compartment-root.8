@@ -293,7 +293,15 @@ to
 forwards
 .BR SIGTERM ", " SIGINT ", " SIGHUP " and " SIGQUIT
 to the command, reaps orphans, and exits with the command's status
-(128+\fIn\fR if it was killed by signal \fIn\fR). Without it a command
+(128+\fIn\fR if it was killed by signal \fIn\fR). The reaper is inside
+every namespace and carries the same dropped capabilities, dropped uid and
+.B no-new-privs
+as the command, but it is deliberately
+.B not
+covered by the seccomp filter \- the command installs that for itself
+after the fork, so an allow-list policy that does not mention
+.BR wait4 / kill / rt_sigaction
+cannot break the reaper. It execs nothing. Without it a command
 with no signal handlers would ignore Ctrl\-C, orphans would never be
 reaped, and killing
 .B compartment-root

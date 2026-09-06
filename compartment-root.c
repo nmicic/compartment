@@ -104,7 +104,7 @@ static int  mask_path(Config *config, const char *path);
 static void join_netns(const char *netns_name);
 static void set_rlimits(void);
 static void apply_default_seccomp_denylist(Config *config);
-static void container_init(char **cmd_args);
+static void container_init(void);
 static void print_help(const char *prog_name);
 
 /* ── Built-in container filesystem layout ───────────────────────────── */
@@ -1068,7 +1068,7 @@ static int child_func(void *arg)
      *     (see container_init).  Deliberately before the seccomp filter:
      *     PID 1 has to keep wait4/kill/rt_sigaction available even under
      *     an allow-list policy that does not mention them. */
-    container_init(cmd_args);
+    container_init();
 
     /* 18. seccomp (last enforcement step before exec) */
     if (config->use_seccomp) {
@@ -1089,12 +1089,12 @@ static int child_func(void *arg)
 
 /* ── Container init (PID 1 of the new pid namespace) ────────────────── */
 
-static volatile pid_t init_target = 0;      /* the exec'd command */
+static volatile sig_atomic_t init_target = 0;   /* pid of the exec'd command */
 
 static void init_forward(int sig)
 {
     if (init_target > 0)
-        kill(init_target, sig);             /* async-signal-safe */
+        kill((pid_t)init_target, sig);      /* async-signal-safe */
 }
 
 /*
@@ -1107,12 +1107,17 @@ static void init_forward(int sig)
  *
  * So PID 1 is this loop instead: forward SIGTERM/SIGINT/SIGHUP/SIGQUIT to
  * the target, reap everything else, and exit with the target's status
- * (128+n if it was killed).  Returns 0 in the child; never returns in PID 1.
+ * (128+n if it was killed).  Returns in the child; never returns in PID 1.
+ *
+ * PID 1 is deliberately left outside the seccomp filter, which the target
+ * installs for itself after the fork: an allow-list policy that does not
+ * mention wait4/kill/rt_sigaction would otherwise break the reaper.  It is
+ * still inside every namespace and carries the same dropped capabilities,
+ * dropped uid and no-new-privs as the target; it execs nothing and does
+ * nothing but wait.
  */
-static void container_init(char **cmd_args)
+static void container_init(void)
 {
-    (void)cmd_args;
-
     pid_t pid = fork();
     if (pid < 0) {
         perror("compartment-root: fork (container init)");
