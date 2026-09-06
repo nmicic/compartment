@@ -278,6 +278,16 @@ static const SyscallEntry syscall_table[] = {
 #ifdef __NR_chown
     {"chown",               __NR_chown},
 #endif
+    /* Device-node creation.  Both names are needed: `block mknod` alone
+     * stops nothing, because glibc's mknod(3) issues mknodat(2).  The pair
+     * matters because a Landlock `rw` rule on any directory carries
+     * LANDLOCK_ACCESS_FS_MAKE_BLOCK, so a root process that keeps CAP_MKNOD
+     * can re-create the raw disk node inside its own writable workspace and
+     * read the filesystem underneath the path policy. */
+#ifdef __NR_mknod
+    {"mknod",               __NR_mknod},
+#endif
+    {"mknodat",             __NR_mknodat},
 
     /* ── Memory ───────────────────────────────────────────────────── */
     {"mmap",                __NR_mmap},
