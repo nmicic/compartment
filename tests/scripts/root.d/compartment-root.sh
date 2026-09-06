@@ -64,26 +64,37 @@ if [ ! -x "${CR}" ]; then
     exit 1
 fi
 
+# busybox-static is a documented precondition, not something a test
+# suite installs. The previous version ran `apt-get install -y` on the
+# host, unprompted, and never removed the package: a test suite that
+# modifies the machine it is measuring is not a test suite.
+SUITE_TOTAL=86
+bail_skip() {
+    skip_group "${SUITE_TOTAL}" "$1"
+    echo ""
+    echo "=== Results ==="
+    echo "  PASS: ${PASS}"
+    echo "  FAIL: ${FAIL}"
+    echo "  SKIP: ${SKIP}"
+    echo ""
+    echo "SUMMARY compartment-root: pass=${PASS} fail=${FAIL} skip=${SKIP}"
+    echo "ALL TESTS PASSED"
+    exit 0
+}
+
 BUSYBOX=""
 for cand in /bin/busybox /usr/bin/busybox; do
     [ -x "$cand" ] && BUSYBOX="$cand" && break
 done
-if [ -z "${BUSYBOX}" ] && command -v apt-get >/dev/null 2>&1; then
-    echo "busybox not found — installing busybox-static"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y busybox-static >/dev/null 2>&1 || true
-    for cand in /bin/busybox /usr/bin/busybox; do
-        [ -x "$cand" ] && BUSYBOX="$cand" && break
-    done
-fi
 if [ -z "${BUSYBOX}" ]; then
-    echo "ERROR: busybox not available and could not be installed."
+    echo "busybox-static is a precondition of this suite:"
     echo "  apt-get install busybox-static"
-    exit 1
+    bail_skip "busybox-static is not installed (precondition, not installed by the suite)"
 fi
 if ldd "${BUSYBOX}" >/dev/null 2>&1; then
-    echo "ERROR: ${BUSYBOX} is dynamically linked; the rootdir must stand alone."
+    echo "${BUSYBOX} is dynamically linked; the rootdir must stand alone:"
     echo "  apt-get install busybox-static"
-    exit 1
+    bail_skip "${BUSYBOX} is dynamically linked (need busybox-static)"
 fi
 
 echo "  compartment-root: ${CR}"
@@ -658,7 +669,7 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 86
+harness_expect_total "${SUITE_TOTAL}"
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

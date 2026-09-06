@@ -50,11 +50,21 @@ vsay() { [ -n "${VERBOSE}" ] && echo "    $*" || true; }
 
 WORK="$(mktemp -d -t compartment-examples-XXXXXXXX)"
 SSHD_PID=""
+# The host-key group has to write inside ${HOME}/.ssh/paranoid — that is
+# the one path ssh.conf grants, and it is the policy under test — so the
+# fixture cannot live under ${WORK}. It can, however, be removed on every
+# exit path, which it was not: an abort left a directory in the user's
+# real ~/.ssh.
+EXAMPLES_KH=""
+EXAMPLES_KH_DIR=""
 cleanup() {
     [ -n "${SSHD_PID}" ] && kill "${SSHD_PID}" 2>/dev/null || true
+    [ -n "${EXAMPLES_KH}" ] && rm -f "${EXAMPLES_KH}"
+    [ -n "${EXAMPLES_KH_DIR}" ] && rmdir "${EXAMPLES_KH_DIR}" 2>/dev/null
     rm -rf "${WORK}"
+    return 0
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 echo "=== Example profile and script tests ==="
 echo ""
@@ -304,6 +314,12 @@ EOF
                 -p "${PORT}" nobody@127.0.0.1 true >"${out}" 2>&1
     }
 
+    # ssh.conf grants exactly one writable path in $HOME —
+    # `rw $HOME/.ssh/paranoid?` — so the fixture has to live there; that
+    # is the policy under test. What it must not do is survive an abort:
+    # the directory and the known_hosts file are registered with the EXIT
+    # trap here, and the directory is only removed when this suite
+    # created it.
     KH_DIR="${HOME}/.ssh/paranoid"
     KH_DIR_PREEXISTING=0
     [ -d "${KH_DIR}" ] && KH_DIR_PREEXISTING=1
@@ -311,6 +327,8 @@ EOF
     chmod 700 "${KH_DIR}"
     KH="${KH_DIR}/known_hosts.selftest.$$"
     ( umask 077; : > "${KH}" )
+    EXAMPLES_KH="${KH}"
+    [ "${KH_DIR_PREEXISTING}" -eq 0 ] && EXAMPLES_KH_DIR="${KH_DIR}"
 
     if start_sshd "${WORK}/hostkey_1"; then
         try_ssh host-a "${WORK}/ssh1.log" || true
@@ -349,7 +367,9 @@ EOF
     fi
 
     rm -f "${KH}"
-    [ "${KH_DIR_PREEXISTING}" -eq 0 ] && rmdir "${KH_DIR}" 2>/dev/null || true
+    [ "${KH_DIR_PREEXISTING}" -eq 0 ] && rmdir "${KH_DIR}" 2>/dev/null
+    EXAMPLES_KH=""
+    EXAMPLES_KH_DIR=""
 fi
 
 echo ""

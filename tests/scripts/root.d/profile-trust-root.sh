@@ -77,27 +77,57 @@ if [ -z "${VICTIM_UID}" ] || [ "${VICTIM_UID}" = "0" ]; then
 fi
 VICTIM_GID="$(id -g "${VICTIM_UID}" 2>/dev/null || echo 65534)"
 
+# The header documents `COMPARTMENT_ROOT=... sudo -E ...`, and under
+# sudo -E HOME stays the invoking user's — at uid 0 compartment-user then
+# refuses the run ("refusing to use HOME=/home/... as a sandbox root: not
+# owned by you") before it ever picks an audit directory, and the M7
+# group failed with a confusing missing-string. The suite has an
+# undeclared dependency on root's own HOME; declare it.
+HOME="$(getent passwd 0 | cut -d: -f6)"
+[ -n "${HOME}" ] && [ -d "${HOME}" ] || HOME=/root
+export HOME
+
 WORK="$(mktemp -d)"
 CREATED_ETC=0
 CREATED_LOG=0
 CREATED_VARLIB=0
+ETC_MODE=""
 [ -d /etc/compartment ] || CREATED_ETC=1
 [ -d /var/log/compartment ] || CREATED_LOG=1
 [ -d /var/lib/compartment ] || CREATED_VARLIB=1
+[ "${CREATED_ETC}" -eq 0 ] && ETC_MODE="$(stat -c %a /etc/compartment 2>/dev/null || true)"
 
+# Every path this suite can create is registered here, before anything is
+# created. The previous version removed /var/log/compartment
+# unconditionally — running the root suite on a host with a real audit
+# trail destroyed it — and left /var/tmp/compartment-audit-<uid> behind on
+# an abort, which is exactly what made the *rootless* suite skip its whole
+# M7 group on every subsequent run.
 cleanup() {
     rm -f /etc/compartment/cptest-*.conf
-    [ "${CREATED_ETC}" -eq 1 ] && rmdir /etc/compartment 2>/dev/null
+    if [ "${CREATED_ETC}" -eq 1 ]; then
+        rmdir /etc/compartment 2>/dev/null
+    elif [ -n "${ETC_MODE}" ]; then
+        chmod "${ETC_MODE}" /etc/compartment 2>/dev/null
+    fi
     [ "${CREATED_LOG}" -eq 1 ] && rm -rf /var/log/compartment
     [ "${CREATED_VARLIB}" -eq 1 ] && rm -rf /var/lib/compartment
+    if [ -n "${SUDO_UID:-}" ]; then
+        rm -rf "/var/tmp/compartment-audit-${SUDO_UID}"
+    fi
     rm -rf "${WORK}"
     return 0
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 mkdir -p /etc/compartment
 chown root:root /etc/compartment
-chmod 0755 /etc/compartment
+# Only relax the mode when this suite created the directory. An admin who
+# keeps /etc/compartment at 0700 got it permanently widened to 0755 by
+# running the test suite once.
+if [ "${CREATED_ETC}" -eq 1 ]; then
+    chmod 0755 /etc/compartment
+fi
 
 run() {
     OUT="$("$@" 2>&1)"
@@ -336,20 +366,27 @@ echo ""
 
 echo "--- Test group: root audit directory (M7) ---"
 
-rm -rf /var/log/compartment
+# Only clear a log directory this suite is responsible for. Removing a
+# real /var/log/compartment destroys the host's audit trail.
+if [ "${CREATED_LOG}" -eq 1 ]; then
+    rm -rf /var/log/compartment
+fi
 run "${CU}" --verbose --no-landlock --no-seccomp --audit -- /bin/true
+want_rc "M7: the root audit run succeeds" 0
 want_out "M7: root audit log defaults to /var/log/compartment" \
          "/var/log/compartment"
 want_no_out "M7: root audit log is not under /var/tmp" "/var/tmp/compartment-audit"
-if [ -d /var/log/compartment ]; then
+if [ ! -d /var/log/compartment ]; then
+    fail "M7: /var/log/compartment was not created"
+elif [ "${CREATED_LOG}" -eq 0 ]; then
+    skip "M7: /var/log/compartment pre-existed — not asserting a mode this suite did not set"
+else
     MODE="$(stat -c %a /var/log/compartment)"
     if [ "${MODE}" = "700" ]; then
         pass "M7: /var/log/compartment created 0700"
     else
         fail "M7: /var/log/compartment is mode ${MODE}, expected 700"
     fi
-else
-    fail "M7: /var/log/compartment was not created"
 fi
 
 echo ""
@@ -409,7 +446,7 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 45
+harness_expect_total 46
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

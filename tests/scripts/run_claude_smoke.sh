@@ -29,8 +29,11 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CU="${REPO_DIR}/compartment-user"
 PROFILE_TEMPLATE="${REPO_DIR}/tests/profiles/test-claude-smoke.conf"
 PROFILE=""   # rendered below, once the CLI has been resolved
-OUTPUT_DIR="${REPO_DIR}/tests/output"
-mkdir -p "${OUTPUT_DIR}"
+# Not ${REPO_DIR}/tests/output: a suite that writes into the checkout
+# leaves the working tree dirty and, under sudo, root-owned. mktemp -d,
+# removed by the EXIT trap below.
+OUTPUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/compartment-smoke.XXXXXX")"
+trap 'rm -rf "${OUTPUT_DIR}" "${AUDIT_DIR:-}"' EXIT INT TERM
 
 WITH_PROXY=0
 if [ "${1:-}" = "--with-proxy" ]; then
@@ -107,7 +110,6 @@ CLI_PATH="$(command -v claude)"
 CLI_REAL="$(readlink -f "${CLI_PATH}" 2>/dev/null || printf '%s' "${CLI_PATH}")"
 CLI_DIR="$(dirname "${CLI_REAL}")"
 PROFILE="$(mktemp "${OUTPUT_DIR}/claude-smoke.XXXXXX.conf")"
-trap 'rm -f "${PROFILE}"' EXIT
 while IFS= read -r line; do
     printf '%s\n' "${line//@CLI_DIR@/${CLI_DIR}}"
 done < "${PROFILE_TEMPLATE}" > "${PROFILE}"
@@ -165,7 +167,7 @@ fi
 
 # Save output
 echo "${CLAUDE_OUT}" > "${OUTPUT_DIR}/claude_smoke_output.txt"
-echo "  Output saved to: tests/output/claude_smoke_output.txt"
+echo "  Output saved to: ${OUTPUT_DIR}/claude_smoke_output.txt"
 
 if echo "${CLAUDE_OUT}" | grep -qi "SANDBOXED"; then
     pass "Claude responded correctly under sandbox"
@@ -191,8 +193,10 @@ echo ""
 
 echo "--- Test: Claude with audit logging ---"
 
-AUDIT_DIR="/var/tmp/compartment-test-audit"
-mkdir -p "${AUDIT_DIR}"
+# /var/tmp is world-writable and sticky; a fixed name there is both
+# squattable and, when the suite aborts, left behind for the next run to
+# inherit. Keep it private and remove it on every exit path.
+AUDIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/compartment-smoke-audit.XXXXXX")"
 
 # Create a timestamp marker BEFORE the test so we only match new logs
 MARKER=$(mktemp)
@@ -230,8 +234,6 @@ fi
 echo ""
 
 # ── Summary ───────────────────────────────────────────────────────
-
-rm -rf "${AUDIT_DIR}"
 
 harness_expect_total 5
 

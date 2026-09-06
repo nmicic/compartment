@@ -97,9 +97,18 @@ WORK="$(mktemp -d /tmp/compartment-root-ll.XXXXXX)"
 JAIL="${WORK}/jail"
 NETNS="cpll$$"
 
+CREATED_LOG=0
+[ -d /var/log/compartment ] || CREATED_LOG=1
+
 cleanup() {
     local rc=$?
     pkill -9 -f "compartment-root .*${WORK}" 2>/dev/null || true
+    # A profile here turns auditing on, and the root default is
+    # /var/log/compartment. Leaving it behind made the *next* suite
+    # (profile-trust-root.sh) treat it as pre-existing and skip the
+    # assertion that it is created 0700 — a cross-suite state leak
+    # inside the same runner.
+    [ "${CREATED_LOG:-0}" -eq 1 ] && rm -rf /var/log/compartment
     sleep 0.2
     local mp
     while read -r mp; do
