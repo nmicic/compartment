@@ -538,6 +538,11 @@ def write_matrix_file(path, surfaces, covered_keys, exemptions, evidence=None):
                  "Do not edit by hand.\n")
     lines.append("\nStatus key: `witnessed` = referenced by a test under "
                  "tests/; `exempt` = accepted gap (see reason).\n")
+    lines.append("\nThe note column names the FIRST witnessing file in sorted "
+                 "order, not the strongest one and not the only one. A surface "
+                 "is routinely referenced by several tests, and this gate is "
+                 "about existence, not accuracy \u2014 the exact-delta counter "
+                 "assertions are catalogued in COUNTERS.md.\n")
     evidence = evidence or {}
     cur = None
     for kind, name, _m in surfaces:

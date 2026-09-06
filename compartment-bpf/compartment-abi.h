@@ -242,9 +242,13 @@
 //        ino carries the target map id, so the audit line identifies the
 //        object without a second lookup.
 //      - ACTION_DENY_PIN_TAMPER = 17. Emitted by inode_unlink / inode_rename
-//        / inode_rmdir / sb_mount when a non-loader tries to unlink, rename,
-//        rmdir or over-mount an inode recorded in protected_pins (the bpffs
-//        pin objects, the pin directories and the bpffs mount root).
+//        / inode_rmdir / sb_mount / move_mount when a non-loader tries to
+//        unlink, rename, rmdir or over-mount an inode recorded in
+//        protected_pins (the bpffs pin objects, the pin directories and the
+//        bpffs mount root). sb_umount also refuses to let that bpffs be
+//        detached, but keeps ACTION_DENY_UMOUNT (=15): the operator-visible
+//        fact is the one that code already names, and unlike the others it
+//        applies to every caller, the loader included.
 //        Distinct from ACTION_DENY_UNLINK (=1) / ACTION_DENY_RENAME (=2):
 //        1 and 2 mean "an operator seal denied this"; 17 means "the tool
 //        refused to let its own enforcement be removed".

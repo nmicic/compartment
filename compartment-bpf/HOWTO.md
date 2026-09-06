@@ -567,8 +567,15 @@ loader image:
   the syscall path);
 * `unlink`, `rename` and `rmdir` of the pin objects, the two pin directories,
   `/sys/fs/bpf/compartment` and the bpffs mount root;
-* `umount` (including `umount -l`) of the bpffs holding the pins, and mounting
-  a second bpffs over it.
+* mounting a second bpffs over any of those (`move_mount(2)` included).
+
+And one thing it refuses to **everyone**, the loader included:
+
+* `umount` (and `umount -l`) of the bpffs holding the pins. There is no
+  loader exemption here on purpose — the loader has no reason to detach that
+  filesystem, and it is the same rule v0.8 already applies to a filesystem
+  holding sealed paths: you `--unpin` first, then unmount. The audit line is
+  `DENY_UMOUNT`, not `DENY_PIN_TAMPER`.
 
 Two prerequisites, both enforced at pin time with a clear refusal:
 

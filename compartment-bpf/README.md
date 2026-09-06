@@ -43,7 +43,7 @@ enforces the seal on every matching operation regardless of uid or capability.
 | `sb_mount` / `move_mount` | new mount on a sealed inode or inside a sealed subtree (path shadowing) |
 | `sb_umount` | detaching a filesystem that hosts sealed inodes (`umount`, `umount -l`; `move_mount(2)` is gated by `move_mount`'s from-side) |
 | `bprm_committed_creds` / `task_alloc` / `task_prctl` / `ptrace_*` | actor-strict marker lifecycle and identity-swap hardening |
-| `bpf_map` (opt-in, `--pin --self-protect` only) | any fd — read-only included — to this tool's own BPF maps, for a task that is not an authorised loader image. The same flag adds a pin-tamper branch to `inode_unlink` / `inode_rename` / `inode_rmdir` / `sb_mount` / `sb_umount` covering its own bpffs pins; those are existing hooks, not new links. See `HOWTO.md` §3.6. |
+| `bpf_map` (opt-in, `--pin --self-protect` only) | any fd — read-only included — to this tool's own BPF maps, for a task that is not an authorised loader image. The same flag adds a pin-tamper branch to `inode_unlink` / `inode_rename` / `inode_rmdir` / `sb_mount` / `move_mount` covering its own bpffs pins, and makes `sb_umount` refuse to detach the bpffs holding them (under the existing `DENY_UMOUNT`); those are existing hooks, not new links. See `HOWTO.md` §3.6. |
 
 Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all four).
 

@@ -6,7 +6,7 @@
 // exe inodes). Companion to
 // compartment-user (Landlock+seccomp) and compartment-root (namespaces).
 //
-// Hooks (27 attach points as of ABI v0.8; 29 SEC() entries, two of which are
+// Hooks (29 attach points as of ABI v0.8; 30 SEC() entries, two of which are
 // the mutually-exclusive inode_setattr signature wrappers):
 //   v0.x file/inode/path (16):
 //     inode_unlink, inode_rename, inode_rmdir, inode_create, inode_mkdir,
@@ -26,8 +26,9 @@
 //     sb_umount (no detaching the filesystem out from under one)
 //   v0.8 self-protection (1, opt-in via --self-protect):
 //     bpf_map (no fd to a compartment map for anything but the loader).
-//     inode_unlink / inode_rename / inode_rmdir / sb_mount / sb_umount also
-//     gain a pin-tamper branch; they are existing hooks, not new links.
+//     inode_unlink / inode_rename / inode_rmdir / sb_mount / move_mount also
+//     gain a pin-tamper branch, and sb_umount gains a bpffs branch that keeps
+//     the existing DENY_UMOUNT code; they are existing hooks, not new links.
 //
 // v0.1 maps:
 //   sealed_inodes : (dev, ino) -> struct seal_value     (per-file)
