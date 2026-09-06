@@ -10,7 +10,7 @@ Integration tests for `compartment-user`, `compartment-root` and
 
 ```bash
 make test-integration          # everything that runs unprivileged
-make test-quick                # core suites only (skips sandbox.sh + Claude)
+make test-quick                # core suites only (skips sandbox.sh + external CLI)
 sudo make test-root            # the root-only suites
 
 ./tests/scripts/run_all.sh --verbose        # same, with per-command tracing
@@ -43,7 +43,7 @@ filter).
 | **Discovered rootless suites** | `rootless.d/*.sh` | Anything unprivileged; each script is its own suite (see below) |
 | **Discovered root suites** | `root.d/*.sh` | Root-only paths; run by `sudo make test-root` |
 | **Sandbox proxy/network** | `run_sandbox_proxy_matrix.sh` | sandbox.sh HARD/SOFT modes, network isolation, proxy bridge |
-| **Claude CLI smoke** | `run_claude_smoke.sh` | Third-party CLI under compartment-user; skipped without the CLI, without `~/.claude`, or with `--no-external` |
+| **External CLI smoke** | `run_claude_smoke.sh` | A third-party CLI under compartment-user; skipped when the CLI is missing or unauthenticated, or with `--no-external` |
 
 `compartment-root` used to have no automated coverage at all. It now has a
 runner (`run_root_tests.sh`, refuses to run unprivileged) and a discovery
@@ -82,7 +82,7 @@ tests/
 │   ├── test-seccomp-deny.conf  — seccomp deny-list only
 │   ├── test-env-deny.conf      — env sanitization only
 │   ├── test-combined.conf      — all three combined
-│   └── test-claude-smoke.conf  — Claude CLI profile
+│   └── test-claude-smoke.conf  — external CLI profile
 ├── scripts/
 │   ├── run_all.sh              — rootless entrypoint (make test-integration)
 │   ├── run_root_tests.sh       — root entrypoint  (sudo make test-root)
@@ -174,5 +174,5 @@ SKIP rather than PASS.
 - GCC or Clang (to build `deny_probe`)
 - For the root suites: root, and user namespaces
 - For sandbox tests: `unshare`, optionally `socat`, `slirp4netns`
-- For the Claude smoke test: `claude` CLI installed and authenticated
+- For `run_claude_smoke.sh`: the CLI it drives, installed and authenticated
 - Optional: Squid proxy on localhost:8080

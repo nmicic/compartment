@@ -52,7 +52,7 @@ make
 ```bash
 make                    # builds the zero-dependency core tools
 make test               # core suites (Landlock + seccomp + env + inheritance)
-make test-integration   # every unprivileged suite (sandbox.sh, Claude smoke)
+make test-integration   # every unprivileged suite (sandbox.sh, external CLI)
 sudo make test-root     # the root-only suites
 make hardened           # build with randomized shell stash path
 make show-hardening     # print the hardening flags this toolchain accepted

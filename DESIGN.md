@@ -204,7 +204,8 @@ used to repeat them each quoted a different, wrong figure.
   modes, proxy bridge
 - **Claude CLI smoke**: `claude --version` + `claude --print` under full
   sandbox, audit logging captures PPID chain, --dry-run policy display.
-  Skipped without the CLI, without `~/.claude`, or with `--no-external`
+  Skipped without the CLI, without its config directory, or with
+  `--no-external`
 
 Tests use `deny_probe`, a purpose-built binary with subcommands for each
 operation (fs_read, fs_write, sc_ptrace_traceme, sc_ptrace_x32, env_get,

@@ -5,12 +5,12 @@
 # run_all.sh — run all compartment test suites
 #
 # Usage:
-#   ./tests/scripts/run_all.sh                # run all tests
-#   ./tests/scripts/run_all.sh --quick        # skip Claude smoke + sandbox proxy
-#   ./tests/scripts/run_all.sh --verbose      # verbose output from test runners
-#   ./tests/scripts/run_all.sh --no-external  # skip suites that need a
-#                                             # third-party CLI or an outbound
-#                                             # proxy (also: COMPARTMENT_SKIP_EXTERNAL=1)
+#   ./tests/scripts/run_all.sh              # run all tests
+#   ./tests/scripts/run_all.sh --quick      # skip Claude smoke + sandbox proxy
+#   ./tests/scripts/run_all.sh --verbose    # verbose output from test runners
+#   ./tests/scripts/run_all.sh --no-external  # skip suites needing a third-party
+#                                             # CLI or an outbound proxy; same as
+#                                             # COMPARTMENT_SKIP_EXTERNAL=1
 #
 # Every executable tests/scripts/rootless.d/*.sh is discovered and run as its
 # own suite; see tests/scripts/rootless.d/README.md for the contract.
@@ -161,17 +161,21 @@ if [ "${QUICK}" -eq 0 ]; then
     run_suite "Sandbox.sh proxy/network tests" \
         "${SCRIPT_DIR}/run_sandbox_proxy_matrix.sh" ${VERBOSE}
 
-    # The Claude smoke suite needs a third-party CLI and an authenticated
-    # session, neither of which exists on a build machine.
+    # This suite needs a third-party CLI and an authenticated session for it,
+    # neither of which exists on a build machine. Decide here rather than
+    # letting the suite discover it, so "not applicable" is distinguishable
+    # from "broken" in the final summary.
+    CLI_SUITE="${SCRIPT_DIR}/run_claude_smoke.sh"
+    CLI_SUITE_NAME="External CLI smoke test"
+    CLI_BIN="claude"
     if [ "${SKIP_EXTERNAL}" = "1" ]; then
-        skip_suite "Claude CLI smoke test" "--no-external / COMPARTMENT_SKIP_EXTERNAL=1"
-    elif ! command -v claude > /dev/null 2>&1; then
-        skip_suite "Claude CLI smoke test" "claude CLI not installed"
-    elif [ ! -d "${HOME}/.claude" ]; then
-        skip_suite "Claude CLI smoke test" "no ${HOME}/.claude — CLI not authenticated"
+        skip_suite "${CLI_SUITE_NAME}" "--no-external / COMPARTMENT_SKIP_EXTERNAL=1"
+    elif ! command -v "${CLI_BIN}" > /dev/null 2>&1; then
+        skip_suite "${CLI_SUITE_NAME}" "${CLI_BIN} not installed"
+    elif [ ! -d "${HOME}/.${CLI_BIN}" ]; then
+        skip_suite "${CLI_SUITE_NAME}" "no ${HOME}/.${CLI_BIN} — CLI not authenticated"
     else
-        run_suite "Claude CLI smoke test" \
-            "${SCRIPT_DIR}/run_claude_smoke.sh" ${VERBOSE}
+        run_suite "${CLI_SUITE_NAME}" "${CLI_SUITE}" ${VERBOSE}
     fi
 else
     echo ""
