@@ -563,7 +563,14 @@ After that reboot, validate from the host:
 Then sync the compartment-bpf source and run the smoke gate:
 
   rsync -a --exclude=.git/ <checkout>/compartment-bpf/ ${USERNAME}@${VM_IP}:~/compartment-bpf/
-  ssh ${USERNAME}@${VM_IP} "bash -lc 'cd ~/compartment-bpf && make vmlinux.h && make && sudo make check'"
+  ssh ${USERNAME}@${VM_IP} "bash -lc 'cd ~/compartment-bpf && make regen-vmlinux && make && sudo make check'"
+
+\`make regen-vmlinux\`, not \`make vmlinux.h\`: rsyncing a checkout that has
+already been built on the host carries that host's vmlinux.h across, and
+\`make vmlinux.h\` is then a no-op on an up-to-date file — the guest would
+compile its BPF objects against the HOST kernel's BTF, which is the one
+thing a kernel-matrix VM exists to avoid. regen-vmlinux re-dumps the header
+from the guest's own /sys/kernel/btf/vmlinux first.
 
 \`make check\` runs every gate and prints a per-target transcript; the last
 lines are the howto-examples tally, and the run is green when it exits 0.
