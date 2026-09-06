@@ -193,6 +193,175 @@ fi
 
 echo ""
 
+# ── Test group: extra/ helper scripts ──────────────────────────────
+
+echo "--- Test group: extra/ helper scripts ---"
+
+# Every helper the docs tell people to run has to be executable.
+NON_EXEC=""
+while read -r mode _ _ path; do
+    case "${path}" in
+        *.sh) ;;
+        *) continue ;;
+    esac
+    head -c2 "${REPO_DIR}/${path}" 2>/dev/null | grep -q '#!' || continue
+    [ "${mode}" = "100755" ] || NON_EXEC="${NON_EXEC} ${path}"
+done < <(git -C "${REPO_DIR}" ls-files -s extra 2>/dev/null || true)
+if [ -z "${NON_EXEC}" ]; then
+    pass "every extra/ script with a shebang is committed executable"
+else
+    fail "not executable in the index:${NON_EXEC}"
+fi
+
+SH_BAD=""
+for f in "${REPO_DIR}"/extra/tinyproxy/*.sh "${REPO_DIR}"/extra/squid-proxy/srv/squid/*.sh; do
+    [ -f "${f}" ] || continue
+    bash -n "${f}" 2>/dev/null || SH_BAD="${SH_BAD} $(basename "${f}")"
+done
+if [ -z "${SH_BAD}" ]; then
+    pass "extra/ scripts parse (bash -n)"
+else
+    fail "syntax errors in:${SH_BAD}"
+fi
+
+# ── squid.conf must not ship as an open proxy ──────────────────────
+SQUID_CONF="${REPO_DIR}/extra/squid-proxy/srv/squid/squid.conf"
+squid_line() { grep -E "$1" "${SQUID_CONF}" | grep -v '^[[:space:]]*#' | head -1; }
+
+if [ -n "$(squid_line '^http_port[[:space:]]+(127\.0\.0\.1|\[::1\]):')" ]; then
+    pass "squid.conf binds the loopback address"
+else
+    fail "squid.conf http_port is not bound to loopback: $(squid_line '^http_port')"
+fi
+if [ -n "$(squid_line '^http_access[[:space:]]+allow[[:space:]]+all[[:space:]]*$')" ]; then
+    fail "squid.conf still has 'http_access allow all'"
+else
+    pass "squid.conf has no blanket 'http_access allow all'"
+fi
+if [ -n "$(squid_line '^http_access[[:space:]]+deny[[:space:]]+all[[:space:]]*$')" ]; then
+    pass "squid.conf ends with a default deny"
+else
+    fail "squid.conf has no 'http_access deny all'"
+fi
+for rule in '^acl[[:space:]]+Safe_ports[[:space:]]+port' \
+            '^acl[[:space:]]+SSL_ports[[:space:]]+port' \
+            '^http_access[[:space:]]+deny[[:space:]]+!Safe_ports' \
+            '^http_access[[:space:]]+deny[[:space:]]+CONNECT[[:space:]]+!SSL_ports'; do
+    if [ -n "$(squid_line "${rule}")" ]; then
+        pass "squid.conf restores baseline ACL: ${rule}"
+    else
+        fail "squid.conf is missing baseline ACL: ${rule}"
+    fi
+done
+if [ -n "$(grep -E '^[[:space:]]*--network[[:space:]]+host' "${REPO_DIR}/extra/squid-proxy/srv/squid/start.sh")" ]; then
+    pass "squid start.sh uses host networking so the loopback bind is the host's"
+else
+    fail "squid start.sh does not use --network host; a loopback bind inside a bridge container is unreachable"
+fi
+
+# ── crontab surgery must touch only our own lines ──────────────────
+# A stub `crontab` keeps the real user crontab out of this entirely.
+TP="${WORK}/tinyproxy"
+cp -a "${REPO_DIR}/extra/tinyproxy" "${TP}"
+STUB="${WORK}/stubbin"
+mkdir -p "${STUB}"
+cat > "${STUB}/crontab" <<'STUBEOF'
+#!/bin/bash
+case "${1:-}" in
+    -l) [ -s "${CRONTAB_STORE}" ] || exit 1; cat "${CRONTAB_STORE}" ;;
+    -)  cat > "${CRONTAB_STORE}" ;;
+    *)  exit 2 ;;
+esac
+STUBEOF
+chmod 755 "${STUB}/crontab"
+export CRONTAB_STORE="${WORK}/crontab.txt"
+UNRELATED="30 3 * * * /home/someone/backups/start.sh --nightly"
+{
+    echo "0 * * * * /usr/bin/true"
+    echo "# tinyproxy-autostart"
+    echo "@reboot ${TP}/start.sh >> ${TP}/logs/cron-start.log 2>&1"
+    echo "${UNRELATED}"
+} > "${CRONTAB_STORE}"
+
+# Invoked with `bash`, not directly: the file mode is checked separately
+# above, and these assertions are about what the script *does*.
+if PATH="${STUB}:${PATH}" bash "${TP}/disable.sh" >"${WORK}/disable.out" 2>&1; then
+    vsay "$(cat "${WORK}/disable.out")"
+    pass "disable.sh runs to completion"
+else
+    fail "disable.sh failed: $(head -2 "${WORK}/disable.out" | tr '\n' ' ')"
+fi
+if grep -qF "# tinyproxy-autostart" "${CRONTAB_STORE}"; then
+    fail "disable.sh left its own marker line in the crontab"
+else
+    pass "disable.sh removed its marker line"
+fi
+if grep -qF "${TP}/start.sh" "${CRONTAB_STORE}"; then
+    fail "disable.sh left its own @reboot entry in the crontab"
+else
+    pass "disable.sh removed its @reboot entry"
+fi
+if grep -qF "${UNRELATED}" "${CRONTAB_STORE}"; then
+    pass "disable.sh left unrelated crontab lines mentioning start.sh alone"
+else
+    fail "disable.sh deleted an unrelated crontab line that mentioned start.sh"
+fi
+if grep -qF "0 * * * * /usr/bin/true" "${CRONTAB_STORE}"; then
+    pass "disable.sh left the rest of the crontab alone"
+else
+    fail "disable.sh deleted an unrelated crontab line"
+fi
+unset CRONTAB_STORE
+
+# ── PID files must be validated before anything is signalled ───────
+mkdir -p "${TP}/run"
+PIDF="${TP}/run/tinyproxy.pid"
+
+sleep 300 &
+VICTIM=$!
+echo "${VICTIM}" > "${PIDF}"
+
+bash "${TP}/reload.sh" >"${WORK}/reload.out" 2>&1 || true
+if kill -0 "${VICTIM}" 2>/dev/null; then
+    pass "reload.sh refuses to SIGHUP a PID that is not tinyproxy"
+else
+    fail "reload.sh signalled an unrelated process"
+fi
+
+bash "${TP}/stop.sh" >"${WORK}/stop.out" 2>&1 || true
+if kill -0 "${VICTIM}" 2>/dev/null; then
+    pass "stop.sh refuses to kill a PID that is not tinyproxy"
+else
+    fail "stop.sh killed an unrelated process"
+fi
+kill "${VICTIM}" 2>/dev/null || true
+wait "${VICTIM}" 2>/dev/null || true
+
+printf 'not-a-pid\n' > "${PIDF}"
+if bash "${TP}/stop.sh" >"${WORK}/stop2.out" 2>&1; then
+    if grep -qiE 'usable PID|refusing to signal' "${WORK}/stop2.out"; then
+        pass "stop.sh rejects a PID file that does not hold a number"
+    else
+        fail "stop.sh accepted a garbage PID file silently"
+    fi
+else
+    pass "stop.sh rejects a PID file that does not hold a number"
+fi
+rm -f "${PIDF}"
+
+# ── disable.sh must not report success when stop.sh failed ─────────
+chmod -x "${TP}/stop.sh"
+export CRONTAB_STORE="${WORK}/crontab2.txt"
+: > "${CRONTAB_STORE}"
+if PATH="${STUB}:${PATH}" bash "${TP}/disable.sh" >"${WORK}/disable2.out" 2>&1; then
+    fail "disable.sh reported success although stop.sh could not run"
+else
+    pass "disable.sh fails loudly when stop.sh cannot run"
+fi
+unset CRONTAB_STORE
+
+echo ""
+
 # ── Summary ────────────────────────────────────────────────────────
 
 echo "=== Results ==="
