@@ -5,8 +5,16 @@
 
 Integration tests for compartment-user and sandbox.sh.
 
-Note: compartment-root requires root and is not covered by this automated
-suite. Test it manually with `sudo ./compartment-root --dry-run --profile examples/container.conf -- /bin/sh`.
+Note: compartment-root requires real root, so it is not covered by the
+suites below. It has its own root-only suite, run separately:
+
+```bash
+sudo ./tests/scripts/root.d/compartment-root.sh
+```
+
+59 assertions against a real container. It builds its own busybox rootdir
+under `mktemp -d`, refuses to run without root, and removes everything it
+created on exit — including on failure.
 
 ## Quick Start
 
