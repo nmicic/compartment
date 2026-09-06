@@ -8,6 +8,11 @@
 #   ./tests/scripts/run_all.sh              # run all tests
 #   ./tests/scripts/run_all.sh --quick      # skip Claude smoke + sandbox proxy
 #   ./tests/scripts/run_all.sh --verbose    # verbose output from test runners
+#
+# Every executable tests/scripts/rootless.d/*.sh is discovered and run as its
+# own suite; see tests/scripts/rootless.d/README.md for the contract.
+# Root-only suites live in tests/scripts/root.d/ and are run by
+# tests/scripts/run_root_tests.sh (`sudo make test-root`).
 
 set -euo pipefail
 
@@ -52,6 +57,29 @@ run_suite() {
     fi
 }
 
+# Run every executable *.sh in a discovery directory as its own suite.
+# A non-executable *.sh is a failure, not a silent skip: a test that never
+# runs is the defect this harness exists to catch.
+run_discovered() {
+    local dir="$1" label="$2" script
+    if [ ! -d "${dir}" ]; then
+        return 0
+    fi
+    for script in "${dir}"/*.sh; do
+        [ -e "${script}" ] || continue          # empty glob
+        if [ ! -x "${script}" ]; then
+            SUITES_RUN=$((SUITES_RUN + 1))
+            SUITES_FAILED=$((SUITES_FAILED + 1))
+            FAILED_SUITES="${FAILED_SUITES}  - ${label}: $(basename "${script}") (not executable)"$'\n'
+            echo ""
+            echo "^^^ SUITE NOT EXECUTABLE: ${script} (chmod 755 it) ^^^"
+            echo ""
+            continue
+        fi
+        run_suite "${label}: $(basename "${script}")" "${script}" ${VERBOSE}
+    done
+}
+
 # ── Build prerequisites ───────────────────────────────────────────
 
 echo "Building compartment tools..."
@@ -77,6 +105,10 @@ run_suite "Compartment-user matrix (fs + seccomp + env)" \
 
 run_suite "Child inheritance tests" \
     "${SCRIPT_DIR}/run_child_inheritance_tests.sh" ${VERBOSE}
+
+# ── Discovered rootless suites ────────────────────────────────────
+
+run_discovered "${SCRIPT_DIR}/rootless.d" "rootless.d"
 
 # ── Extended tests (skip with --quick) ────────────────────────────
 

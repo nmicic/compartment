@@ -9,6 +9,11 @@ tests/probes/deny_probe
 *.a
 *.so
 
+# ...but the test discovery directories are not build artifacts. Without
+# these, "*.d" silently swallows every suite dropped into them.
+!tests/scripts/root.d/
+!tests/scripts/rootless.d/
+
 # Generated headers (config.py output)
 config.h
 compartment-root-config.h

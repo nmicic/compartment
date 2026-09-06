@@ -15,7 +15,7 @@ PREFIX  = /usr/local
 BINDIR  = $(PREFIX)/bin
 MANDIR  = $(PREFIX)/share/man
 
-.PHONY: all clean test test-integration test-quick hardened install install-man
+.PHONY: all clean test test-integration test-quick test-root hardened install install-man
 
 # Both tools: zero dependencies
 all: compartment-user compartment-root
@@ -51,6 +51,11 @@ test-integration: all tests/probes/deny_probe
 
 test test-quick: all tests/probes/deny_probe
 	./tests/scripts/run_all.sh --quick
+
+# Root-only suites (tests/scripts/root.d/). Must be run as root:
+#   sudo make test-root
+test-root: all tests/probes/deny_probe
+	./tests/scripts/run_root_tests.sh
 
 install: all install-man
 	install -d $(DESTDIR)$(BINDIR)
