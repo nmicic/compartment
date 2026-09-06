@@ -628,6 +628,20 @@ check-release: check-env
 	  echo "[check-release] FAIL: a core suite SKIPPED for an env reason preflight should have guaranteed away (above)"; \
 	  rm -f "$$log"; exit 1; \
 	fi; \
+	pats=$$(mktemp); unknown=$$(mktemp); \
+	grep -vE '^[[:space:]]*(#|$$)' tests/release-skip-allowlist.txt > "$$pats"; \
+	grep -a 'SKIP' "$$log" | grep -avE -f "$$pats" > "$$unknown" || true; \
+	if [ -s "$$unknown" ]; then \
+	  echo "[check-release] FAIL: unrecognised SKIP line(s). Every skip must match a documented"; \
+	  echo "[check-release]       entry in tests/release-skip-allowlist.txt — an unknown skip is a FAIL,"; \
+	  echo "[check-release]       because that is how two permanently-dead bypass witnesses (BX-11"; \
+	  echo "[check-release]       'spike fixtures missing', BX-12 'bpftool map create failed') read"; \
+	  echo "[check-release]       as green on every release. Fix the witness, or add an allowlist"; \
+	  echo "[check-release]       entry with a reason."; \
+	  sed 's/^/  /' "$$unknown"; \
+	  rm -f "$$log" "$$pats" "$$unknown"; exit 1; \
+	fi; \
+	rm -f "$$pats" "$$unknown"; \
 	rm -f "$$log"; \
 	echo "[check-release] PASS — full suite ran with no critical env skips"
 
