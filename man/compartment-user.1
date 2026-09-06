@@ -114,7 +114,18 @@ Log events to stderr and to a file.
 .TP
 .BI \-\-audit\-log " DIR"
 Set audit log directory (implies \fB\-\-audit\fR).
-Default: \fI/var/tmp/compartment-audit-$UID/\fR.
+Default: \fI$XDG_STATE_HOME/compartment\fR, or
+\fI~/.local/state/compartment\fR when
+.I $XDG_STATE_HOME
+is unset, created mode 0700.
+The directory must be owned by the effective uid and must not be group- or
+world-writable; it is opened with
+.B O_DIRECTORY|O_NOFOLLOW
+and the daily file is created relative to that descriptor, so neither the
+directory nor the file may be a symlink.
+If auditing was requested and cannot be set up safely,
+.B compartment-user
+refuses to run.
 .TP
 .B \-\-unsecure
 Allow execution when enforcement is degraded.
@@ -330,8 +341,9 @@ Per-user profile files.
 .I /etc/compartment/*.conf
 System-wide profile files.
 .TP
-.I /var/tmp/compartment-audit-$UID/
-Default audit log directory (one file per day).
+.I ~/.local/state/compartment/
+Default audit log directory (one file per day). Overridden by
+.IR $XDG_STATE_HOME/compartment .
 .SH REQUIREMENTS
 Linux >= 5.13 (Landlock). seccomp BPF requires >= 3.17.
 No external libraries.

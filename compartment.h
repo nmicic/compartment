@@ -1267,6 +1267,22 @@ static inline int get_ppid_chain(pid_t pid, pid_t chain[], int max_len)
 
 /* ── Audit logging ───────────────────────────────────────────────── */
 
+/* Every field below is interpolated into a single-line record, and some
+ * of them (the command path, the profile name, the cwd) are chosen by
+ * whoever runs the tool. A newline in any of them forges a log record.
+ * Replace everything outside printable ASCII with '_'. */
+static inline const char *audit_scrub(const char *in, char *buf, size_t bufsz)
+{
+    size_t i = 0;
+    if (!in) in = "";
+    for (; in[i] && i + 1 < bufsz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        buf[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '_';
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
 static inline void audit_log(Config *cfg, const char *event, const char *detail)
 {
     if (!cfg->audit) return;
@@ -1296,64 +1312,146 @@ static inline void audit_log(Config *cfg, const char *event, const char *detail)
     /* Get TTY */
     const char *tty = ttyname(STDIN_FILENO);
 
+    char s_user[128], s_event[128], s_cwd[PATH_MAX], s_tty[256], s_detail[1024];
+    audit_scrub(user, s_user, sizeof(s_user));
+    audit_scrub(event, s_event, sizeof(s_event));
+    audit_scrub(cwd, s_cwd, sizeof(s_cwd));
+    audit_scrub(tty ? tty : "none", s_tty, sizeof(s_tty));
+    audit_scrub(detail, s_detail, sizeof(s_detail));
+
     fprintf(stderr,
             "compartment: [%s] user=%s uid=%u event=%s ppid_chain=%s "
             "cwd=%s tty=%s %s\n",
-            ts, user, uid, event,
+            ts, s_user, uid, s_event,
             chain_str[0] ? chain_str : "?",
-            cwd, tty ? tty : "none",
-            detail ? detail : "");
+            s_cwd, s_tty, s_detail);
 
     /* Also write to audit log file if open */
     if (cfg->audit_log_fd >= 0) {
         dprintf(cfg->audit_log_fd,
                 "[%s] user=%s uid=%u event=%s ppid_chain=%s "
                 "cwd=%s tty=%s %s\n",
-                ts, user, uid, event,
+                ts, s_user, uid, s_event,
                 chain_str[0] ? chain_str : "?",
-                cwd, tty ? tty : "none",
-                detail ? detail : "");
+                s_cwd, s_tty, s_detail);
     }
 }
 
 /* ── Audit log file (must be opened BEFORE Landlock — fd survives) ── */
 
+/* Create dir and any missing parent. Intermediates get 0755, the leaf the
+ * requested mode. */
+static inline int mkdir_parents(const char *dir, mode_t mode)
+{
+    char tmp[PATH_MAX];
+    size_t n = strlen(dir);
+    if (n == 0 || n >= sizeof(tmp)) { errno = ENAMETOOLONG; return -1; }
+    memcpy(tmp, dir, n + 1);
+    while (n > 1 && tmp[n-1] == '/') tmp[--n] = '\0';
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+        *p = '/';
+    }
+    if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* Default audit directory. $XDG_STATE_HOME/compartment (or
+ * ~/.local/state/compartment) for an ordinary user, /var/log/compartment
+ * for root. The old default lived under world-writable /var/tmp. */
+static inline int audit_default_dir(char *dir, size_t dirsz)
+{
+    if (geteuid() == 0) {
+        int n = snprintf(dir, dirsz, "/var/log/compartment");
+        return (n > 0 && (size_t)n < dirsz) ? 0 : -1;
+    }
+    const char *xdg = getenv("XDG_STATE_HOME");
+    const char *why = NULL;
+    const char *home = home_dir_usable(getenv("HOME"), &why);
+    int n;
+    if (xdg && xdg[0] == '/')
+        n = snprintf(dir, dirsz, "%s/compartment", xdg);
+    else if (home)
+        n = snprintf(dir, dirsz, "%s/.local/state/compartment", home);
+    else {
+        fprintf(stderr, "compartment: no usable audit log directory "
+                "($XDG_STATE_HOME unset and $HOME %s) — use --audit-log DIR\n",
+                why ? why : "unusable");
+        return -1;
+    }
+    return (n > 0 && (size_t)n < dirsz) ? 0 : -1;
+}
+
 static inline int audit_log_open(Config *cfg)
 {
     char dir[PATH_MAX - 32];  /* leave room for /YYYY-MM-DD.log */
+    int explicit_dir = cfg->audit_log_dir != NULL;
 
-    if (cfg->audit_log_dir) {
-        snprintf(dir, sizeof(dir), "%s", cfg->audit_log_dir);
+    if (explicit_dir) {
+        int n = snprintf(dir, sizeof(dir), "%s", cfg->audit_log_dir);
+        if (n < 0 || (size_t)n >= sizeof(dir)) {
+            fprintf(stderr, "compartment: audit log dir path too long\n");
+            return -1;
+        }
+        if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+            fprintf(stderr, "compartment: mkdir %s: %s\n", dir, strerror(errno));
+            return -1;
+        }
     } else {
-        snprintf(dir, sizeof(dir), "/var/tmp/compartment-audit-%u",
-                 (unsigned)getuid());
+        if (audit_default_dir(dir, sizeof(dir)) != 0)
+            return -1;
+        if (mkdir_parents(dir, 0700) != 0) {
+            fprintf(stderr, "compartment: mkdir %s: %s\n", dir, strerror(errno));
+            return -1;
+        }
     }
 
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
-        fprintf(stderr, "compartment: mkdir %s: %s\n", dir, strerror(errno));
+    /* Validate the directory on its own fd, then create the day file
+     * relative to it. O_NOFOLLOW on the final component alone left the
+     * directory component followable: a symlink at the audit path
+     * redirected every record somewhere else. */
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dfd < 0) {
+        fprintf(stderr, "compartment: audit dir %s: %s\n", dir, strerror(errno));
+        return -1;
+    }
+    struct stat st;
+    if (fstat(dfd, &st) != 0) {
+        fprintf(stderr, "compartment: audit dir %s: %s\n", dir, strerror(errno));
+        close(dfd);
+        return -1;
+    }
+    mode_t bad = st.st_mode & (S_IWGRP | S_IWOTH);
+    if ((bad & S_IWGRP) && group_is_private(st.st_uid, st.st_gid))
+        bad &= (mode_t)~S_IWGRP;
+    if (st.st_uid != geteuid() || bad) {
+        fprintf(stderr, "compartment: audit dir %s is not a private, "
+                "self-owned directory (uid %u, mode %04o)\n",
+                dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777));
+        close(dfd);
         return -1;
     }
 
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
+    char name[32];
+    strftime(name, sizeof(name), "%Y-%m-%d.log", tm);
 
-    char path[PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/", dir);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
-        fprintf(stderr, "compartment: audit log dir path too long\n");
-        return -1;
-    }
-    strftime(path + n, sizeof(path) - (size_t)n, "%Y-%m-%d.log", tm);
-
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    int fd = openat(dfd, name,
+                    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    close(dfd);
     if (fd < 0) {
-        fprintf(stderr, "compartment: open %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "compartment: open %s/%s: %s\n",
+                dir, name, strerror(errno));
         return -1;
     }
 
     cfg->audit_log_fd = fd;
     if (cfg->verbose)
-        fprintf(stderr, "compartment: audit log: %s\n", path);
+        fprintf(stderr, "compartment: audit log: %s/%s\n", dir, name);
     return 0;
 }
 

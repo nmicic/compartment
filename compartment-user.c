@@ -380,7 +380,9 @@ static void print_usage(void)
         "  --verbose             Print actions to stderr\n"
         "  --audit               Log events to stderr + file\n"
         "  --audit-log DIR       Set audit log directory (implies --audit)\n"
-        "                        Default: /var/tmp/compartment-audit-$UID/\n"
+        "                        Default: $XDG_STATE_HOME/compartment or\n"
+        "                        ~/.local/state/compartment (root:\n"
+        "                        /var/log/compartment)\n"
         "  --insecure            Allow execution when enforcement is degraded\n"
         "                        (missing Landlock, unsupported filesystem, etc.)\n"
         "  --verify              Check system support and exit\n"
@@ -1090,9 +1092,11 @@ int main(int argc, char *argv[])
                     cfg.env_deny_count);
         }
         if (cfg.audit) {
+            char defdir[PATH_MAX - 32];
             fprintf(stderr, "  audit: yes (log: %s)\n",
                     cfg.audit_log_dir ? cfg.audit_log_dir :
-                    "/var/tmp/compartment-audit-$UID/");
+                    (audit_default_dir(defdir, sizeof(defdir)) == 0
+                         ? defdir : "(none)"));
         }
         fprintf(stderr, "  command: %s\n", argv[optind]);
         return 0;
@@ -1100,7 +1104,15 @@ int main(int argc, char *argv[])
 
     /* ── Audit (open log file BEFORE Landlock — fd survives) ──── */
     if (cfg.audit) {
-        audit_log_open(&cfg);  /* non-fatal if it fails */
+        /* Fatal: auditing was explicitly requested. Continuing without a
+         * durable record — or worse, with the record redirected through a
+         * symlink someone else controls — is not a degraded mode worth
+         * having. */
+        if (audit_log_open(&cfg) != 0) {
+            fprintf(stderr, "compartment-user: audit logging was requested "
+                    "but could not be set up safely — refusing to run\n");
+            return 1;
+        }
 
         char detail[512];
         snprintf(detail, sizeof(detail), "command=%s profile=%s source=%s "

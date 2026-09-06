@@ -384,7 +384,11 @@ int main(int argc, char *argv[])
     /* ── Audit log (open BEFORE clone — fd is on host filesystem) ──── */
 
     if (config.audit) {
-        audit_log_open(&config);
+        if (audit_log_open(&config) != 0) {
+            fprintf(stderr, "compartment-root: audit logging was requested "
+                    "but could not be set up safely — refusing to run\n");
+            return 1;
+        }
 
         char detail[512];
         snprintf(detail, sizeof(detail),

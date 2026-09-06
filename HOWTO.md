@@ -185,7 +185,7 @@ env-sanitize on
 
 # Audit logging
 audit on
-audit-log /var/tmp/compartment-audit-$USER
+audit-log $HOME/.local/state/compartment
 
 # Working directory
 # workdir $HOME/projects
@@ -270,7 +270,7 @@ compartment-user logs events to stderr and to daily log files.
 ### Enable
 
 ```bash
-# Stderr + default log dir (/var/tmp/compartment-audit-$UID/)
+# Stderr + default log dir (~/.local/state/compartment/)
 ./compartment-user --audit -- claude
 
 # Stderr + custom log dir
@@ -278,18 +278,28 @@ compartment-user logs events to stderr and to daily log files.
 
 # Via profile file
 audit on
-audit-log /var/tmp/my-audit-dir
+audit-log /srv/audit/compartment
 ```
 
 ### Log Location
 
-Default: `/var/tmp/compartment-audit-<UID>/YYYY-MM-DD.log`
+Default: `$XDG_STATE_HOME/compartment/YYYY-MM-DD.log`, or
+`~/.local/state/compartment/YYYY-MM-DD.log` when `$XDG_STATE_HOME` is
+unset. compartment-root running as root uses `/var/log/compartment/`.
+Either directory is created mode 0700.
 
-Why `/var/tmp`?
-- **World-writable** with sticky bit — any user can create dirs, no root needed
-- **Survives reboot** — unlike `/tmp` on tmpfs distros
-- **Not in the Landlock allowed set** — the sandboxed child process cannot
-  see, read, or tamper with audit logs
+The directory must be owned by the effective uid and must not be group-
+or world-writable. It is opened with `O_DIRECTORY|O_NOFOLLOW` and the
+daily file is created relative to that descriptor with `O_NOFOLLOW`, so
+neither the directory nor the file may be a symlink someone else
+controls. Every field written to a record has control characters
+replaced with `_`, so a command path containing a newline cannot forge a
+log line. If auditing was requested and cannot be set up safely,
+compartment-user and compartment-root refuse to run.
+
+Earlier releases defaulted to `/var/tmp/compartment-audit-$UID/`. That
+directory sits in a world-writable tree and the old code followed a
+symlink planted at that path.
 
 The log file is opened **before** Landlock is applied. The file descriptor
 has `O_CLOEXEC`, so it does not leak to the exec'd child. This gives us:
@@ -297,12 +307,28 @@ has `O_CLOEXEC`, so it does not leak to the exec'd child. This gives us:
 ```
 1. audit_log_open()    ← opens fd (no restrictions yet)
 2. audit_log()         ← writes COMPARTMENT_START event
-3. apply_landlock()    ← from here, /var/tmp is inaccessible
+3. apply_landlock()    ← from here, the log directory is inaccessible
 4. apply_seccomp()
 5. execv(child)        ← child inherits restrictions, fd is closed
 ```
 
-The child literally cannot `open()`, `stat()`, or `ls` the audit directory.
+The fd is closed across the exec, so the child cannot write to the open
+log file.
+
+**It does not follow that the child cannot reach the directory.** Landlock
+is additive and only restricts the rights named in its handled mask:
+
+* if the audit directory lies inside a path the profile grants (and the
+  default `~/.local/state/compartment` lies inside the `rwx $HOME` rule
+  the built-in `ai-agent` profile installs), the child can open, read and
+  rewrite yesterday's log;
+* even outside every rule, the handled mask carries no metadata-read
+  right, so `stat()` and `access()` on the directory still succeed.
+
+For tamper-evident logging, point `--audit-log` at a directory outside
+every granted path — ideally one the sandboxed user cannot write at all,
+such as a root-owned directory with `compartment-root` — or ship the
+records off the host.
 
 ### File Permissions
 
@@ -327,7 +353,7 @@ No rotation logic needed — the date **is** the rotation. One file per day.
 Clean up old logs with cron:
 
 ```bash
-find /var/tmp/compartment-audit-$(id -u) -name '*.log' -mtime +30 -delete
+find "${XDG_STATE_HOME:-$HOME/.local/state}/compartment" -name '*.log' -mtime +30 -delete
 ```
 
 ---

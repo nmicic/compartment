@@ -208,6 +208,10 @@ Configuration error, namespace creation failure, or privilege drop failure.
 .I /etc/compartment/*.conf
 System-wide profile files.
 compartment-root reads no other location.
+.TP
+.I /var/log/compartment/
+Default audit log directory when running as root (one file per day),
+created mode 0700.
 .SH REQUIREMENTS
 Linux >= 4.6 (CLONE_NEWCGROUP). Requires root or equivalent capabilities.
 No external libraries (no libseccomp, no libcap).
