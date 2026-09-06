@@ -91,94 +91,32 @@ fi
 echo "  user-ns:    $([ ${CAN_USERNS} -eq 1 ] && echo 'yes' || echo 'NO')"
 echo ""
 
+# shellcheck source=tests/scripts/lib/sandbox-hard.sh
+. "${SCRIPT_DIR}/lib/sandbox-hard.sh"
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/sandbox-proxy-matrix.XXXXXX")"
+trap 'rm -rf "${WORK}"' EXIT
+
+# Every negative outcome below used to route to skip(), and fail() was
+# defined and never called from anywhere in this file — so FAIL was
+# structurally always 0 and "ALL TESTS PASSED" was unconditional, on
+# every host, forever. The assertions now live in lib/sandbox-hard.sh and
+# are shared with root.d/sandbox-hard.sh, which clears
+# kernel.apparmor_restrict_unprivileged_userns for the duration so they
+# actually run on a machine like this one.
 if [ "${CAN_USERNS}" -eq 0 ]; then
-    echo "Cannot create user namespaces. Skipping sandbox.sh tests."
-    echo "(This is expected in some container environments.)"
-    skip "user namespaces not available"
-    echo ""
-    echo "=== Results ==="
-    echo "  PASS: ${PASS}  FAIL: ${FAIL}  SKIP: ${SKIP}"
-    echo "SUMMARY sandbox-proxy-matrix: pass=${PASS} fail=${FAIL} skip=${SKIP}"
-    exit 0
-fi
-
-# ── Test 1: HARD mode — no network ─────────────────────────────────
-
-echo "--- Test group: HARD mode (no proxy) ---"
-
-# In HARD mode without a proxy, the process should have no network
-# We test by trying to connect to localhost:1 (should fail — no interfaces)
-OUT=$(UPSTREAM_PROXY="" COMPARTMENT_USER="" \
-    timeout 10 "${SANDBOX}" /bin/sh -c "echo INSIDE; cat /proc/net/if_inet6 2>/dev/null || echo no-ipv6; ip addr 2>/dev/null || echo no-ip-cmd" 2>/dev/null) || true
-
-if echo "${OUT}" | grep -q "INSIDE"; then
-    pass "HARD mode: process runs inside sandbox"
+    echo "Cannot create an unprivileged user namespace as this user."
+    echo "(sudo make test-root runs the same assertions through"
+    echo " tests/scripts/root.d/sandbox-hard.sh.)"
+    skip_group "${SANDBOX_HARD_COUNT}" "user namespaces not available to this user"
 else
-    # sandbox.sh might fail to set up if system doesn't support net ns
-    skip "HARD mode: sandbox.sh failed to launch"
+    echo "--- Test group: sandbox.sh HARD mode against a real namespace ---"
+    sandbox_hard_assertions "${SANDBOX}" "${WORK}"
 fi
 
 echo ""
 
-# ── Test 2: HARD mode with proxy ───────────────────────────────────
-
-echo "--- Test group: HARD mode with proxy ---"
-
-if [ "${HAS_PROXY}" -eq 0 ] || [ "${HAS_SOCAT}" -eq 0 ]; then
-    skip "proxy or socat not available"
-else
-    # With proxy, curl through the proxy bridge should work
-    OUT=$(UPSTREAM_PROXY="http://127.0.0.1:8080" COMPARTMENT_USER="" \
-        timeout 15 "${SANDBOX}" /bin/sh -c \
-        'curl -s --proxy "${http_proxy:-}" --connect-timeout 5 http://example.com 2>&1 | head -5 || echo curl-failed' \
-        2>/dev/null) || true
-
-    if echo "${OUT}" | grep -qi "example\|html\|doctype"; then
-        pass "HARD+proxy: curl through proxy bridge works"
-    else
-        # Proxy bridge might not be wired in all configs
-        skip "HARD+proxy: curl did not return expected content (proxy bridge may not be configured)"
-    fi
-fi
-
-echo ""
-
-# ── Test 3: Environment inside sandbox ─────────────────────────────
-
-echo "--- Test group: Environment inside sandbox ---"
-
-OUT=$(UPSTREAM_PROXY="" COMPARTMENT_USER="" \
-    timeout 10 "${SANDBOX}" /bin/sh -c 'echo "uid=$(id -u) gid=$(id -g)"' 2>/dev/null) || true
-
-if echo "${OUT}" | grep -q "uid="; then
-    pass "sandbox: can run commands and get uid/gid"
-else
-    skip "sandbox: could not capture uid/gid"
-fi
-
-echo ""
-
-# ── Test 4: Verify process isolation ──────────────────────────────
-
-echo "--- Test group: Process isolation ---"
-
-# Inside sandbox, /proc should only show sandbox processes
-OUT=$(UPSTREAM_PROXY="" COMPARTMENT_USER="" \
-    timeout 10 "${SANDBOX}" /bin/sh -c 'ls /proc/*/cmdline 2>/dev/null | wc -l' 2>/dev/null) || true
-
-if [ -n "${OUT}" ]; then
-    # Should see very few processes (just sh and ls)
-    PROC_COUNT=$(echo "${OUT}" | tail -1 | tr -d '[:space:]')
-    if [ "${PROC_COUNT:-0}" -lt 20 ]; then
-        pass "sandbox: limited process visibility (${PROC_COUNT} processes)"
-    else
-        pass "sandbox: process list accessible (${PROC_COUNT} processes — no PID ns)"
-    fi
-else
-    skip "sandbox: could not count processes"
-fi
-
-echo ""
+harness_expect_total $(( SANDBOX_HARD_COUNT + 1 ))
 
 # ── Summary ───────────────────────────────────────────────────────
 
