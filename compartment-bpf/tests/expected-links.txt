@@ -21,7 +21,18 @@
 # comp_inode_setattr is pinned under that canonical name whichever of the
 # two kernel-signature wrappers is live.
 #
+# comp_bpf_map carries the marker `self-protect`: it is autoloaded ONLY when
+# --pin --self-protect was asked for, and only then on a kernel whose vmlinux
+# BTF has bpf_lsm_bpf_map with the 2-argument shape (true on 6.8 and 7.0 alike
+# — verified FUNC_PROTO vlen=2 on both). A default `--pin` pins 28 links, the
+# same set v0.8 pinned; `--pin --self-protect` pins 29. --self-protect refuses
+# to run at all on a kernel without the hook rather than pretend the maps are
+# protected. The assertion keys off the loader's own
+# "[probe] bpf_map hook: ... (self-protection ARMED)" line, so it is exact in
+# both modes rather than a count with a tolerance.
+#
 # Adding or removing a hook means changing this file in the same commit.
+comp_bpf_map	self-protect
 comp_bprm_committed_creds
 comp_file_ioctl
 comp_file_ioctl_compat	conditional

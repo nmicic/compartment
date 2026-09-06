@@ -28,6 +28,11 @@
 18-chattr-no-chmod.sh
 19-utimes-no-chmod.sh
 20-umount-shadow.sh
+22-self-protect-map.sh
+23-pin-unlink.sh
+24-bpffs-umount.sh
+25-loader-upgrade.sh
+26-frozen-map-honesty.sh
 exec-domain/BX-1-bind-mount-actor.sh
 exec-domain/BX-10-hardlink-to-canonical-actor.sh
 exec-domain/BX-11-ld-preload-strict.sh

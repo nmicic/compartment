@@ -35,6 +35,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `sb_mount` | witnessed | `tests/bypass/07-mount-bind-decoy.sh` |
 | `sb_umount` | witnessed | `tests/bypass/20-umount-shadow.sh` |
 | `move_mount` | witnessed | `tests/bypass/17-mount-inside-sealed-dir.sh` |
+| `bpf_map` | witnessed | `tests/bypass/23-pin-unlink.sh` |
 ## observe-hook
 
 | surface | status | note |
@@ -66,6 +67,8 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `DENY_PTRACE_TRACEME` | witnessed | `tests/strict-launch/run.sh` |
 | `DENY_MOUNT` | witnessed | `tests/bypass/07-mount-bind-decoy.sh` |
 | `DENY_UMOUNT` | witnessed | `tests/bypass/20-umount-shadow.sh` |
+| `DENY_BPF_SELF` | witnessed | `tests/bypass/22-self-protect-map.sh` |
+| `DENY_PIN_TAMPER` | witnessed | `tests/bypass/23-pin-unlink.sh` |
 | `DENY_UNLINK` | witnessed | `tests/mesh/run-mesh.sh` |
 | `DENY_RENAME` | witnessed | `tests/bypass/11-rename-into-no-write-dir.sh` |
 | `DENY_CREATE` | witnessed | `tests/bypass/14-runtime-subtree-depth-cap.sh` |
@@ -74,7 +77,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 
 | surface | status | note |
 |---|---|---|
-| `deny_total` | witnessed | `tests/counter-smoke.sh` |
+| `deny_total` | witnessed | `tests/bypass/22-self-protect-map.sh` |
 | `audit_drop_total` | witnessed | `tests/counter-smoke.sh` |
 | `actor_mismatch_total` | witnessed | `tests/bypass/exec-domain/BX-5-setuid-actor.sh` |
 | `strict_launch_missing_total` | witnessed | `tests/bypass/exec-domain/BX-11-ld-preload-strict.sh` |
@@ -87,6 +90,8 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `prctl_set_mm_exe_file_denied_total` | witnessed | `tests/stability/counter-longevity.sh` |
 | `ptrace_access_denied_total` | witnessed | `tests/stability/counter-longevity.sh` |
 | `ptrace_traceme_denied_total` | witnessed | `tests/stability/counter-longevity.sh` |
+| `bpf_self_denied_total` | witnessed | `tests/bypass/22-self-protect-map.sh` |
+| `pin_tamper_denied_total` | witnessed | `tests/bypass/23-pin-unlink.sh` |
 ## observe-counter
 
 | surface | status | note |
