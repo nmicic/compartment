@@ -277,7 +277,7 @@ removable — from inside the sandbox;
 .I /var/tmp
 is covered by no rule at all and is therefore neither.
 .TP
-.B \-\-unsecure
+.B \-\-insecure
 Allow execution when enforcement is degraded.
 .B compartment-user
 runs a pre-flight check before executing the command. If any check fails
@@ -287,11 +287,16 @@ protection, printing warnings to stderr.
 When \fB\-\-audit\fR is also set, a
 .B COMPARTMENT_DEGRADED
 event is logged.
+.B \-\-unsecure
+is accepted as an alias.
 .TP
 .B \-\-verify
 Check kernel support (Landlock, seccomp, filesystem type) and exit.
 Reports the Landlock ABI version, detects unsupported filesystems
 (9p, NFS, CIFS), and verifies seccomp BPF availability.
+.TP
+.B \-\-version
+Print the version and exit.
 .TP
 .B \-\-help
 Print usage summary.
@@ -329,7 +334,7 @@ compartment-user: REFUSING to execute \(em 1 preflight check failed.
 .fi
 .RE
 .PP
-Use \fB\-\-unsecure\fR to proceed with degraded protection, or
+Use \fB\-\-insecure\fR to proceed with degraded protection, or
 \fB\-\-no-landlock\fR to skip filesystem restrictions entirely.
 .SH SHELL REPLACEMENT MODE
 When invoked via a symlink whose name is not
@@ -487,6 +492,9 @@ Command not found or not executable under Landlock restrictions.
 .TP
 .I ~/.config/compartment/*.conf
 Per-user profile files.
+Searched only when
+.B \-\-user\-profiles
+is given, and never in shell-replacement mode.
 .TP
 .I /etc/compartment/*.conf
 System-wide profile files.
