@@ -101,7 +101,73 @@ static int  path_has_dotdot(const char *path);
 static int  mask_path(Config *config, const char *path);
 static void join_netns(const char *netns_name);
 static void set_rlimits(void);
+static void apply_default_seccomp_denylist(Config *config);
 static void print_help(const char *prog_name);
+
+/* ── Built-in seccomp deny-list ──────────────────────────────────────── */
+
+/*
+ * apply_default_seccomp_denylist — the filter compartment-root installs
+ * when the operator supplies neither --block nor --seccomp-allowed.
+ *
+ * Without this there was no default filter at all: apply_seccomp() warned
+ * "seccomp enabled but no syscalls to block" and returned success, so
+ * every container ran with Seccomp: 0 — byte-identical to --no-seccomp —
+ * while --help advertised seccomp as one of the things the tool does.
+ *
+ * The list mirrors compartment-user's built-in ai-agent deny-list.  It is
+ * deliberately kept here rather than hoisted into compartment.h: the
+ * profile loader in that header is being reworked separately, and keeping
+ * the two copies apart keeps this change to compartment-root.c.  Fold them
+ * into one shared table once that work lands.
+ *
+ * Nothing in this list is needed by a container after exec: all mounts,
+ * namespace setup and privilege changes happen in the child before the
+ * filter is installed.
+ */
+static void apply_default_seccomp_denylist(Config *config)
+{
+    static const char *blocked[] = {
+        /* Debugging and process memory access */
+        "ptrace", "process_vm_readv", "process_vm_writev",
+        /* Mount / namespace manipulation — nested container escape */
+        "mount", "umount2", "pivot_root", "chroot", "unshare", "setns",
+        "mount_setattr", "open_tree", "move_mount",
+        "fsopen", "fsmount", "fsconfig", "fspick",
+        /* Handle-based file access — reaches outside the mount namespace */
+        "open_by_handle_at", "name_to_handle_at",
+        /* Kernel code loading and reboot */
+        "reboot", "kexec_load", "kexec_file_load",
+        "init_module", "finit_module", "delete_module",
+        /* Kernel keyring */
+        "keyctl", "add_key", "request_key",
+        /* Kernel interfaces with a long CVE history */
+        "bpf", "userfaultfd", "perf_event_open",
+        "io_uring_setup", "io_uring_enter", "io_uring_register",
+        /* Host-wide state */
+        "acct", "swapon", "swapoff",
+        "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
+        /* Cross-process FD theft */
+        "pidfd_getfd",
+#ifdef __x86_64__
+        /* Raw I/O port access */
+        "ioperm", "iopl",
+#endif
+        NULL
+    };
+
+    for (int i = 0; blocked[i]; i++) {
+        int nr = resolve_syscall(blocked[i]);
+        if (nr < 0)
+            continue;   /* syscall does not exist on this architecture */
+        if (config->blocked_count >= MAX_BLOCKED_SC) {
+            fprintf(stderr, "compartment-root: built-in deny-list exceeds "
+                    "MAX_BLOCKED_SC (%d)\n", MAX_BLOCKED_SC);
+            exit(EXIT_FAILURE);
+        }
+        config->blocked_syscalls[config->blocked_count++] = nr;
+    }
+}
 
 /* ── main ────────────────────────────────────────────────────────────── */
 
@@ -279,6 +345,22 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* ── seccomp: fall back to the built-in deny-list ─────────────── */
+
+    int seccomp_builtin = 0;
+    if (config.use_seccomp && !config.seccomp_allow_mode &&
+        config.blocked_count == 0) {
+        apply_default_seccomp_denylist(&config);
+        seccomp_builtin = 1;
+    }
+    if (config.use_seccomp &&
+        (config.seccomp_allow_mode ? config.allowed_sc_count
+                                   : config.blocked_count) == 0) {
+        fprintf(stderr, "compartment-root: seccomp is enabled but the filter "
+                "would be empty — refusing to run\n");
+        return 1;
+    }
+
     /* ── no-new-privs is not negotiable for compartment-root ──────── */
 
     if (!config.use_no_new_privs) {
@@ -356,9 +438,10 @@ int main(int argc, char *argv[])
                     config.use_seccomp ? "yes" : "no",
                     config.allowed_sc_count);
         } else {
-            fprintf(stderr, "  seccomp: %s DENY-LIST (%d blocked)\n",
+            fprintf(stderr, "  seccomp: %s DENY-LIST (%d blocked%s)\n",
                     config.use_seccomp ? "yes" : "no",
-                    config.blocked_count);
+                    config.blocked_count,
+                    seccomp_builtin ? ", built-in default" : "");
         }
         fprintf(stderr, "  env-sanitize: %s\n",
                 config.use_env_sanitize ? "yes" : "no");
@@ -1169,6 +1252,16 @@ static void set_rlimits(void)
 
 /* ── Help ────────────────────────────────────────────────────────────── */
 
+/* Size of the built-in deny-list on this architecture (for --help). */
+static int builtin_denylist_size(void)
+{
+    Config tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    apply_default_seccomp_denylist(&tmp);
+    return tmp.blocked_count;
+}
+
+
 static void print_help(const char *prog_name)
 {
     printf("compartment-root — full-namespace process isolation (requires root)\n\n");
@@ -1193,6 +1286,10 @@ static void print_help(const char *prog_name)
     printf("  -a, --seccomp-allowed <syscall>  Allowed syscall, allow-list mode (repeatable)\n");
     printf("  -B, --block <syscall>            Blocked syscall, deny-list mode (repeatable)\n");
     printf("      --no-seccomp                 Disable seccomp entirely\n");
+    printf("                                   With neither -a nor -B and no profile\n");
+    printf("                                   list, the built-in deny-list (%d\n",
+           builtin_denylist_size());
+    printf("                                   syscalls) is installed.\n");
     printf("\nEnvironment:\n");
     printf("  -E, --env-deny <var>             Strip environment variable (repeatable)\n");
     printf("  -e, --env-allow <var>            Keep only listed env vars (repeatable)\n");
