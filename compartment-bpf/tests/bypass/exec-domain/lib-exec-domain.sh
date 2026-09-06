@@ -39,6 +39,26 @@ ed_create_actor() {
 #
 #   Caller must have created $TMP via mktemp -d /tmp/bypass.XXXXXX (so
 #   bypass_teardown's `rm -rf $TMP` cleans up correctly).
+# ed_mount_denied_by_compartment
+#   Returns 0 if a DENY_MOUNT audit line has appeared in $DAEMON_LOG.
+#
+#   From v0.8 the sb_mount / move_mount hooks refuse any new mount on or
+#   under a sealed inode, and ed_setup_actor_seal() seals the actor binary
+#   `full`. The bind-mount-over-actor decoy that BX-1 and BX-2 stage is
+#   therefore refused before it can be staged at all. That is a STRONGER
+#   outcome than the deny those witnesses were written to prove, so they
+#   must report it as a pass — reporting "need privileged mount" would blame
+#   the environment for a control doing its job and would quietly retire two
+#   bypass witnesses.
+ed_mount_denied_by_compartment() {
+	[ -n "${DAEMON_LOG:-}" ] || return 1
+	for _ in $(seq 1 20); do
+		grep -q 'DENY_MOUNT' "$DAEMON_LOG" 2>/dev/null && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
 ed_setup_actor_seal() {
 	_ed_actor=$1
 	_ed_actor_path=$2

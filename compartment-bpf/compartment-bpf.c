@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <ftw.h>
 #include <limits.h>
+#include <stdint.h>   /* UINT32_MAX (sealed_devs refcount saturation) */
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/resource.h>
@@ -1541,6 +1542,8 @@ static const char *action_name(__u32 a)
 	case ACTION_DENY_PRCTL_SET_MM:          return "DENY_PRCTL_SET_MM";
 	case ACTION_DENY_PTRACE_ACCESS:         return "DENY_PTRACE_ACCESS";
 	case ACTION_DENY_PTRACE_TRACEME:        return "DENY_PTRACE_TRACEME";
+	case ACTION_DENY_MOUNT:                 return "DENY_MOUNT";
+	case ACTION_DENY_UMOUNT:                return "DENY_UMOUNT";
 	default: return "?";
 	}
 }
@@ -1845,6 +1848,48 @@ static int validate_recursive_dir_seal(const char *path)
 // the leaf, so "seal /usr/bin/python" sealed whatever python pointed to
 // (e.g. python3.13). Now we refuse a symlink leaf and tell the operator
 // to pass the target path explicitly. The README documents this.
+// v0.8: register `dev` in sealed_devs (or bump its refcount) so
+// comp_sb_umount knows this superblock hosts sealed state. Called once per
+// successfully written seal, from seal_path() below.
+//
+// The value is a refcount purely for diagnostics — the hook tests presence.
+// A lost update under a concurrent loader is not possible here (policy load
+// is single-threaded and holds the pin lifecycle lock), so a plain
+// lookup/increment/update is correct.
+static int record_sealed_dev(struct compartment_bpf *skel, __u64 dev,
+			     const char *path)
+{
+	int dfd = bpf_map__fd(skel->maps.sealed_devs);
+	__u32 n = 0;
+
+	if (dfd < 0) {
+		fprintf(stderr, "seal %s: sealed_devs map fd unavailable\n", path);
+		return -1;
+	}
+	if (bpf_map_lookup_elem(dfd, &dev, &n) < 0) {
+		if (errno != ENOENT) {
+			fprintf(stderr, "seal %s: sealed_devs lookup: %s\n",
+				path, strerror(errno));
+			return -1;
+		}
+		n = 0;
+	}
+	if (n < UINT32_MAX)
+		n++;
+	if (bpf_map_update_elem(dfd, &dev, &n, BPF_ANY) < 0) {
+		// E2BIG here means the profile spans more distinct filesystems
+		// than sealed_devs holds. Refuse rather than attach a policy
+		// whose umount protection silently covers only some of them.
+		fprintf(stderr,
+			"seal %s: sealed_devs update (dev=0x%llx): %s. "
+			"The profile spans more filesystems than the "
+			"sealed_devs map holds; refusing fail-closed.\n",
+			path, (unsigned long long)dev, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 static int seal_path(struct compartment_bpf *skel, const char *path,
 		     __u32 flags, const struct actor_group *actor_ref,
 		     struct held_fds *held, struct profile_state *ps)
@@ -2125,6 +2170,17 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 
 	if (bpf_map_update_elem(mfd, &k, &sv, BPF_ANY) < 0) {
 		fprintf(stderr, "seal %s: map update: %s\n", path, strerror(errno));
+		close(pfd);
+		return -1;
+	}
+
+	// v0.8: record the hosting superblock in sealed_devs so comp_sb_umount
+	// can refuse to let the filesystem be detached out from under this
+	// path. The hook is handed a struct vfsmount and has no way back to an
+	// inode, so this is the only state that can answer it. Fail-closed: a
+	// seal we cannot register is a seal whose path guarantee we cannot
+	// keep, so refuse the load rather than attach a half-covered policy.
+	if (record_sealed_dev(skel, dev, path) < 0) {
 		close(pfd);
 		return -1;
 	}
@@ -2958,13 +3014,14 @@ static void pin_lifecycle_unlock(int fd)
 static int pin_links(struct compartment_bpf *skel)
 {
 	// pin_one_link writes into pinned[*pinned_count] without an
-	// explicit bound. We currently make 21 PIN_LINK invocations and have
-	// 32 slots. The assert hard-codes the current count (21) because
-	// KNOWN_LINK_NAMES is declared later in the file; if the PIN_LINK
-	// invocation count below grows, bump the literal here in lockstep.
+	// explicit bound. We currently make 28 pin calls (26 PIN_LINK, plus
+	// the canonical-name inode_setattr pin and the conditional
+	// file_ioctl_compat pin) and have 32 slots. The assert hard-codes the
+	// current count because KNOWN_LINK_NAMES is declared later in the
+	// file; if the pin count below grows, bump the literal in lockstep.
 	char pinned[32][PATH_MAX];
-	_Static_assert(sizeof(pinned) / PATH_MAX >= 21,
-		       "pinned[] must hold all PIN_LINK invocations (currently 21: 16 v0.3 + 5 v0.4)");
+	_Static_assert(sizeof(pinned) / PATH_MAX >= 28,
+		       "pinned[] must hold all PIN_LINK invocations (currently 28: 16 v0.3 + 5 v0.4 + 7 v0.8)");
 	int pinned_count = 0;
 
 	if (ensure_bpffs("/sys/fs/bpf") < 0 ||
@@ -3002,11 +3059,27 @@ static int pin_links(struct compartment_bpf *skel)
 	PIN_LINK(comp_inode_setxattr);
 	PIN_LINK(comp_inode_removexattr);
 	/* v0.4 strict-launch-marker hooks */
-	PIN_LINK(comp_bprm_check_security);
+	PIN_LINK(comp_bprm_committed_creds);  /* v0.8: was comp_bprm_check_security */
 	PIN_LINK(comp_task_alloc);
 	PIN_LINK(comp_task_prctl);
 	PIN_LINK(comp_ptrace_access_check);
 	PIN_LINK(comp_ptrace_traceme);
+	/* v0.8 metadata + mount coverage */
+	PIN_LINK(comp_inode_set_acl);
+	PIN_LINK(comp_inode_remove_acl);
+	PIN_LINK(comp_file_ioctl);
+	// file_ioctl_compat is autoload-gated on a BTF probe
+	// (select_file_ioctl_compat). When the running kernel has no
+	// security_file_ioctl_compat() the program is never loaded and libbpf
+	// leaves the link NULL, so skip the pin instead of failing: on such a
+	// kernel compat ioctls route through security_file_ioctl() and
+	// comp_file_ioctl already covers them. A NULL link with autoload
+	// enabled cannot reach here — compartment_bpf__attach() fails first.
+	if (skel->links.comp_file_ioctl_compat)
+		PIN_LINK(comp_file_ioctl_compat);
+	PIN_LINK(comp_sb_mount);
+	PIN_LINK(comp_sb_umount);
+	PIN_LINK(comp_move_mount);
 
 #undef PIN_LINK
 
@@ -3040,11 +3113,23 @@ static const char *const KNOWN_LINK_NAMES[] = {
 	"comp_inode_setxattr",
 	"comp_inode_removexattr",
 	/* v0.4: strict-launch-marker hooks */
+	"comp_bprm_committed_creds",
+	/* Legacy v0.4..v0.7 name for the marker hook. Never pinned by a v0.8+
+	 * loader; kept so `--unpin` can sweep a pin tree left by an older
+	 * loader instead of refusing it as an unknown object. */
 	"comp_bprm_check_security",
 	"comp_task_alloc",
 	"comp_task_prctl",
 	"comp_ptrace_access_check",
 	"comp_ptrace_traceme",
+	/* v0.8: metadata + mount coverage */
+	"comp_inode_set_acl",
+	"comp_inode_remove_acl",
+	"comp_file_ioctl",
+	"comp_file_ioctl_compat",
+	"comp_sb_mount",
+	"comp_sb_umount",
+	"comp_move_mount",
 };
 static const size_t N_KNOWN_LINK_NAMES =
 	sizeof(KNOWN_LINK_NAMES) / sizeof(KNOWN_LINK_NAMES[0]);
@@ -3092,6 +3177,7 @@ static int pin_tree_exists(void)
 	static const char *const KNOWN_MAP_NAMES[] = {
 	"sealed_inodes",
 	"sealed_dirs",
+	"sealed_devs",
 	"audit_rb",
 	"deny_total",
 	"audit_drop_total",
@@ -3104,6 +3190,7 @@ static int pin_tree_exists(void)
 	"strict_launch_missing_total",
 	"strict_launch_allowed_total",
 	"marker_set_total",
+	"marker_set_fail_total",
 	"marker_clear_foreign_exec_total",
 	"marker_copy_fork_total",
 	"marker_stale_generation_total",
@@ -3404,6 +3491,7 @@ static int pin_counter_maps(struct compartment_bpf *skel)
 		{ "strict_launch_missing_total",      skel->maps.strict_launch_missing_total },
 		{ "strict_launch_allowed_total",      skel->maps.strict_launch_allowed_total },
 		{ "marker_set_total",                  skel->maps.marker_set_total },
+		{ "marker_set_fail_total",             skel->maps.marker_set_fail_total },
 		{ "marker_clear_foreign_exec_total",   skel->maps.marker_clear_foreign_exec_total },
 		{ "marker_copy_fork_total",            skel->maps.marker_copy_fork_total },
 		{ "marker_stale_generation_total",     skel->maps.marker_stale_generation_total },
@@ -3616,6 +3704,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		/* v0 / v0.1 seal map shapes */
 		{ "sealed_inodes",                    skel->maps.sealed_inodes },
 		{ "sealed_dirs",                      skel->maps.sealed_dirs },
+		{ "sealed_devs",                      skel->maps.sealed_devs },
 		/* v0 counters — userspace reads only via bpf_map_lookup_elem;
 		 * freezing blocks userspace writes, BPF-side (*v)++ still works. */
 		{ "deny_total",                       skel->maps.deny_total },
@@ -3630,6 +3719,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		{ "strict_launch_missing_total",      skel->maps.strict_launch_missing_total },
 		{ "strict_launch_allowed_total",      skel->maps.strict_launch_allowed_total },
 		{ "marker_set_total",                 skel->maps.marker_set_total },
+		{ "marker_set_fail_total",            skel->maps.marker_set_fail_total },
 		{ "marker_clear_foreign_exec_total",  skel->maps.marker_clear_foreign_exec_total },
 		{ "marker_copy_fork_total",           skel->maps.marker_copy_fork_total },
 		{ "marker_stale_generation_total",    skel->maps.marker_stale_generation_total },
@@ -3638,11 +3728,11 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		{ "ptrace_traceme_denied_total",      skel->maps.ptrace_traceme_denied_total },
 	};
 	const size_t n = sizeof(entries) / sizeof(entries[0]);
-	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 = 17.
+	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 2 v0.8 = 19.
 	 * If you add a freezable map to compartment.bpf.c without extending
 	 * this table, the assert below catches it at build time. */
-	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 17,
-		"freeze_seal_maps entry count drift (expected: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 = 17)");
+	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 19,
+		"freeze_seal_maps entry count drift (expected: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 2 v0.8 = 19)");
 
 	for (size_t i = 0; i < n; i++) {
 		int fd = bpf_map__fd(entries[i].map);
@@ -3684,6 +3774,7 @@ static int stats_action(void)
 		{ "strict_launch_missing_total",      0, 0 },
 		{ "strict_launch_allowed_total",      0, 0 },
 		{ "marker_set_total",                 0, 0 },
+		{ "marker_set_fail_total",            0, 0 },
 		{ "marker_clear_foreign_exec_total",  0, 0 },
 		{ "marker_copy_fork_total",           0, 0 },
 		{ "marker_stale_generation_total",    0, 0 },
@@ -4205,8 +4296,10 @@ static int unpin_action(const char *requested)
 	// hard upper bound — one prog per link pin. Stack-sized array keeps
 	// the drain path allocation-free.
 	__u32 link_prog_ids[64];
-	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 21,
-		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id (currently 21)");
+	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 29,
+		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id "
+		       "(currently 29: 28 live pins + the legacy "
+		       "comp_bprm_check_security sweep entry)");
 	size_t n_link_prog_ids;
 
 	if (strcmp(cand, root) == 0) {
@@ -4459,6 +4552,58 @@ static int select_inode_setattr_variant(struct compartment_bpf *skel)
 	return 0;
 }
 
+// security_file_ioctl_compat() is the entry point a 32-bit process on a
+// 64-bit kernel reaches (fs/ioctl.c COMPAT_SYSCALL_DEFINE3(ioctl)); the
+// native SYSCALL_DEFINE3 calls security_file_ioctl() instead. Without the
+// compat program a 32-bit `chattr +i` bypasses the whole v0.8 ioctl gate.
+//
+// The hook was backported into stable 6.6.y, so `uname` cannot decide it:
+// probe vmlinux BTF for bpf_lsm_file_ioctl_compat and autoload the program
+// only when the symbol exists. On a kernel without it, attaching would fail
+// the whole load; skipping is correct because such a kernel routes compat
+// ioctls through security_file_ioctl(), which comp_file_ioctl already covers.
+// Must run after __open() and before __load(), like the setattr probe.
+static int select_file_ioctl_compat(struct compartment_bpf *skel)
+{
+	bool present = false;
+	int decided = 0;
+	struct btf *btf = btf__load_vmlinux_btf();
+
+	if (btf) {
+		__s32 id = btf__find_by_name_kind(btf, "bpf_lsm_file_ioctl_compat",
+		                                  BTF_KIND_FUNC);
+		present = (id >= 0);
+		decided = 1;
+		btf__free(btf);
+	}
+	if (!decided) {
+		// BTF absent: the hook has existed since 6.7 and is in every
+		// supported stable line, but we cannot prove it here. Disable
+		// rather than risk failing the entire load on a BTF-less host —
+		// the native comp_file_ioctl program still attaches, so the
+		// 64-bit gate stays live and only the compat residual reopens
+		// (the same residual documented in LIMITATIONS.md for kernels
+		// that genuinely lack the hook).
+		present = false;
+		fprintf(stderr,
+			"[probe] warn: vmlinux BTF unavailable; disabling the "
+			"file_ioctl_compat program. 32-bit ioctl callers are "
+			"NOT gated on this host.\n");
+	}
+
+	if (bpf_program__set_autoload(skel->progs.comp_file_ioctl_compat,
+	                              present)) {
+		fprintf(stderr,
+			"[probe] error: set_autoload(file_ioctl_compat) failed; "
+			"refusing to load.\n");
+		return -1;
+	}
+	fprintf(stderr, "[probe] file_ioctl_compat hook: %s.\n",
+		present ? "present (32-bit ioctl callers gated)"
+		        : "absent (compat ioctls route through file_ioctl)");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	/* Subcommand dispatch: `compartment-bpf observe [OPTIONS]` */
@@ -4693,6 +4838,11 @@ int main(int argc, char **argv)
 	// (6.8 has no mnt_idmap; 7.0+ does) before load, so the verifier only
 	// sees the correctly-shaped program.
 	if (select_inode_setattr_variant(skel) < 0) {
+		compartment_bpf__destroy(skel);
+		return 1;
+	}
+
+	if (select_file_ioctl_compat(skel) < 0) {
 		compartment_bpf__destroy(skel);
 		return 1;
 	}

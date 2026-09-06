@@ -39,8 +39,10 @@ enforces the seal on every matching operation regardless of uid or capability.
 | `inode_create` / `link` / `mkdir` / `mknod` / `symlink` / `rmdir` | create inside sealed dir |
 | `file_open` / `file_permission` / `file_truncate` | write-open, write through old FD, truncation |
 | `mmap_file` / `file_mprotect` | new shared-writable mapping of sealed file |
-| `inode_setattr` / xattr hooks | size / mode / owner / xattr changes |
-| `task_alloc` / `bprm_*` / `ptrace` / `task_free` | actor-strict marker lifecycle |
+| `inode_setattr` / xattr hooks / `inode_set_acl` / `inode_remove_acl` / `file_ioctl` (+ `file_ioctl_compat`) | size / mode / owner / timestamp / xattr / POSIX-ACL / inode-flag (`chattr`) changes, native and 32-bit callers |
+| `sb_mount` / `move_mount` | new mount on a sealed inode or inside a sealed subtree (path shadowing) |
+| `sb_umount` | detaching a filesystem that hosts sealed inodes (`umount`, `umount -l`; `move_mount(2)` is gated by `move_mount`'s from-side) |
+| `bprm_committed_creds` / `task_alloc` / `task_prctl` / `ptrace_*` | actor-strict marker lifecycle and identity-swap hardening |
 
 Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all four).
 
@@ -49,8 +51,9 @@ Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all 
 ## Key properties
 
 - **Inode-based, not path-based.** Sealed by `(dev, ino)`. Hard links to a
-  sealed inode inherit the seal; bind-mount shadowing of the path does not
-  bypass the underlying inode's protection.
+  sealed inode inherit the seal; bind-mount aliases of a sealed path share
+  its dentries and stay enforced; and since v0.8 no new mount can be placed
+  on or under a sealed path at all (`sb_mount` / `move_mount`).
 
 - **Recursive directory seals.** A `DIR full` or `DIR no-write` seal on a
   directory applies to all descendants — the BPF hooks walk ancestor dentries
@@ -152,7 +155,7 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 | Suite | Coverage |
 |-------|----------|
 | `make check` | loader negative-path, multi-actor, error-path, regression (24+ checks) |
-| `tests/bypass/run-all.sh` | 33 bypass scenarios (kernel hook coverage per flag class) |
+| `tests/bypass/run-all.sh` | 39 bypass scenarios (20 seal-class + 19 exec-domain; kernel hook coverage per flag class) |
 | `tests/strict-launch/run.sh` | 15 strict-launch-marker witnesses |
 | `tests/observe/run.sh` | 25 observe pipeline witnesses |
 | `tests/mesh/run-mesh.sh` | 3276 (actor × operation × flag) enforcement matrix rows |
@@ -167,14 +170,27 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 
 See `LIMITATIONS.md` for the full table. Highlights:
 
-- **Bind-mount shadowing**: `CAP_SYS_ADMIN` can `mount --bind` a decoy over
-  a sealed path, making the path resolve to an unsealed inode. The original
-  sealed inode remains protected; the path guarantee breaks.
+- **Mount shadowing (residual)**: v0.8 denies new mounts on or under sealed
+  paths, and denies detaching or moving away the filesystem that hosts them.
+  A consequence worth knowing before you load a policy: **you cannot
+  `umount` a filesystem holding sealed paths without `--unpin` first.** Still
+  open for `CAP_SYS_ADMIN`: `pivot_root`, mounting on the root of a nested
+  mount that already sat inside a sealed tree at load time, and unmounting a
+  bind mount that was itself the sealed path (the filesystem is not detached
+  by that, so it is deliberately allowed). The sealed inodes stay protected
+  in every case; only the path guarantee breaks.
+- **`chattr`-class ioctls**: gated on `no-chmod` seals for native *and*
+  32-bit compat callers (`file_ioctl` + `file_ioctl_compat`). The compat
+  program is autoload-gated on a BTF probe; on a kernel that lacks
+  `security_file_ioctl_compat()` compat ioctls route through the native hook
+  anyway. See LIMITATIONS.md.
 - **Existing writable mappings**: a shared-writable mmap established *before*
   policy attach is not revoked. Load before protected services start.
-- **BPF LSM detach**: a root process with `CAP_BPF` and access to the bpffs
-  link can detach the programs. Combine with capability dropping and bpffs
-  namespace lockdown for stronger guarantees.
+- **BPF LSM detach**: a root process with `CAP_BPF` and write access to the
+  bpffs pin directory can `unlink()` the link pins and, once the last fd
+  drops, remove enforcement. Note `bpf(BPF_LINK_DETACH)` does **not** work on
+  an LSM link — it returns `-EOPNOTSUPP` — so the pin tree is the surface to
+  guard. Combine with capability dropping and bpffs namespace lockdown.
 - **btrfs / overlayfs anon_bdev**: on these filesystems, `(dev, ino)` can be
   reused across bind-mount views of the same inode; see LIMITATIONS.md.
 - **No cryptographic policy signing** yet.

@@ -155,6 +155,11 @@ static int do_chown(const char *p)
 	return classify(rc, errno);
 }
 
+// Drives the inode_setxattr / inode_removexattr LSM hooks (comp_inode_setxattr,
+// comp_inode_removexattr): the two xattr operations the `no-chmod` seal flag
+// blocks. tests/mesh/run-mesh.sh's BLOCKING_OPS[no-chmod] runs both of these
+// through this probe on every mesh trial for that flag; they have no other
+// caller in the suite.
 static int do_setxattr(const char *p)
 {
 	int rc = setxattr(p, "user.sealprobe", "x", 1, 0);

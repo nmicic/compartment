@@ -54,6 +54,17 @@ ACTION_FLAG = {
     "DENY_PTRACE_TRACEME": None,
     "DENY_PRCTL_SET_MM": None,
     "DENY_UNPIN_AUTH_FAIL": None,
+    # DENY_MOUNT (v0.8): the mount gate fires on ANY seal flag, so there is no
+    # single flag whose allow-rule would restore the mount. The fix is either
+    # to add the mounting binary to the covering seal's actor= list or to move
+    # the mountpoint outside the sealed subtree — both operator decisions.
+    # REVIEW-ONLY, like the other structural denies above.
+    "DENY_MOUNT": None,
+    # DENY_UMOUNT (v0.8): the filesystem hosting the seals was about to be
+    # detached or moved. There is no seal flag to relax — the fix is to
+    # --unpin before the umount, or to keep the sealed paths off that
+    # filesystem. REVIEW-ONLY.
+    "DENY_UMOUNT": None,
 }
 
 # The daemon emits three deny line shapes: basic (uniform-deny, no caller/actor),

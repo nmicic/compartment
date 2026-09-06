@@ -6,11 +6,13 @@ original/
 /compartment-bpf
 /compartment.bpf.o
 /compartment.skel.h
+/compartment-observe.bpf.o
+/compartment-observe.skel.h
 /vmlinux.h
 /vmlinux.h.tmp
 
 # Test instrument binaries / output (built by `make test-tools`, `make bench`)
-test/sealprobe
+tests/sealprobe
 tests/fuzz_oracle
 tests/matrix-results-*.csv
 tests/bypass-results-*.txt

@@ -24,7 +24,10 @@ mkdir -p "$STAB_DIR"
 . "$SCRIPT_DIR/../lib-stability.sh"
 
 DAEMON="$REPO/compartment-bpf"
-PROF="$SCRIPT_DIR/../baseline-profile.conf"
+# baseline-profile.conf is a template (@STAB_ACTOR@); stab_profile renders it
+# against a real regular-file ELF so it also resolves on uutils-coreutils
+# distros where /usr/bin/true is a symlink. See tests/lib-realbin.sh.
+PROF=$(stab_profile "$SCRIPT_DIR/../baseline-profile.conf")
 
 if [ "$(id -u)" -ne 0 ]; then stab_skip "CC-09 requires root"; exit 0; fi
 [ -x "$DAEMON" ] || { stab_skip "CC-09: compartment-bpf missing"; exit 0; }

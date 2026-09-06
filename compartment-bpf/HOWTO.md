@@ -27,6 +27,19 @@ and unknown flags are fatal at load time. `oracle.conf` is the
 minimal worked example; the per-daemon profiles under `profiles/`
 are richer examples.
 
+`no-chmod` covers every inode-metadata write path the kernel exposes:
+`chmod`/`chown` (`inode_setattr`), xattrs, POSIX ACLs
+(`inode_set_acl` / `inode_remove_acl` — a separate hook since Linux 6.2,
+covered from v0.8), inode-flag ioctls such as `chattr +i/+a`
+(`file_ioctl`, v0.8) and explicit timestamp changes (`touch -d`,
+`utimensat`; v0.8). Truncation remains write-class (`no-write`). Any
+seal flag also refuses new mounts on or under the sealed path
+(`sb_mount` / `move_mount`, v0.8) so the path cannot be shadowed, and
+refuses to let the filesystem hosting the sealed path be detached or moved
+away from under it (`sb_umount`, v0.8). Note the operational consequence:
+while a policy is loaded, `umount` of a filesystem holding sealed paths is
+denied — run `compartment-bpf --unpin` first.
+
 The loader resolves paths once at load time via
 `open(O_PATH | O_NOFOLLOW)` + `fstat`, then keys the seal by
 `(dev, ino)`. A symlink at the leaf is refused with a clear message;
@@ -112,10 +125,13 @@ forgeable.
 
 ### 2.3 Hook-side semantics (ED-4 / ED-6)
 
-At each of the 21 LSM hooks `compartment.bpf.c` attaches (the 16
-file/inode/path hooks of v0.3 plus `task_alloc`, `task_prctl`,
-`ptrace_access_check`, `ptrace_traceme`, and the sleepable
-`bprm_check_security` added by v0.4 strict-launch),
+At each of the 28 LSM hooks `compartment.bpf.c` attaches (the 16
+file/inode/path hooks of v0.3; the five v0.4 strict-launch hooks
+`bprm_committed_creds`, `task_alloc`, `task_prctl`,
+`ptrace_access_check`, `ptrace_traceme`; and the seven v0.8
+metadata/mount hooks `inode_set_acl`, `inode_remove_acl`,
+`file_ioctl`, `file_ioctl_compat`, `sb_mount`, `sb_umount`,
+`move_mount`),
 after the
 existing seal+flag check passes the kernel runs an actor match
 against `current->mm->exe_file`'s `(dev, ino)`. On mismatch the
@@ -173,8 +189,10 @@ The `strict-launch` flag on a seal turns on the in-kernel marker
 check. A protected file operation on such a seal requires:
 
 1. existing actor= inode check (v0.3 binding) — and
-2. a valid task-storage marker (`bprm_check_security` sets one when
-   the task exec'd the sealed launcher), and
+2. a valid task-storage marker (`bprm_committed_creds` sets one once an
+   exec of the sealed launcher has *committed*; v0.8 moved this off
+   `bprm_check_security`, which runs before the point of no return and
+   left a marker behind when the exec failed afterwards), and
 3. the marker's target inode equals the current task's exe inode, and
 4. the marker's actor_slot matches the seal's strict_actor_slot, and
 5. the marker's policy_generation equals the loaded generation.
@@ -386,13 +404,15 @@ on x86_64) + `sodium_mlock` on every passphrase buffer + dual-
 channel audit (stderr + syslog `LOG_AUTHPRIV`) on
 `DENY_UNPIN_AUTH_FAIL` + an ABI-versioned action code
 (`ACTION_DENY_UNPIN_AUTH_FAIL = 7`, stable since ABI v0.3 and
-unchanged through the current v0.5 ABI). That is a
+unchanged through the current v0.8 ABI). That is a
 credential-gate-grade build, not the "speed bump" wording the
 v0 brief originally used. The honest threat-model framing:
 
 * **Against an attacker with CAP_BPF / CAP_SYS_ADMIN on the box,**
   this gate is bypassable — they own the sentinel file, the bpffs
-  pin tree, and can `bpftool prog detach`. The recovery path in
+  pin tree, and can `unlink()` the link pins (note `bpf(BPF_LINK_DETACH)`
+  does not work on an LSM link — it returns `-EOPNOTSUPP`; the pin tree is
+  the surface). The recovery path in
   §3.4 documents this directly.
 * **Against a non-CAP_BPF-restricted root attacker** (an
   unconfined process running as uid 0 but without CAP_BPF /
@@ -533,7 +553,8 @@ ABI v0.4) the strict-launch-marker counters:
 |--------------------------------------|-----------------------------------------------------------------------------------------------|
 | `strict_launch_missing_total`        | file-op denies emitted by `strict_launch_check_or_deny` (any failure mode)                    |
 | `strict_launch_allowed_total`        | file-op operations passed by `strict_launch_check_or_deny` (positive observability)           |
-| `marker_set_total`                   | tasks marker'd by `bprm_check_security` on sealed-launcher exec                              |
+| `marker_set_total`                   | tasks marker'd by `bprm_committed_creds` on a committed sealed-launcher exec                 |
+| `marker_set_fail_total`              | committed sealed-launcher execs whose task-storage marker could not be allocated (fail-closed; expect 0) |
 | `marker_clear_foreign_exec_total`    | tasks whose marker was cleared on a foreign exec (chain break — visibility signal)            |
 | `marker_copy_fork_total`             | child tasks that inherited a parent marker via `task_alloc` (G6 Outcome B)                    |
 | `marker_stale_generation_total`      | denies whose root cause was generation mismatch (always 0 in v0.4 fresh-load-only; see §3a)  |
@@ -739,13 +760,28 @@ without enumerating every file, while keeping the model fail-closed.
 
 ### 7.1 What a dir-destination seal does
 
-`deny_file_write()` (LSM `file_open` / `file_truncate`) and
-`deny_file_chmod()` (`path_chmod`) call both `deny_inode_action()`
-(for the file's own inode seal — the v0.3 behavior) AND
-`deny_file_parent_dir_action()` (for the parent inode's
-`ACTION_DENY_WRITE_PARENT_DIR=9` / `ACTION_DENY_CHMOD_PARENT_DIR=10`).
-A non-actor write or chmod against any immediate child of a
-DD-sealed dir is denied even if the child has no per-file seal.
+Every hook that can mutate a file calls **both** `deny_inode_action()`
+(the file's own inode seal — the v0.3 behaviour) and one of
+`deny_file_parent_dir_action()` / `deny_dentry_parent_dir_action()` (the
+covering directory's seal, emitting `ACTION_DENY_WRITE_PARENT_DIR=9` or
+`ACTION_DENY_CHMOD_PARENT_DIR=10`). A non-actor write or metadata change
+against a child of a DD-sealed dir is denied even if the child has no
+per-file seal.
+
+The write-class hooks are `file_open`, `file_permission` and
+`file_truncate`. The chmod-class hooks — what `no-chmod` actually covers —
+are:
+
+| hook | denies |
+|------|--------|
+| `inode_setattr` | `chmod`, `chown`, and (v0.8) explicit timestamp writes: `ATTR_ATIME\|ATTR_MTIME` without `ATTR_SIZE`, i.e. `touch` / `touch -d` / `touch -a` / `utimensat(2)`. `ATTR_SIZE` is excluded so truncation stays write-class. |
+| `inode_setxattr` / `inode_removexattr` | extended-attribute writes |
+| `inode_set_acl` / `inode_remove_acl` (v0.8) | POSIX ACL writes (`setfacl -m/-x/-b`). Since Linux 6.2 these are routed by `vfs_set_acl()` / `vfs_remove_acl()` and never reach the xattr hooks. |
+| `file_ioctl` + `file_ioctl_compat` (v0.8) | `FS_IOC_SETFLAGS` / `FS_IOC32_SETFLAGS` / `FS_IOC_FSSETXATTR` / `FS_IOC_SETVERSION` — `chattr +i/+a`, project ids. Both the native and the 32-bit compat ioctl entry points are separate LSM hooks in the kernel, so both are attached. |
+
+(There is no `path_chmod` program and no `deny_file_chmod()` helper; earlier
+revisions of this section named symbols that do not exist in
+`compartment.bpf.c`.)
 
 ### 7.2 Syntax
 
@@ -812,7 +848,8 @@ at load time.
 
 ### 7.4 Version requirement
 
-The runtime kernel module must be at ABI v0.5 or higher.
+The runtime kernel module must be at ABI v0.5 or higher. The current ABI
+is v0.8 (`0x0008`).
 
 `compartment-bpf observe` calls `detect_runtime_abi()`, which since
 v0.6 reads the exact runtime ABI from `PIN_ROOT/maps/abi_version_map`
@@ -899,6 +936,36 @@ All stability tests require root (for `--pin`/`--unpin`, dmesg access,
 and bpffs cleanup). The harness `stab_skip`s with rc=77 on hosts
 without root or BPF LSM, matching the project SKIP convention.
 
+Two things the harness now does for you, because getting them wrong
+produced a run that looked healthy and tested nothing:
+
+* **It drives `--pin` the way the loader actually behaves.** `--pin`
+  does not daemonise, fork or detach, and there is no
+  `--daemonize`/`--background` flag: it attaches, writes the pins under
+  `PIN_ROOT`, prints `[run] compartment-bpf live. ^C to exit.` and then
+  blocks in the ringbuf poll loop. The pins outlive the process — that
+  is the point — so each cycle starts it, waits for the pins to appear
+  on bpffs, then signals and reaps it. The old harness waited for
+  `--pin` to *exit* and declared a hang at cycle 0 of 64 on a perfectly
+  healthy box.
+* **It renders the profile against a real binary.**
+  `tests/stability/baseline-profile{,-b}.conf` are templates:
+  `@STAB_ACTOR@` / `@STAB_ACTOR_B@` are substituted with a purpose-built
+  regular-file ELF (`tests/lib-realbin.sh`). They used to name
+  `/usr/bin/true` and `/usr/bin/false`, which are symlinks on any distro
+  shipping uutils coreutils (Ubuntu 26.04); the loader refuses a symlink
+  leaf, so every seal failed to resolve and all 64 cycles pinned nothing
+  while the run still reported the churn as healthy. T-STAB-8 now fails
+  the run unless every cycle observed a live pin.
+
+Loop B runs `tests/mesh/run-mesh.sh` concurrently, and its ME-10 phase
+pins a daemon to read counter deltas back through `--stats`. `PIN_ROOT`
+is one global namespace and `--unpin` sweeps all of it, so both sides
+take the advisory mutex in `tests/lib-pinlock.sh` around their pinned
+window. Without it, the churn deleted the maps ME-10 was measuring and
+the run failed with `deny_total-delta(exp=1,got=0)` rows that had
+nothing to do with enforcement.
+
 ### 9.3 Acceptance criteria
 
 | ID | Check | Gate |
@@ -910,6 +977,7 @@ without root or BPF LSM, matching the project SKIP convention.
 | T-STAB-5 | All 10 corner-case witnesses pass or documented-skip | FAIL on any FAIL |
 | T-STAB-6 | No stuck-state (D-state survivor, mesh outer timeout) | FAIL |
 | T-STAB-7 | BPF prog/map counts return to baseline (±4) | FAIL |
+| T-STAB-8 | Every churn cycle observed a live pin under `PIN_ROOT/links` | FAIL |
 
 ### 9.4 Failure handling
 

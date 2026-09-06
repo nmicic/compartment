@@ -37,7 +37,15 @@ unshare -m sh -c "
 "
 rc=$?
 
-[ "$rc" = "100" ] && bypass_skip "bind-mount inside unshare -m failed"
+if [ "$rc" = "100" ]; then
+	# Same v0.8 outcome as BX-1: the sealed actor binary cannot be
+	# shadowed, even inside a private mount namespace — comp_sb_mount is
+	# keyed on the mountpoint inode, which is namespace-independent.
+	if ed_mount_denied_by_compartment; then
+		bypass_pass "bind-mount-over-actor inside a private mount namespace refused at the mount itself (DENY_MOUNT audited); a fresh mount-ns does not escape the seal"
+	fi
+	bypass_skip "bind-mount inside unshare -m failed"
+fi
 
 case $rc in
 	1) bypass_pass "open-write in mount-ns decoy denied (exe_inode != actor inode)" ;;

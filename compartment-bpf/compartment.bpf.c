@@ -6,16 +6,23 @@
 // exe inodes). Companion to
 // compartment-user (Landlock+seccomp) and compartment-root (namespaces).
 //
-// Hooks (21 total as of ABI v0.6):
+// Hooks (26 total as of ABI v0.8):
 //   v0.x file/inode/path (16):
 //     inode_unlink, inode_rename, inode_rmdir, inode_create, inode_mkdir,
 //     inode_mknod, inode_symlink, inode_link, file_open, file_permission,
 //     file_truncate, inode_setattr, mmap_file, file_mprotect,
 //     inode_setxattr, inode_removexattr
 //   v0.4 strict-launch (5):
-//     lsm.s/bprm_check_security (sleepable; sets task-storage marker),
-//     task_alloc (marker copy on fork), task_prctl (PR_SET_MM_EXE_FILE
-//     deny), ptrace_access_check, ptrace_traceme
+//     bprm_committed_creds (sets/keeps/clears the task-storage marker;
+//     moved here from bprm_check_security in v0.8 — see the hook comment),
+//     task_alloc (G6 marker copy on fork), task_prctl (PR_SET_MM deny),
+//     ptrace_access_check, ptrace_traceme
+//   v0.8 metadata + mount coverage (7):
+//     inode_set_acl, inode_remove_acl (POSIX ACL writes bypass the xattr
+//     hooks), file_ioctl + file_ioctl_compat (FS_IOC_SETFLAGS /
+//     FSSETXATTR / SETVERSION, native and 32-bit compat entry points),
+//     sb_mount, move_mount (no new mount on or under a sealed path),
+//     sb_umount (no detaching the filesystem out from under one)
 //
 // v0.1 maps:
 //   sealed_inodes : (dev, ino) -> struct seal_value     (per-file)
@@ -77,6 +84,45 @@ char LICENSE[] SEC("license") = "GPL";
 #ifndef S_IFLNK
 #define S_IFLNK 0120000
 #endif
+#ifndef ATTR_ATIME
+#define ATTR_ATIME 16
+#endif
+#ifndef ATTR_MTIME
+#define ATTR_MTIME 32
+#endif
+
+// v0.8 file_ioctl gate. vmlinux.h carries no preprocessor macros, so the
+// uapi encodings are spelled out (_IOW('f', 2, long) etc.; identical on
+// every 64-bit arch Linux supports). Verified against <linux/fs.h> on the
+// build host; tests/bypass/18-chattr-no-chmod.sh exercises SETFLAGS
+// end-to-end.
+#define COMP_FS_IOC_SETFLAGS      0x40086602UL
+#define COMP_FS_IOC32_SETFLAGS    0x40046602UL
+#define COMP_FS_IOC_FSSETXATTR    0x401c5820UL
+#define COMP_FS_IOC_SETVERSION    0x40087602UL
+#define COMP_FS_IOC32_SETVERSION  0x40047602UL
+
+// v0.8 sb_mount gate: mount(2) flag bits that modify an existing mount
+// and attach nothing new at the target path. Mirrors the dispatch order
+// in fs/namespace.c:path_mount().
+#ifndef MS_REMOUNT
+#define MS_REMOUNT     0x20
+#endif
+#ifndef MS_BIND
+#define MS_BIND        0x1000
+#endif
+#ifndef MS_UNBINDABLE
+#define MS_UNBINDABLE  (1 << 17)
+#endif
+#ifndef MS_PRIVATE
+#define MS_PRIVATE     (1 << 18)
+#endif
+#ifndef MS_SLAVE
+#define MS_SLAVE       (1 << 19)
+#endif
+#ifndef MS_SHARED
+#define MS_SHARED      (1 << 20)
+#endif
 
 // Recursive subtree enforcement walks ancestor dentries up to
 // COMPARTMENT_MAX_DIR_ANCESTORS levels. The shared default lives in
@@ -118,6 +164,22 @@ struct {
 	__type(key, struct inode_key);
 	__type(value, struct seal_value);
 } sealed_dirs SEC(".maps");
+
+// v0.8: the set of superblock devices that host at least one sealed inode
+// or sealed directory. Populated by the loader as it writes sealed_inodes /
+// sealed_dirs, and frozen with them.
+//
+// comp_sb_umount is handed a `struct vfsmount *`, not an inode, so the
+// per-inode maps cannot answer the only question that hook needs to ask:
+// "does this filesystem host anything sealed?". The value is a refcount of
+// the seals on that device, kept for diagnostics; the hook only tests
+// presence.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u64);
+	__type(value, __u32);
+} sealed_devs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -229,6 +291,18 @@ struct {
 	__type(key, __u32);
 	__type(value, __u64);
 } marker_set_total SEC(".maps");
+
+// v0.8: bprm_committed_creds could not allocate the task-storage marker.
+// Fail-closed (the actor is later denied with DENY_STRICT_LAUNCH_MISSING),
+// but silent without this counter — an operator seeing strict-launch denies
+// with no policy change needs to be able to tell "allocation pressure" from
+// "someone is attacking the launcher chain".
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} marker_set_fail_total SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1341,7 +1415,18 @@ comp_inode_setattr_impl(struct dentry *dentry, struct iattr *attr, int ret)
 				return r;
 		}
 
-		if (ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID)) {
+		// v0.8: explicit timestamp writes (utimensat / touch -d) on a
+		// directly sealed inode are chmod-class, matching the v0.5
+		// parent-dir rule below (anti-forensic mtime forgery on a sealed
+		// file is a metadata mutation the seal promises to block).
+		// Kernel-internal notify_change() callers never carry
+		// ATTR_ATIME|ATTR_MTIME without ATTR_SIZE (do_truncate) or
+		// carry them at all (chmod_common, chown_common,
+		// file_remove_privs), so the ATTR_SIZE exclusion keeps
+		// truncation classified as write, not chmod.
+		if ((ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID)) ||
+		    (!(ia_valid & ATTR_SIZE) &&
+		     (ia_valid & (ATTR_ATIME | ATTR_MTIME)))) {
 			r = seal_decision(isv, SEAL_NO_CHMOD,
 			                  ACTION_DENY_CHMOD, k.dev, k.ino, &cid);
 			if (r)
@@ -1486,28 +1571,73 @@ int BPF_PROG(comp_inode_removexattr, struct mnt_idmap *idmap,
 // v0.4 strict-launch-marker hooks (SPEC §6.1, §6.3)
 // ============================================================
 
-// §6.1 bprm_check_security — marker set / keep / clear. NOT a deny hook
-// in v0.4; the actual deny point is the seal_decision strict-launch
-// extension above. Sleepable (`lsm.s/`) because bpf_task_storage_get
-// with F_CREATE may sleep when allocating the per-task slot.
+// §6.1 marker set / keep / clear — attached at bprm_committed_creds.
+//
+// v0.8: moved from bprm_check_security. security_bprm_check() is called
+// from search_binary_handler() (fs/exec.c) immediately BEFORE
+// fmt->load_binary(), i.e. before load_elf_binary() has done anything. The
+// exploitable window is between that call and begin_new_exec(), because
+// every failure inside load_elf_binary() up to that point returns -errno to
+// the caller's ORIGINAL image — the task keeps running its old code with
+// whatever the check hook already wrote.
+//
+// Note this is NOT the window the first draft of this comment claimed:
+// de_thread(), unshare_files()/dup_fd() and exec_mmap() all run inside
+// begin_new_exec(), which sets bprm->point_of_no_return before any of them,
+// and bprm_execve() turns a failure past that point into force_fatal_sig
+// (SIGSEGV). Those paths kill the task; they can never return a marker to
+// the caller. The genuine pre-commit failure points, in
+// fs/binfmt_elf.c:load_elf_binary(), are:
+//
+//   - open_exec(elf_interpreter)  -> -ENOENT, and deterministically
+//     forceable: an attacker who controls a mount namespace shadows the
+//     interpreter path named in the launcher's PT_INTERP.
+//   - load_elf_phdrs()            -> -ENOMEM
+//   - the PT_INTERP sanity checks -> -ELIBBAD
+//   - the -ENOEXEC binfmt retry loop
+//
+// With the marker written at check time, a task already executing the actor
+// target (direct exec under LD_PRELOAD: exe == target, no marker) could
+// execve() the sealed launcher, force one of those failures — the
+// interpreter shadow is a single mount away and needs no race — and return
+// to its own code carrying a valid marker whose target matched its exe,
+// satisfying every strict-launch condition.
+//
+// bprm_committed_creds runs only once the new credentials and mm are
+// installed, so a marker can never describe an image that did not actually
+// replace the caller. bprm->file here is the final binary (for scripts, the
+// interpreter) and is what set_mm_exe_file() installed as
+// current->mm->exe_file — the same inode caller_id_resolve_locked reads at
+// enforcement time.
 //
 // Per SPEC §6.1:
-//   1. Resolve exec target inode (via bprm->file).
+//   1. Resolve exec target inode (via bprm->file). Unresolvable → drop
+//      any existing marker (fail closed) and return.
 //   2. If target inode is a declared launcher (launcher_to_actor hit):
 //      create/overwrite current task marker with (target, slot, gen).
-//      marker_set_total++.
+//      marker_set_total++ (marker_set_fail_total++ if the task-storage
+//      allocation fails; the actor then fails closed at op time).
 //   3. Else if current task already has a marker:
 //      3a. If exec target == marker.target → keep (slm-actor exec from
 //          its sealed launcher; legitimate chain continuation).
 //      3b. Else → foreign exec. marker_clear_foreign_exec_total++ before
-//          clearing. Allow exec.
-//   4. Else allow exec (no marker, not a launcher; ordinary process).
-SEC("lsm.s/bprm_check_security")
-int BPF_PROG(comp_bprm_check_security, struct linux_binprm *bprm, int ret)
+//          clearing.
+//   4. Else nothing (no marker, not a launcher; ordinary process).
+// Attached sleepable (lsm.s/). bpf_lsm_bprm_committed_creds is in the
+// kernel's sleepable_lsm_hooks allowlist on every supported kernel (6.8 and
+// 7.0 both verified), and sleepable context is what makes the
+// bpf_task_storage_get(F_CREATE) below a blocking allocation. A plain lsm/
+// attach would work, but under memory pressure the marker allocation could
+// fail without blocking, silently costing an actor its identity. The
+// remaining failure is counted (marker_set_fail_total) rather than ignored.
+//
+// The hook is void (LSM_RET_VOID): the program is linked as BPF_TRAMP_FEXIT
+// and its return value is discarded, so nothing here can deny. Every return
+// is 0 and the BPF_PROG arity omits the trailing `int ret` — there is no
+// return slot to read.
+SEC("lsm.s/bprm_committed_creds")
+int BPF_PROG(comp_bprm_committed_creds, struct linux_binprm *bprm)
 {
-	if (ret != 0)
-		return ret;
-
 	struct task_struct *t;
 	struct file *f;
 	struct inode *ino_p;
@@ -1517,37 +1647,36 @@ int BPF_PROG(comp_bprm_check_security, struct linux_binprm *bprm, int ret)
 	struct actor_marker *am;
 	__u32 gen;
 
-	// cur_strict_loaded() short-circuit
-	// mirrors the comp_task_prctl / comp_ptrace_*_check hooks. Without
-	// it, every execve() on the host pays the BPF_CORE_READ + map-lookup
-	// chain even on a profile with no strict-launch seals. Asymmetric
-	// guard application (3 of 5 hooks short-circuited, 2 didn't) was
-	// caught by 4 reviewers as an oversight; closing it makes the
-	// kernel-wide cost-of-strict-mode zero on a v0.3-style profile.
+	// cur_strict_loaded() short-circuit mirrors comp_task_alloc /
+	// comp_task_prctl / comp_ptrace_*: every execve() on the host would
+	// otherwise pay the BPF_CORE_READ + map-lookup chain on a profile
+	// with no strict-launch seals.
 	if (!cur_strict_loaded())
 		return 0;
-
-	// Resolve exec target inode key.
-	f = BPF_CORE_READ(bprm, file);
-	if (!f)
-		return 0;
-	ino_p = BPF_CORE_READ(f, f_inode);
-	if (!ino_p)
-		return 0;
-	exec_id.ino = BPF_CORE_READ(ino_p, i_ino);
-	sb = BPF_CORE_READ(ino_p, i_sb);
-	if (sb)
-		exec_id.dev = (__u64)BPF_CORE_READ(sb, s_dev);
 
 	t = (void *)bpf_get_current_task_btf();
 	if (!t)
 		return 0;
 
+	// Resolve exec target inode key.
+	f = BPF_CORE_READ(bprm, file);
+	ino_p = f ? BPF_CORE_READ(f, f_inode) : (struct inode *)0;
+	if (!ino_p) {
+		// Cannot classify the committed image: a marked task must not
+		// keep actor identity across an exec we cannot attribute.
+		bpf_task_storage_delete(&actor_marker_map, t);
+		return 0;
+	}
+	exec_id.ino = BPF_CORE_READ(ino_p, i_ino);
+	sb = BPF_CORE_READ(ino_p, i_sb);
+	if (sb)
+		exec_id.dev = (__u64)BPF_CORE_READ(sb, s_dev);
+
 	gen = cur_strict_generation();
 
 	la = bpf_map_lookup_elem(&launcher_to_actor, &exec_id);
 	if (la) {
-		// Step 2: launcher exec — create/overwrite marker.
+		// Step 2: launcher exec committed — create/overwrite marker.
 		am = bpf_task_storage_get(&actor_marker_map, t, NULL,
 		                          BPF_LOCAL_STORAGE_GET_F_CREATE);
 		if (am) {
@@ -1557,6 +1686,13 @@ int BPF_PROG(comp_bprm_check_security, struct linux_binprm *bprm, int ret)
 			am->state = 1;
 			am->_pad = 0;
 			bump_counter(&marker_set_total);
+		} else {
+			// Task-storage allocation failed. Fail-closed: without a
+			// marker the actor is denied by strict_launch_check_or_deny
+			// with DENY_STRICT_LAUNCH_MISSING. Count it so the deny has a
+			// distinguishable root cause instead of looking like an
+			// attack on the launcher chain.
+			bump_counter(&marker_set_fail_total);
 		}
 		return 0;
 	}
@@ -1718,4 +1854,330 @@ int BPF_PROG(comp_ptrace_traceme, struct task_struct *parent, int ret)
 		return -EPERM;
 	}
 	return 0;
+}
+
+// ============================================================
+// v0.8 metadata + mount coverage
+// ============================================================
+
+// POSIX ACLs. Since Linux 6.2 (vfs_set_acl()/vfs_remove_acl()),
+// setxattr(2)/removexattr(2) on system.posix_acl_{access,default} are
+// routed by do_setxattr()/removexattr() to the ACL VFS entry points,
+// which call security_inode_set_acl()/security_inode_remove_acl() and
+// never security_inode_setxattr()/security_inode_removexattr(). On the
+// project's kernel floor (>= 6.6) a `no-chmod` seal therefore did not
+// stop `setfacl -m / -x / -b`, even though an ACL write rewrites the
+// effective permission bits (posix_acl_update_mode derives the group
+// bits from the ACL mask). Mirror comp_inode_setxattr /
+// comp_inode_removexattr exactly: per-inode SEAL_NO_CHMOD, then the
+// parent-dir / recursive-subtree SEAL_NO_CHMOD. kacl is declared void *
+// so the program does not depend on struct posix_acl being in BTF.
+SEC("lsm/inode_set_acl")
+int BPF_PROG(comp_inode_set_acl, struct mnt_idmap *idmap,
+	     struct dentry *dentry, const char *acl_name, void *kacl,
+	     int ret)
+{
+	(void)idmap;
+	(void)acl_name;
+	(void)kacl;
+	if (ret != 0)
+		return ret;
+
+	struct inode *inode = BPF_CORE_READ(dentry, d_inode);
+	struct caller_id cid = {};
+	if (deny_inode_action(inode, SEAL_NO_CHMOD, ACTION_DENY_CHMOD, &cid))
+		return -EACCES;
+	if (deny_dentry_parent_dir_action(dentry, SEAL_NO_CHMOD,
+					  ACTION_DENY_CHMOD_PARENT_DIR, &cid))
+		return -EACCES;
+	return 0;
+}
+
+SEC("lsm/inode_remove_acl")
+int BPF_PROG(comp_inode_remove_acl, struct mnt_idmap *idmap,
+	     struct dentry *dentry, const char *acl_name, int ret)
+{
+	(void)idmap;
+	(void)acl_name;
+	if (ret != 0)
+		return ret;
+
+	struct inode *inode = BPF_CORE_READ(dentry, d_inode);
+	struct caller_id cid = {};
+	if (deny_inode_action(inode, SEAL_NO_CHMOD, ACTION_DENY_CHMOD, &cid))
+		return -EACCES;
+	if (deny_dentry_parent_dir_action(dentry, SEAL_NO_CHMOD,
+					  ACTION_DENY_CHMOD_PARENT_DIR, &cid))
+		return -EACCES;
+	return 0;
+}
+
+// Inode flag ioctls. chattr(1) (FS_IOC_SETFLAGS: +i/+a/+A/+d/...),
+// project quota / xfs_io (FS_IOC_FSSETXATTR) and FS_IOC_SETVERSION change
+// inode metadata through ->fileattr_set with no inode_setattr or xattr
+// hook in the path. Kernels >= 6.17 add security_inode_file_setattr();
+// the project floor is 6.6, so gate at the ioctl hooks, which every
+// ioctl(2) passes through. Only the five flag-writing commands are
+// inspected; every other ioctl returns after the compares below.
+//
+// Data-writing ioctls (FICLONE / FICLONERANGE / FIDEDUPERANGE) are
+// deliberately NOT listed: fs/remap_range.c calls security_file_permission()
+// with MAY_WRITE on the destination, so comp_file_permission already covers
+// them under no-write. Do not re-litigate.
+static __always_inline int
+comp_file_ioctl_impl(struct file *file, unsigned int cmd, int ret)
+{
+	if (ret != 0)
+		return ret;
+	if (cmd != COMP_FS_IOC_SETFLAGS && cmd != COMP_FS_IOC32_SETFLAGS &&
+	    cmd != COMP_FS_IOC_FSSETXATTR &&
+	    cmd != COMP_FS_IOC_SETVERSION && cmd != COMP_FS_IOC32_SETVERSION)
+		return 0;
+
+	struct inode *inode = BPF_CORE_READ(file, f_inode);
+	if (!inode)
+		return 0;
+	struct caller_id cid = {};
+	if (deny_inode_action(inode, SEAL_NO_CHMOD, ACTION_DENY_CHMOD, &cid))
+		return -EACCES;
+	if (deny_file_parent_dir_action(file, SEAL_NO_CHMOD,
+					ACTION_DENY_CHMOD_PARENT_DIR, &cid))
+		return -EACCES;
+	return 0;
+}
+
+// Native ioctl(2): fs/ioctl.c SYSCALL_DEFINE3(ioctl) -> security_file_ioctl().
+SEC("lsm/file_ioctl")
+int BPF_PROG(comp_file_ioctl, struct file *file, unsigned int cmd,
+	     unsigned long arg, int ret)
+{
+	(void)arg;
+	return comp_file_ioctl_impl(file, cmd, ret);
+}
+
+// Compat ioctl(2): a 32-bit process on a 64-bit kernel enters through
+// fs/ioctl.c COMPAT_SYSCALL_DEFINE3(ioctl), which calls
+// security_file_ioctl_compat() and NEVER security_file_ioctl(). Without this
+// program a 32-bit `chattr +i` walks straight past the gate above (the compat
+// switch handles FS_IOC32_SETFLAGS itself). Same body, same commands.
+//
+// The hook was added upstream and backported into stable 6.6.y, so a kernel
+// version test is unreliable; the loader BTF-probes for bpf_lsm_file_ioctl_compat
+// and autoload-gates this program (select_file_ioctl_compat() in
+// compartment-bpf.c). On a kernel without the hook, compat ioctls fall back
+// through security_file_ioctl() and comp_file_ioctl covers them.
+SEC("lsm/file_ioctl_compat")
+int BPF_PROG(comp_file_ioctl_compat, struct file *file, unsigned int cmd,
+	     unsigned long arg, int ret)
+{
+	(void)arg;
+	return comp_file_ioctl_impl(file, cmd, ret);
+}
+
+// Mount shadowing. A mount attached ON a sealed inode or anywhere INSIDE
+// a sealed subtree makes the path resolve to a foreign, unsealed inode:
+// the sealed inode is untouched but the path guarantee is gone (the
+// pre-v0.8 LIMITATIONS rows "bind-mount-OVER sealed path" and
+// "Mount-inside-sealed-subtree bypass"). Deny when the mountpoint
+// dentry's inode carries any seal flag, or any ancestor within the
+// recursive walk budget does. Actor-bound seals keep their allowlist
+// semantics through seal_decision (an actor may mount inside its own
+// sealed tree). Bind-mounting FROM a sealed path to somewhere else stays
+// allowed: the alias shares dentries with the original, so every seal
+// (including the ancestor walk) still applies through it — the mesh
+// §3.23 (b)/(c) rows witness that.
+//
+// The complementary shape — detaching the filesystem instead of mounting
+// over it — is comp_sb_umount's job, below.
+//
+// Not covered by either: pivot_root, and a mount placed on the root of a
+// nested mount that already sits inside a sealed tree (the d_parent walk
+// stops at a mount root). See LIMITATIONS.md.
+static __always_inline int
+deny_mount_on_dentry(struct dentry *mp, struct caller_id *cid)
+{
+	struct inode *inode;
+
+	if (!mp)
+		return 0;
+	inode = BPF_CORE_READ(mp, d_inode);
+	if (deny_inode_action(inode, SEAL_FULL, ACTION_DENY_MOUNT, cid))
+		return -EACCES;
+	return deny_dentry_parent_dir_action(mp, SEAL_FULL, ACTION_DENY_MOUNT,
+					     cid);
+}
+
+// mount(2). fs/namespace.c:path_mount() calls security_sb_mount() with the
+// caller's flags before it dispatches, and the exemptions below must mirror
+// that dispatch order exactly, because the kernel tests the flag bits in a
+// fixed sequence and the FIRST match wins:
+//
+//   security_sb_mount(...)                      <- this hook
+//   may_mount()
+//   if ((flags & (MS_REMOUNT|MS_BIND)) == (MS_REMOUNT|MS_BIND)) ...
+//   if (flags & MS_REMOUNT)  -> do_remount()      attaches nothing
+//   if (flags & MS_BIND)     -> do_loopback()     ATTACHES A NEW MOUNT
+//   if (flags & (MS_SHARED|MS_PRIVATE|MS_SLAVE|MS_UNBINDABLE))
+//                            -> do_change_type()  attaches nothing
+//   if (flags & MS_MOVE)     -> do_move_mount_old() ATTACHES
+//   return do_new_mount(...)                       ATTACHES
+//
+// MS_BIND is tested BEFORE the propagation bits, so a caller that passes
+// `MS_BIND|MS_PRIVATE` (`mount --bind src dst -o private`) gets a bind mount,
+// not a propagation change. Exempting on any propagation bit — as the first
+// cut of this gate did — therefore let one extra flag bit attach a mount
+// inside a sealed subtree, and neither hook caught it: do_loopback() reaches
+// graft_tree() without ever calling security_move_mount(). Test the flags in
+// the kernel's own order instead. tests/bypass/17 W5 is the regression
+// witness.
+SEC("lsm/sb_mount")
+int BPF_PROG(comp_sb_mount, const char *dev_name, const struct path *path,
+	     const char *type, unsigned long flags, void *data, int ret)
+{
+	(void)dev_name;
+	(void)type;
+	(void)data;
+	if (ret != 0)
+		return ret;
+	/* do_remount(): modifies an existing mount, attaches nothing.
+	 * MS_REMOUNT wins over MS_BIND in path_mount() (the combined
+	 * REMOUNT|BIND case is a bind-flag remount, still attaching nothing). */
+	if (flags & MS_REMOUNT)
+		return 0;
+	/* do_change_type(): propagation-only, attaches nothing — but ONLY when
+	 * MS_BIND is clear, because path_mount() dispatches MS_BIND first. */
+	if (!(flags & MS_BIND) &&
+	    (flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE)))
+		return 0;
+	/* MS_BIND (do_loopback), MS_MOVE (do_move_mount_old) and a fresh
+	 * filesystem mount (do_new_mount) all attach at `path`: gate them. */
+
+	struct dentry *mp = BPF_CORE_READ(path, dentry);
+	struct caller_id cid = {};
+	return deny_mount_on_dentry(mp, &cid);
+}
+
+// A filesystem hosting sealed inodes must not be detached, and its own
+// mount must not be moved away from under the sealed path.
+//
+// Gating the mount DESTINATION (comp_sb_mount / comp_move_mount above) only
+// covers half the shadowing class. The other half needs no mount at all to
+// start: `umount -l /data` detaches the filesystem, the sealed path then
+// resolves to the (unsealed) mountpoint dentry in the PARENT filesystem, and
+// a fresh `mount -t tmpfs none /data` sails past the destination gate
+// because nothing at that dentry is sealed. Every sealed path now resolves
+// to attacker content. The sealed inodes are still protected — they are just
+// unreachable, which is not what an operator was promised.
+//
+// In daemon mode the held O_PATH fds make umount EBUSY, but that is an
+// accident of implementation, not a control: `umount -l` detaches anyway,
+// and in daemonless `--pin` mode the fds died with the loader.
+//
+// Precision matters here, because s_dev alone is far too coarse: seal one
+// file on the root filesystem and every mount whose superblock is the root
+// filesystem — every bind mount of a root-fs directory, every container
+// setup — would become unmountable. So require BOTH:
+//
+//   (a) the superblock hosts at least one seal (sealed_devs hit), AND
+//   (b) mnt->mnt_root == mnt->mnt_sb->s_root, i.e. this vfsmount is a mount
+//       of the WHOLE filesystem, not a bind mount of some subdirectory of
+//       it. Detaching a bind mount leaves the filesystem — and every path
+//       into it through its real mount — exactly where it was.
+//
+// Residual: a bind mount at a sealed path is still unmountable-away
+// (condition (b) fails, so it is allowed), which re-exposes the path at
+// whatever the underlying dentry is. That is the same nested-mount class
+// already documented for comp_sb_mount, and it is recorded in
+// LIMITATIONS.md rather than papered over here.
+static __always_inline int
+deny_umount_of_sealed_dev(struct vfsmount *mnt)
+{
+	struct super_block *sb;
+	struct dentry *mnt_root, *s_root;
+	__u64 dev;
+	__u32 *hit;
+
+	if (!mnt)
+		return 0;
+	sb = BPF_CORE_READ(mnt, mnt_sb);
+	if (!sb)
+		return 0;
+
+	dev = (__u64)BPF_CORE_READ(sb, s_dev);
+	hit = bpf_map_lookup_elem(&sealed_devs, &dev);
+	if (!hit)
+		return 0;
+
+	// (b): whole-filesystem mount only.
+	mnt_root = BPF_CORE_READ(mnt, mnt_root);
+	s_root   = BPF_CORE_READ(sb, s_root);
+	if (!mnt_root || mnt_root != s_root)
+		return 0;
+
+	struct caller_id cid = {};
+	caller_id_resolve_locked(&cid);
+	emit_audit_actor(ACTION_DENY_UMOUNT, dev, 0,
+	                 cid.valid ? cid.dev : 0,
+	                 cid.valid ? cid.ino : 0,
+	                 (const char *)0);
+	return -EACCES;
+}
+
+// umount(2) / umount2(2), including MNT_DETACH (`umount -l`).
+// fs/namespace.c:do_umount() calls security_sb_umount(&mnt->mnt, flags) as
+// its first statement, before any of the may_umount / propagation work, and
+// the signature is identical on 6.8 and 7.0.
+SEC("lsm/sb_umount")
+int BPF_PROG(comp_sb_umount, struct vfsmount *mnt, int flags, int ret)
+{
+	(void)flags;   /* MNT_DETACH and MNT_FORCE are denied like a plain umount */
+	if (ret != 0)
+		return ret;
+	return deny_umount_of_sealed_dev(mnt);
+}
+
+// move_mount(2), including the tail of the new mount API flows
+// (open_tree(OPEN_TREE_CLONE) + move_mount, fsopen/fsmount + move_mount):
+// the mount at from_path is attached at to_path. Gate the destination the
+// same way. Note this hook is NOT on the MS_MOVE path: `mount --move` runs
+// do_move_mount_old(), which calls do_move_mount() directly and never
+// security_move_mount(), so MS_MOVE is covered by comp_sb_mount above and
+// only there. util-linux >= 2.39 increasingly uses the new mount API, so on
+// recent distributions a plain `mount` may never call security_sb_mount() at
+// all — both hooks are needed.
+SEC("lsm/move_mount")
+int BPF_PROG(comp_move_mount, const struct path *from_path,
+	     const struct path *to_path, int ret)
+{
+	if (ret != 0)
+		return ret;
+
+	// FROM side: moving the whole filesystem that hosts the seals away
+	// from its current mountpoint breaks the path guarantee exactly like
+	// unmounting it. Same two conditions as comp_sb_umount, plus a third:
+	// from_path must BE the mount root, otherwise this is a bind-style
+	// move of a subtree and the filesystem stays where it is.
+	//
+	// RESIDUAL: this only covers move_mount(2). The classic
+	// mount(2)+MS_MOVE spelling runs do_move_mount_old(), which calls
+	// do_move_mount() directly and never security_move_mount() (verified in
+	// fs/namespace.c on both 6.8 and 7.0), while security_sb_mount() sees
+	// only the DESTINATION path plus the source as a char* string it cannot
+	// resolve. There is no hook that can see the source mount on that path.
+	// LIMITATIONS.md carries the row; tests/bypass/20 W3 therefore drives
+	// move_mount(2) directly rather than `mount --move`, which would be a
+	// false pass (a shared-propagation parent returns EINVAL of its own).
+	struct vfsmount *from_mnt = BPF_CORE_READ(from_path, mnt);
+	struct dentry *from_dentry = BPF_CORE_READ(from_path, dentry);
+	if (from_mnt && from_dentry &&
+	    from_dentry == BPF_CORE_READ(from_mnt, mnt_root)) {
+		int r = deny_umount_of_sealed_dev(from_mnt);
+		if (r)
+			return r;
+	}
+
+	// TO side: attaching anything on or under a sealed path.
+	struct dentry *mp = BPF_CORE_READ(to_path, dentry);
+	struct caller_id cid = {};
+	return deny_mount_on_dentry(mp, &cid);
 }

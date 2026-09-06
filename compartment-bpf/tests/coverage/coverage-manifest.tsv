@@ -18,6 +18,25 @@
 # go DOWN. Adding a new uncovered surface requires a visible row here, which
 # shows up in review. See TODO.md "full test-coverage-vs-code audit".
 #
+# 2026-09-06: the definition of "witnessed" was tightened (see the rule block
+# at the top of tools/coverage-map.py). A hook used to be credited by its bare
+# op suffix appearing ANYWHERE in the tests/ corpus, comments included --
+# `file_open` was witnessed by the word `open`. It now needs the test file to
+# name the hook AND drive its operation outside comments, or to reference the
+# hook's BPF program name in code; actions and counters need their exact name
+# outside comments; observe hooks need their ao_* program name specifically.
+# `tools/coverage-map.py --selftest` asserts those properties. The re-audit
+# under the stricter rule added NO rows to this file: the two surfaces it
+# newly exposed (inode_setxattr, inode_removexattr) got a real witness in
+# tests/sealprobe.c instead. Ratchet unchanged at 12.
+#
+# 2026-09-06 (integration): the v0.8 surfaces were re-audited under that same
+# stricter rule. All of them keep a real witness except bprm_committed_creds,
+# whose only references were comments (the strict-launch suite drives it but
+# never named it in code); it got one -- strict-launch SL-12 asserts the
+# loader pinned PIN_ROOT/links/comp_bprm_committed_creds and did NOT pin the
+# pre-v0.8 comp_bprm_check_security. No rows added here either; still 12.
+#
 # ---------------------------------------------------------------------------
 # Action tokens whose enforcement PATH is exercised but whose audit-line token
 # is not yet grepped by a witness. Tracked Phase 3 (P1) of the coverage plan.

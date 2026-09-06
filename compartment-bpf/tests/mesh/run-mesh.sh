@@ -50,8 +50,49 @@ STUB_DIR="$REPO_ROOT/tests/mesh/build"
 RESULTS_DIR="$REPO_ROOT/tests/results"
 mkdir -p "$RESULTS_DIR"
 
+# --- Preconditions this harness used to leave to the Makefile ---------------
+#
+# `make check-mesh` chowns tests/mesh/sequences to 0:0 before invoking us
+# because ME-21 refuses to source a .seq file that is not root-owned
+# (HIGH-13, below). A direct `sudo tests/mesh/run-mesh.sh` — the invocation
+# in the docs and the obvious one for an operator — did not, so on a freshly
+# rsync'd, user-owned tree every sequence FATAL'd and the operator got a
+# silent hole in the run. We already require root here, so do it ourselves.
+if [ -d "$REPO_ROOT/tests/mesh/sequences" ]; then
+	if ! chown -R 0:0 "$REPO_ROOT/tests/mesh/sequences" 2>/dev/null ||
+	   ! chmod -R u=rwX,go=rX "$REPO_ROOT/tests/mesh/sequences" 2>/dev/null; then
+		echo "[mesh] FATAL: cannot make $REPO_ROOT/tests/mesh/sequences root-owned and non-group/world-writable." >&2
+		echo "[mesh]        ME-21 sources those files as root shell code and refuses anything else (HIGH-13)." >&2
+		echo "[mesh]        Fix with: chown -R 0:0 tests/mesh/sequences && chmod -R u=rwX,go=rX tests/mesh/sequences" >&2
+		exit 2
+	fi
+fi
+
+# The 8 mesh stubs are built by `make mesh-stubs`. A standalone run on a tree
+# where they are absent used to die at the distinct-inode assertion with a
+# bare "missing stub" and exit 2 — which the stability harness happily looped
+# on 358 times. Build them here if they are missing so the harness is
+# self-sufficient; if the build is not possible, say exactly what to run.
+if [ ! -x "$STUB_DIR/mesh_actor_a1" ]; then
+	echo "[mesh] mesh stubs absent under $STUB_DIR; building via 'make mesh-stubs'" >&2
+	if ! make -C "$REPO_ROOT" mesh-stubs >/dev/null 2>&1; then
+		echo "[mesh] FATAL: mesh stubs missing and 'make -C $REPO_ROOT mesh-stubs' failed." >&2
+		echo "[mesh]        Build them first: make mesh-stubs" >&2
+		exit 2
+	fi
+fi
+
 # shellcheck source=tests/mesh/predict.sh
 . "$REPO_ROOT/tests/mesh/predict.sh"
+# realbin_noop(): a real regular-file ELF, never /usr/bin/true (a symlink
+# under uutils coreutils). Used by ME-13's cp-onto-actor trial.
+# shellcheck source=tests/lib-realbin.sh
+. "$REPO_ROOT/tests/lib-realbin.sh"
+# pinlock_*(): PIN_ROOT is global and --unpin sweeps all of it, so the ME-10
+# counter phase must own it exclusively for the whole pin-measure-unpin
+# transaction. See tests/lib-pinlock.sh.
+# shellcheck source=tests/lib-pinlock.sh
+. "$REPO_ROOT/tests/lib-pinlock.sh"
 
 ACTORS=(a1 a2 a3 a4)
 OUTSIDERS=(b1 b2 b3 b4)
@@ -1446,8 +1487,10 @@ me13_assert_deny() {
 		fi
 	fi
 }
-# (a) no-write: cp /usr/bin/true onto the actor binary → DENY.
-me13_assert_deny cp-onto-actor cp /usr/bin/true "$ME13_BIN"
+# (a) no-write: cp a real ELF onto the actor binary → DENY. The source used
+# to be /usr/bin/true, a symlink on uutils-coreutils distros.
+ME13_SRC=$(realbin_noop) || ME13_SRC="$STUB_DIR/mesh_outsider_b1"
+me13_assert_deny cp-onto-actor cp "$ME13_SRC" "$ME13_BIN"
 # (b) no-rename/no-unlink: mv actor binary aside → DENY.
 me13_assert_deny mv-actor mv "$ME13_BIN" "${ME13_BIN}.bak"
 # (c) no-unlink: rm actor binary → DENY.
@@ -2270,23 +2313,29 @@ echo "[mesh] ME-22 fs variations: $ME22_PASS PASS / $ME22_FAIL FAIL"
 
 # --- ME-23 §3.23 mount/remount/bind-mount scenarios ---
 #
-# compartment-bpf hooks NO mount LSM paths (sb_mount, sb_remount,
-# move_mount). The seal is keyed by (dev,ino); mount changes alter
-# which inode a path resolves to. Witness the four classes:
+# v0.8: compartment-bpf hooks sb_mount + move_mount (a new mount ON a
+# sealed inode or INSIDE a sealed subtree is denied, ACTION_DENY_MOUNT)
+# and sb_umount (detaching a filesystem that hosts sealed inodes is
+# denied, ACTION_DENY_UMOUNT). sb_remount stays deliberately unhooked —
+# LSM denies are independent of MS_RDONLY, so a remount defeats nothing —
+# and sb_pivotroot is still open. The seal is keyed by (dev,ino); mount
+# changes alter which inode a path resolves to. Witness the five classes:
 #
 #   Tier 1 (mandatory, three bind scenarios):
-#     (a) bind OVER sealed path → GAP (writes via path hit unsealed inode)
+#     (a) bind OVER sealed path → DENY (v0.8 sb_mount; pre-v0.8 KNOWN-GAP)
 #     (b) bind FROM sealed path → seal-follows-inode (writes via alias DENY)
 #     (c) bind sealed DIR      → seal-follows-inode for parent-dir ops
 #
 #   Tier 2 (best-effort, two):
 #     (d) remount ro→rw of a loop-mounted FS containing sealed inode
 #         → seal unaffected (per-inode, not per-sb-flag)
-#     (e) unmount of FS containing sealed inodes → orphan map entries;
-#         subsequent path access returns ENOENT (kernel-level, before LSM)
+#     (e) unmount of FS containing sealed inodes → DENY (v0.8 sb_umount;
+#         through v0.7 this succeeded and left orphan map entries with the
+#         path returning ENOENT — a documented gap, now closed)
 #
-# Mount-over-sealed-mount-point: deferred to a future dedicated run (same
-# GAP class as (a); the bind-mount-OVER witness already documents it).
+# Mount on the ROOT of a nested mount that already sits inside a sealed
+# tree: still a gap (the BPF d_parent walk stops at a mount root, so the
+# sealed ancestor is never seen). Deferred; LIMITATIONS.md carries the row.
 ME23_PASS=0; ME23_FAIL=0
 ME23_MOUNTS=()
 me23_record() {
@@ -2319,28 +2368,34 @@ me23_record() {
 
 mkdir -p "$WORK/me23"
 
-# (a) Bind OVER sealed path — GAP witness.
-# Source: a fresh unsealed file with known content. Target: ME19_SECRET
-# (sealed `full actor=a1`). After bind, ME19_SECRET path resolves to
-# the unsealed source inode → outsider writes ALLOW (GAP).
+# (a) Bind OVER sealed path — DENY witness (v0.8, ENFORCED).
+# Pre-v0.8 this row was KNOWN-GAP: the bind succeeded and outsider writes
+# via the path hit the unsealed source inode. v0.8 attaches lsm/sb_mount +
+# lsm/move_mount: attaching a mount ON a sealed inode is denied with
+# ACTION_DENY_MOUNT. Expected now: the bind FAILS and the path still
+# resolves to the sealed inode (outsider write DENY). A bind that succeeds
+# is a regression and is recorded as actual=ALLOW against expected=DENY.
+# Control first: the same bind onto an UNSEALED file must work, otherwise
+# this host cannot bind-mount at all and the row is SKIP, not PASS.
 echo "xUNSEALEDx" > "$WORK/me23/over-src"
-if mount --bind "$WORK/me23/over-src" "$ME19_SECRET" 2>/dev/null; then
-	# Outsider write via path → unsealed inode → ALLOW (documented GAP).
-	stub=$(caller_path b1)
-	actual=$(run_trial "$stub" write "$ME19_SECRET")
-	me23_record bind-OVER-sealed-path-GAP b1 write "$ME19_SECRET" ALLOW "$actual" \
-		"GAP-bind-over-redirects-to-unsealed-inode" KNOWN-GAP
-	# Restore: umount immediately so subsequent tests see the original
-	# sealed inode. This mount is intentionally NOT tracked in
-	# ME23_MOUNTS — we umount inline and never need cleanup-trap to
-	# re-umount it. Don't use the bash ${array[@]/pat} substring-replace
-	# pattern to "remove" elements; it leaves empty strings behind that
-	# pollute the final cleanup loop (reviewer Leader-15-rev-HIGH-1).
-	umount "$ME19_SECRET" 2>/dev/null || true
-else
-	printf 'ME23-mount,bind-OVER-sealed-path-GAP-b1,%s,bind,setup,n/a,bind-failed,SKIP\n' \
+: > "$WORK/me23/over-ctl"
+if ! mount --bind "$WORK/me23/over-src" "$WORK/me23/over-ctl" 2>/dev/null; then
+	printf 'ME23-mount,bind-OVER-sealed-path-b1,%s,bind,setup,n/a,control-bind-failed,SKIP\n' \
 		"$ME19_SECRET" >> "$CSV"
 	SKIP=$((SKIP+1))
+else
+	umount "$WORK/me23/over-ctl" 2>/dev/null || true
+	if mount --bind "$WORK/me23/over-src" "$ME19_SECRET" 2>/dev/null; then
+		# Restore immediately so later rows see the sealed inode again.
+		umount "$ME19_SECRET" 2>/dev/null || true
+		me23_record bind-OVER-sealed-path b1 mount "$ME19_SECRET" DENY ALLOW \
+			"sb_mount-must-deny-mount-over-sealed-inode"
+	else
+		stub=$(caller_path b1)
+		actual=$(run_trial "$stub" write "$ME19_SECRET")
+		me23_record bind-OVER-sealed-path b1 write "$ME19_SECRET" DENY "$actual" \
+			"mount-over-sealed-inode-denied-path-still-sealed"
+	fi
 fi
 
 # (b) Bind FROM sealed path — seal follows inode.
@@ -2444,11 +2499,22 @@ else
 fi
 
 # (e) Unmount of FS containing sealed inodes. Use the ME-22 tmpfs
-# mount (sealed leaf inside). After unmount, path resolution at the
-# leaf returns ENOENT (kernel-level, before LSM). Witnessed: seal map
-# entry becomes orphan (no kernel inode); subsequent probe is ERROR.
-# We do NOT remove this from ME22_MOUNTS so the cleanup-trap umount-l
-# is harmless (umount-l after umount is a no-op).
+# mount (sealed leaf inside).
+#
+# Through v0.7 this succeeded: the filesystem detached, the sealed path
+# resolved to the (empty) underlying mountpoint directory, and the probe
+# returned ENOENT. The seal map entries were orphaned and every sealed
+# path pointed at whatever the parent filesystem held — including anything
+# a follow-up mount put there, which the v0.8 destination gate cannot see
+# because the mountpoint dentry carries no seal.
+#
+# v0.8 attaches sb_umount against a loader-populated sealed_devs (s_dev)
+# set, so both `umount` and `umount -l` are now DENIED while the policy is
+# live. This block asserts the deny and then re-asserts that the seal is
+# still in force through the still-mounted path.
+#
+# The mount stays in ME22_MOUNTS so the cleanup trap reaps it; cleanup()
+# kills the daemon before it umounts, so the teardown is unaffected.
 ME23_TMPFS_PATH=""
 for entry in "${ME22_FS_AVAILABLE[@]}"; do
 	IFS=':' read -r fs path <<<"$entry"
@@ -2461,26 +2527,44 @@ if [ -n "$ME23_TMPFS_PATH" ]; then
 	actual=$(run_trial "$stub" write "$sealed_tmpfs")
 	me23_record unmount-pre-outsider b1 write "$sealed_tmpfs" DENY "$actual" \
 		"sealed-before-unmount"
-	# Unmount.
-	if umount "$ME23_TMPFS_PATH" 2>/dev/null; then
-		# Path now resolves under the underlying $WORK/me22/tmpfs-mnt
-		# dir which is empty (the tmpfs hid it). open-wronly returns
-		# ENOENT → stub classifies as ERROR (rc=2).
-		stub=$(caller_path b1)
-		actual=$(run_trial "$stub" write "$sealed_tmpfs")
-		# Expect ERROR(2) — explicitly record the orphan-state witness.
-		case "$actual" in
-			ERROR\(2\)) verdict=PASS; PASS=$((PASS+1)); ME23_PASS=$((ME23_PASS+1)) ;;
-			ERROR*)     verdict="$actual"; ERR=$((ERR+1)) ;;
-			*)          verdict=FAIL; FAIL=$((FAIL+1)); ME23_FAIL=$((ME23_FAIL+1)) ;;
-		esac
-		printf 'ME23-mount,unmount-post-orphan-witness,%s,write,n/a,ENOENT-expected,%s,%s\n' \
-			"$sealed_tmpfs" "$actual" "$verdict" >> "$CSV"
-	else
-		printf 'ME23-mount,unmount-failed,%s,umount,setup,n/a,umount-failed,SKIP\n' \
-			"$ME23_TMPFS_PATH" >> "$CSV"
-		SKIP=$((SKIP+1))
-	fi
+	# Unmount must be DENIED (v0.8 sb_umount + sealed_devs). A bare
+	# "umount failed" is NOT enough to credit: the loader's held O_PATH fds
+	# already made a plain umount EBUSY through v0.7, which is exactly how
+	# this row managed to sit at SKIP for releases without anyone noticing.
+	# Require a DENY_UMOUNT audit line so only OUR refusal counts.
+	me23_umount_denied() {
+		# $1 = subcase, $2 = op label, rest = the umount argv
+		_sub=$1; _op=$2; shift 2
+		if "$@" 2>/dev/null; then
+			printf 'ME23-mount,%s,%s,%s,n/a,DENY,ALLOW,FAIL\n' \
+				"$_sub" "$ME23_TMPFS_PATH" "$_op" >> "$CSV"
+			FAIL=$((FAIL+1)); ME23_FAIL=$((ME23_FAIL+1)); return
+		fi
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			grep -q 'DENY_UMOUNT' "$DAEMON_LOG" 2>/dev/null && break
+			sleep 0.2
+		done
+		if grep -q 'DENY_UMOUNT' "$DAEMON_LOG" 2>/dev/null; then
+			printf 'ME23-mount,%s,%s,%s,n/a,DENY,DENY,PASS\n' \
+				"$_sub" "$ME23_TMPFS_PATH" "$_op" >> "$CSV"
+			PASS=$((PASS+1)); ME23_PASS=$((ME23_PASS+1))
+		else
+			printf 'ME23-mount,%s,%s,%s,n/a,DENY,refused-without-audit,FAIL\n' \
+				"$_sub" "$ME23_TMPFS_PATH" "$_op" >> "$CSV"
+			FAIL=$((FAIL+1)); ME23_FAIL=$((ME23_FAIL+1))
+		fi
+	}
+	me23_umount_denied unmount-denied umount umount "$ME23_TMPFS_PATH"
+	# Lazy unmount must be denied too — MNT_DETACH is the shape the
+	# loader's held O_PATH fds never blocked, so it is the one that
+	# actually needed a hook.
+	me23_umount_denied unmount-lazy-denied umount-l umount -l "$ME23_TMPFS_PATH"
+	# The filesystem is still mounted and the seal is still enforced
+	# through it — the point of denying the detach.
+	stub=$(caller_path b1)
+	actual=$(run_trial "$stub" write "$sealed_tmpfs")
+	me23_record unmount-post-still-sealed b1 write "$sealed_tmpfs" DENY "$actual" \
+		"sealed-after-denied-unmount"
 else
 	printf 'ME23-mount,unmount-no-tmpfs,n/a,umount,setup,n/a,tmpfs-unavailable,SKIP\n' >> "$CSV"
 	SKIP=$((SKIP+1))
@@ -2788,6 +2872,16 @@ done
 
 # Unpin any leftover state from prior runs (best-effort) and launch
 # fresh with --pin so --stats can read counters.
+#
+# From here to the matching pinlock_release below we must be the ONLY owner
+# of PIN_ROOT: --stats reads the pinned counter maps, and any other suite's
+# --unpin in this window deletes them mid-measurement (which is what turned
+# every deny_total delta into got=0 when the stability harness drove this
+# runner concurrently).
+if ! pinlock_acquire 180; then
+	echo "[mesh] ME-10 FAIL: timed out waiting for the PIN_ROOT test lock ($COMPARTMENT_TEST_PINLOCK)" >&2
+	FAIL=$((FAIL+1))
+fi
 "$DAEMON" --unpin >/dev/null 2>&1 || true
 ME10_LOG="$WORK/me10/daemon.log"
 "$DAEMON" --pin "$ME10_PROFILE" >"$ME10_LOG" 2>&1 &
@@ -2877,6 +2971,7 @@ if [ -n "${ME10_DAEMON_PID:-}" ] && kill -0 "$ME10_DAEMON_PID" 2>/dev/null; then
 fi
 "$DAEMON" --unpin >/dev/null 2>&1 || true
 DAEMON_PID=""
+pinlock_release
 
 echo "[mesh] ME-10 counter consistency: $ME10_PASS PASS / $ME10_FAIL FAIL"
 
@@ -2918,7 +3013,7 @@ TOTAL=$((PASS+FAIL+ERR+KNOWN_GAP+SKIP))
 	echo ""
 	echo "[mesh] classification fingerprint:"
 	echo "       ENFORCED:     $PASS PASS, $FAIL FAIL"
-	echo "       KNOWN-GAP:    $KNOWN_GAP (bind-OVER, ME-20 substrate=unknown)"
+	echo "       KNOWN-GAP:    $KNOWN_GAP (ME-20 substrate=unknown)"
 	echo "       OUT-OF-SCOPE: $SKIP SKIP (btrfs/overlay anon_bdev refused by HIGH-1 loader gate,"
 	echo "                         nfs out-of-scope, ME-24 doc-only, setup-unavail)"
 	echo "       TOTAL:        $TOTAL"

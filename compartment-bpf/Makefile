@@ -164,7 +164,8 @@ check-parser-actor: compartment-bpf
 
 # ED-3 + ED-4 BPF-side syntactic gate. Compile-only check that
 # compartment.bpf.c still builds with the new struct seal_value, the
-# 16-hook actor_check_or_deny integration, and the unrolled actor[]
+# actor_check_or_deny integration across all 27 programs, and the
+# unrolled actor[]
 # scan. Does NOT load or verify the program (that lands with the
 # bypass suite in ED-8); fails fast if a future edit drops the helper
 # or breaks the unroll bound. Reuses the existing compartment.bpf.o
@@ -197,7 +198,7 @@ check-actor-hook: compartment.bpf.o
 	@grep -q 'ACTION_DENY_STRICT_LAUNCH_MISSING' compartment-abi.h || { echo "error: ACTION_DENY_STRICT_LAUNCH_MISSING missing in compartment-abi.h (ABI v0.4)"; exit 1; }
 	@grep -Eq '_Static_assert\(sizeof\(struct launcher_actor\) == 24' compartment-abi.h || { echo "error: launcher_actor size assertion missing or drifted from 24 in compartment-abi.h (ABI v0.4)"; exit 1; }
 	@grep -Eq '_Static_assert\(sizeof\(struct actor_marker\) == 32' compartment-abi.h || { echo "error: actor_marker size assertion missing or drifted from 32 in compartment-abi.h (ABI v0.4)"; exit 1; }
-	@grep -q 'COMPARTMENT_ABI_VERSION 0x0007' compartment-abi.h || { echo "error: COMPARTMENT_ABI_VERSION did not bump to 0x0007 in compartment-abi.h"; exit 1; }
+	@grep -q 'COMPARTMENT_ABI_VERSION 0x0008' compartment-abi.h || { echo "error: COMPARTMENT_ABI_VERSION did not bump to 0x0008 in compartment-abi.h"; exit 1; }
 	@# v0.5/v0.6 dir-destination gates: catch a drift that drops the
 	@# action codes, recursive ancestor helper, or exact ABI version map.
 	@grep -q 'ACTION_DENY_WRITE_PARENT_DIR' compartment-abi.h || { echo "error: ACTION_DENY_WRITE_PARENT_DIR missing in compartment-abi.h (ABI v0.5)"; exit 1; }
@@ -209,22 +210,47 @@ check-actor-hook: compartment.bpf.o
 	@grep -q 'ACTION_DENY_PRCTL_SET_MM' compartment-abi.h || { echo "error: ACTION_DENY_PRCTL_SET_MM missing in compartment-abi.h (ABI v0.7)"; exit 1; }
 	@grep -q 'ACTION_DENY_PTRACE_ACCESS' compartment-abi.h || { echo "error: ACTION_DENY_PTRACE_ACCESS missing in compartment-abi.h (ABI v0.7)"; exit 1; }
 	@grep -q 'ACTION_DENY_PTRACE_TRACEME' compartment-abi.h || { echo "error: ACTION_DENY_PTRACE_TRACEME missing in compartment-abi.h (ABI v0.7)"; exit 1; }
-	@grep -q 'comp_bprm_check_security' compartment.bpf.c || { echo "error: comp_bprm_check_security missing in compartment.bpf.c (ABI v0.4)"; exit 1; }
+	@grep -q 'comp_bprm_committed_creds' compartment.bpf.c || { echo "error: comp_bprm_committed_creds missing in compartment.bpf.c (ABI v0.8: marker hook moved off bprm_check_security)"; exit 1; }
 	@grep -q 'comp_task_alloc' compartment.bpf.c || { echo "error: comp_task_alloc missing in compartment.bpf.c (ABI v0.4)"; exit 1; }
 	@grep -q 'strict_launch_check_or_deny' compartment.bpf.c || { echo "error: strict_launch_check_or_deny missing in compartment.bpf.c (ABI v0.4)"; exit 1; }
 	@grep -q 'parse_actor_strict_decl' compartment-bpf.c || { echo "error: parse_actor_strict_decl missing in compartment-bpf.c (ABI v0.4)"; exit 1; }
 	@grep -q 'strict_validate_launchers' compartment-bpf.c || { echo "error: strict_validate_launchers missing in compartment-bpf.c (ABI v0.4)"; exit 1; }
 	@grep -q 'STRICT_DANGEROUS_ENV_NAMES' compartment-bpf.c || { echo "error: STRICT_DANGEROUS_ENV_NAMES missing in compartment-bpf.c (ABI v0.4)"; exit 1; }
 	@# HIGH-11 (Review-1 fix): symmetric grep gates for the 3 strict-launch
-	@# LSM hooks that were ungated in the v0.3 lift, plus the 11 v0.4 map
+	@# LSM hooks that were ungated in the v0.3 lift, plus the v0.4 map
 	@# names. A future refactor that drops any of these will now fail
 	@# check-actor-hook instead of slipping through. Mirrors the v0.3
 	@# precedent set in F6 / Phase 2 mesh Review-1 fixes.
 	@grep -q 'comp_task_prctl' compartment.bpf.c || { echo "error: comp_task_prctl missing in compartment.bpf.c (ABI v0.4 SPEC §6.3)"; exit 1; }
 	@grep -q 'comp_ptrace_access_check' compartment.bpf.c || { echo "error: comp_ptrace_access_check missing in compartment.bpf.c (ABI v0.4 SPEC §6.3)"; exit 1; }
 	@grep -q 'comp_ptrace_traceme' compartment.bpf.c || { echo "error: comp_ptrace_traceme missing in compartment.bpf.c (ABI v0.4 SPEC §6.3)"; exit 1; }
+	@# v0.8 gates: metadata + mount coverage hooks and the DENY_MOUNT code.
+	@grep -q 'ACTION_DENY_MOUNT' compartment-abi.h || { echo "error: ACTION_DENY_MOUNT missing in compartment-abi.h (ABI v0.8)"; exit 1; }
+	@grep -q 'case ACTION_DENY_MOUNT' compartment-bpf.c || { echo "error: action_name() lacks ACTION_DENY_MOUNT in compartment-bpf.c (ABI v0.8)"; exit 1; }
+	@for h in comp_inode_set_acl comp_inode_remove_acl comp_file_ioctl \
+	          comp_file_ioctl_compat comp_sb_mount comp_sb_umount \
+	          comp_move_mount; do \
+		grep -q "$$h" compartment.bpf.c || { echo "error: v0.8 hook $$h missing in compartment.bpf.c"; exit 1; }; \
+		grep -q "PIN_LINK($$h)" compartment-bpf.c || { echo "error: v0.8 hook $$h not pinned in compartment-bpf.c pin_links()"; exit 1; }; \
+		grep -q "\"$$h\"" compartment-bpf.c || { echo "error: v0.8 hook $$h missing from KNOWN_LINK_NAMES in compartment-bpf.c"; exit 1; }; \
+	done
+	@# The compat ioctl program is autoload-gated on a BTF probe; without the
+	@# probe it would fail the load on kernels that lack the hook.
+	@grep -q 'select_file_ioctl_compat' compartment-bpf.c || { echo "error: select_file_ioctl_compat BTF autoload gate missing in compartment-bpf.c (ABI v0.8)"; exit 1; }
+	@grep -q 'bpf_lsm_file_ioctl_compat' compartment-bpf.c || { echo "error: file_ioctl_compat BTF probe symbol missing in compartment-bpf.c (ABI v0.8)"; exit 1; }
+	@# sb_mount must mirror path_mount()'s dispatch order: MS_BIND is tested
+	@# before the propagation bits, so exempting on a propagation bit alone
+	@# reopens the MS_BIND|MS_PRIVATE bypass.
+	@grep -q 'MS_BIND' compartment.bpf.c || { echo "error: comp_sb_mount lacks the MS_BIND dispatch-order guard in compartment.bpf.c (ABI v0.8)"; exit 1; }
+	@# sb_umount needs the sealed_devs map on both sides: without the loader
+	@# half the hook is a no-op that no test can distinguish from working.
+	@grep -q 'ACTION_DENY_UMOUNT' compartment-abi.h || { echo "error: ACTION_DENY_UMOUNT missing in compartment-abi.h (ABI v0.8)"; exit 1; }
+	@grep -q 'case ACTION_DENY_UMOUNT' compartment-bpf.c || { echo "error: action_name() lacks ACTION_DENY_UMOUNT in compartment-bpf.c (ABI v0.8)"; exit 1; }
+	@grep -q 'sealed_devs' compartment.bpf.c || { echo "error: sealed_devs map missing in compartment.bpf.c (ABI v0.8)"; exit 1; }
+	@grep -q 'record_sealed_dev' compartment-bpf.c || { echo "error: loader does not populate sealed_devs (record_sealed_dev missing in compartment-bpf.c)"; exit 1; }
+	@grep -Eq '_Static_assert\(ACTION_DENY_UMOUNT +== +15' compartment-abi.h || { echo "error: ACTION_DENY_UMOUNT value-drift assert missing in compartment-abi.h"; exit 1; }
 	@for m in launcher_to_actor policy_state_map actor_marker_map \
-	          marker_set_total marker_copy_fork_total \
+	          marker_set_total marker_set_fail_total marker_copy_fork_total \
 	          marker_stale_generation_total marker_clear_foreign_exec_total \
 	          strict_launch_missing_total strict_launch_allowed_total \
 	          prctl_set_mm_exe_file_denied_total \
@@ -276,8 +302,10 @@ check-howto-examples: compartment-bpf
 # SL-1..SL-10 against the production daemon (not the spike runner) and
 # verifies the new BPF percpu counters increment as expected. Requires
 # root + BPF LSM; the script SKIPs (rc=77) cleanly on developer hosts
-# without a real kernel. Reuses the spike's fixtures under
-# experimental/strict-launch-marker/build/; builds them if missing.
+# without a real kernel. The fixtures are vendored under
+# tests/strict-launch/fixtures/ and built into a temp dir by run.sh; there
+# is no experimental/ directory in this repository (the stale reference to
+# one is what left BX-11 permanently skipped).
 #
 # HIGH-10 (Review-1 fix): trap rc=77 as SKIP so dev hosts without root
 # / BPF LSM / kernel toolchain do not break `make check`. Mirrors
@@ -490,11 +518,15 @@ check-deny-candidate: compartment-bpf
 # The harness also accepts STAB_CYCLES=N for ad-hoc cadences; both
 # targets exist as named entry points so CI / operator scripts don't
 # need to know the env-var spelling.
-check-stability:
+# The harness's Loop B drives tests/mesh/run-mesh.sh, which needs the daemon,
+# the test tools and the 8 mesh stubs. Without these prerequisites every mesh
+# iteration exited 2 ("missing stub") in milliseconds and the churn run spun
+# hundreds of empty iterations before reporting an unrelated SKIP.
+check-stability: compartment-bpf test-tools mesh-stubs
 	@echo "Running stability test ($${STAB_CYCLES:-1024} cycles; requires root)..."
 	sudo STAB_CYCLES=$${STAB_CYCLES:-1024} bash tests/stability/pin-unpin-churn.sh
 
-check-stability-quick:
+check-stability-quick: compartment-bpf test-tools mesh-stubs
 	@echo "Running quick stability test (64 cycles; requires root)..."
 	sudo STAB_CYCLES=64 bash tests/stability/pin-unpin-churn.sh
 
@@ -517,6 +549,12 @@ check-counter-longevity: compartment-bpf
 # new surface with no witness now FAILS the build (the OPEN-1 / dir-seal-drift
 # class). Regenerates tests/coverage/COVERAGE-MATRIX.md as a side effect.
 check-coverage-static:
+	@# --selftest first: the gate is only as strong as its definition of
+	@# "witnessed", and that definition is what silently rotted before
+	@# (a hook was credited by its bare op suffix appearing anywhere in the
+	@# corpus, comments included). The selftest asserts a comment-only
+	@# mention is UNWITNESSED and a stray op token credits nothing.
+	@python3 tools/coverage-map.py --selftest
 	@python3 tools/coverage-map.py --write-matrix tests/coverage/COVERAGE-MATRIX.md
 
 # Loader fail-closed input-validation witnesses (2026-06-09): the recursive
@@ -616,6 +654,20 @@ check-release: check-env
 	  echo "[check-release] FAIL: a core suite SKIPPED for an env reason preflight should have guaranteed away (above)"; \
 	  rm -f "$$log"; exit 1; \
 	fi; \
+	pats=$$(mktemp); unknown=$$(mktemp); \
+	grep -vE '^[[:space:]]*(#|$$)' tests/release-skip-allowlist.txt > "$$pats"; \
+	grep -a 'SKIP' "$$log" | grep -avE -f "$$pats" > "$$unknown" || true; \
+	if [ -s "$$unknown" ]; then \
+	  echo "[check-release] FAIL: unrecognised SKIP line(s). Every skip must match a documented"; \
+	  echo "[check-release]       entry in tests/release-skip-allowlist.txt — an unknown skip is a FAIL,"; \
+	  echo "[check-release]       because that is how two permanently-dead bypass witnesses (BX-11"; \
+	  echo "[check-release]       'spike fixtures missing', BX-12 'bpftool map create failed') read"; \
+	  echo "[check-release]       as green on every release. Fix the witness, or add an allowlist"; \
+	  echo "[check-release]       entry with a reason."; \
+	  sed 's/^/  /' "$$unknown"; \
+	  rm -f "$$log" "$$pats" "$$unknown"; exit 1; \
+	fi; \
+	rm -f "$$pats" "$$unknown"; \
 	rm -f "$$log"; \
 	echo "[check-release] PASS — full suite ran with no critical env skips"
 

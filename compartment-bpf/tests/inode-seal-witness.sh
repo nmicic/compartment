@@ -13,12 +13,21 @@
 #   W3 held-fd lifetime      : the daemon logs `[seal] holding N O_PATH fd(s)`
 #                              with N >= #seals, and the fds are visibly open in
 #                              /proc/<pid>/fd while the daemon runs.
-#   W4 EBUSY (held-fd proof) : a fs containing a seal returns EBUSY on umount
-#                              while the daemon runs, and umounts cleanly after
-#                              the daemon exits. This is the DETERMINISTIC,
-#                              cross-kernel proof the O_PATH fd is held for the
-#                              daemon lifetime (reverting the hold makes umount
-#                              succeed while live -> W4 fails).
+#   W4 detach denied         : a fs containing a seal cannot be unmounted while
+#                              the policy is live, and unmounts cleanly once it
+#                              is gone.
+#                              v0.8 note: this used to assert EBUSY, inferring
+#                              the held-fd pin from it. lsm/sb_umount now fires
+#                              FIRST — security_sb_umount() is the opening
+#                              statement of do_umount(), well before the
+#                              refcount check — so the observable error is
+#                              EACCES from our own hook, and `umount -l`, which
+#                              EBUSY never blocked, is denied too. W4 therefore
+#                              asserts the deny (with the DENY_UMOUNT audit line
+#                              proving it is ours, not the environment's). The
+#                              held-fd property is proven DIRECTLY by W3, which
+#                              reads /proc/<pid>/fd — a stronger witness than
+#                              the EBUSY inference it replaces.
 #   W5 inode-reuse           : after unlinking a no-write-sealed file (unlink is
 #                              permitted), a freshly created file in the same dir
 #                              is WRITABLE — the held fd kept the old inode
@@ -26,7 +35,8 @@
 #                              file inheriting the stale seal. BEST-EFFORT only:
 #                              FAILs loud if reuse is ever observed, else reports
 #                              INCONCLUSIVE (never a vacuous PASS). The held-fd
-#                              property is proven DETERMINISTICALLY by W4 + ME-12.
+#                              property is proven DETERMINISTICALLY by W3 (fds
+#                              visible in /proc/<pid>/fd) + ME-12.
 #
 # Root + BPF LSM required; SKIPs cleanly (rc=0) on a dev host without them so
 # `make check` stays non-hostile. Any real assertion failure -> rc=1.
@@ -34,6 +44,11 @@
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO}"
+# realbin_noop(): a real regular-file ELF for the W6 actor fixture. /bin/true
+# is a symlink on uutils-coreutils distros, and cp'ing a symlink target that
+# is a multi-call binary makes the actor identity meaningless.
+# shellcheck source=tests/lib-realbin.sh
+. "${REPO}/tests/lib-realbin.sh"
 BIN="${REPO}/compartment-bpf"
 PIN_ROOT="/sys/fs/bpf/compartment"
 
@@ -140,24 +155,29 @@ else
 	ok "W3 all ${N_SEALS} sealed paths held as O_PATH fds in /proc/${DAEMON_PID}/fd (log: ${HELD_N})"
 fi
 
-# ---- W4: EBUSY while live, clean umount after exit (the held-fd proof) -------
+# ---- W4: detach denied while live, clean umount after exit -------------------
+# v0.8: lsm/sb_umount + the loader-populated sealed_devs set deny both umount
+# and umount -l on a filesystem that hosts a seal. The deny is what an operator
+# now sees; the held-fd EBUSY it replaced is still there underneath but is no
+# longer reachable, because security_sb_umount() runs before the refcount check.
 uerr="$(umount "${MNT}" 2>&1)"; urc=$?
-if [ "$urc" -eq 0 ]; then
-	bad "W4 umount of a sealed-file fs SUCCEEDED while daemon live (held-fd NOT pinning the fs — inode-reuse fix reverted?)"
+uerr_l="$(umount -l "${MNT}" 2>&1)"; urc_l=$?
+if [ "$urc" -eq 0 ] || [ "$urc_l" -eq 0 ]; then
+	bad "W4 umount of a sealed-file fs SUCCEEDED while the policy is live (rc=${urc} rc-lazy=${urc_l}) — sb_umount/sealed_devs not enforcing; the sealed paths can be shadowed by detaching the fs"
 	mount -t tmpfs tmpfs "${MNT}" 2>/dev/null || true   # remount for cleanup symmetry
-elif ! printf '%s' "$uerr" | grep -qiE 'busy|EBUSY'; then
-	# A non-EBUSY failure (e.g. not-mounted, perms) doesn't prove the held-fd pin
-	# (P2-e): don't credit it as the EBUSY witness.
-	bad "W4 umount failed but NOT with EBUSY ('${uerr}') — does not prove the held-fd fs pin"
+elif ! grep -q 'DENY_UMOUNT' "${SCR}/daemon.log"; then
+	# Both umounts failed but no audit line: something in the environment
+	# refused them, not us. Do not credit that as the witness.
+	bad "W4 umount and umount -l both failed but no DENY_UMOUNT audit line ('${uerr}' / '${uerr_l}') — the refusal did not come from compartment-bpf"
 else
-	# EBUSY confirmed; now prove it releases after the daemon (and its fds) exit.
+	# Our deny confirmed; now prove it lifts once the policy is gone.
 	stop_daemon
 	"${BIN}" --unpin >/dev/null 2>&1 || true
 	if umount "${MNT}" 2>/dev/null; then
-		ok "W4 umount EBUSY while daemon live, succeeds after exit (O_PATH fd held for daemon lifetime)"
+		ok "W4 umount and umount -l denied (DENY_UMOUNT audited) while the policy is live, and succeed after it is torn down"
 		MNT=""   # already unmounted
 	else
-		bad "W4 umount still failed AFTER daemon exit (something else holds the mount)"
+		bad "W4 umount still failed AFTER the daemon exited (something else holds the mount)"
 	fi
 fi
 
@@ -196,7 +216,7 @@ else
 		# green vacuously (P2-1). The held-fd property is proven DETERMINISTICALLY
 		# by W4 (umount-EBUSY) and mesh ME-12; W5 only ever fails LOUD (above) if
 		# reuse is observed. Report INCONCLUSIVE, not PASS.
-		echo "[inode-seal-witness] W5 INCONCLUSIVE: no inode reuse observed (held fd prevents recycling; deterministic proof = W4 + mesh ME-12)"
+		echo "[inode-seal-witness] W5 INCONCLUSIVE: no inode reuse observed (held fd prevents recycling; deterministic proof = W3 + mesh ME-12)"
 	fi
 	stop_daemon
 fi
@@ -210,7 +230,7 @@ rm -rf "${RTMP}" 2>/dev/null || true; RTMP=""
 # a NON-actor caller, is DENIED — directly under the dir AND in a subdir (the
 # recursive ancestor walk, bounded by COMPARTMENT_MAX_DIR_ANCESTORS).
 W6="$(mktemp -d /tmp/inode-w6.XXXXXX)"
-W6DIR="${W6}/datadir"; mkdir -p "${W6DIR}/sub"; cp /bin/true "${W6}/actor"
+W6DIR="${W6}/datadir"; mkdir -p "${W6DIR}/sub"; cp "$(realbin_noop)" "${W6}/actor"
 echo orig  > "${W6DIR}/existing";  echo orig2 > "${W6DIR}/sub/deep"
 chmod 0666 "${W6DIR}/existing" "${W6DIR}/sub/deep"
 cat > "${SCR}/p6.conf" <<EOF6

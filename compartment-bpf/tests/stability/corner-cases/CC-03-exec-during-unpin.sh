@@ -17,7 +17,10 @@ mkdir -p "$STAB_DIR"
 . "$SCRIPT_DIR/../lib-stability.sh"
 
 DAEMON="$REPO/compartment-bpf"
-PROF="$SCRIPT_DIR/../baseline-profile.conf"
+# baseline-profile.conf is a template (@STAB_ACTOR@); stab_profile renders it
+# against a real regular-file ELF so it also resolves on uutils-coreutils
+# distros where /usr/bin/true is a symlink. See tests/lib-realbin.sh.
+PROF=$(stab_profile "$SCRIPT_DIR/../baseline-profile.conf")
 
 if [ "$(id -u)" -ne 0 ]; then stab_skip "CC-03 requires root"; exit 0; fi
 [ -x "$DAEMON" ] || { stab_skip "CC-03: compartment-bpf missing"; exit 0; }
@@ -34,9 +37,12 @@ stab_snapshot_baseline
 	exit 1
 }
 
-# Fork an exec of the sealed actor binary (/usr/bin/true) in the
-# background, then race --unpin against it.
-/usr/bin/true &
+# Fork an exec of the sealed actor binary in the background, then race
+# --unpin against it. The binary is the same real-ELF fixture the rendered
+# profile seals (tests/lib-realbin.sh), not /usr/bin/true — which is a
+# symlink under uutils coreutils and so was never the sealed inode here.
+CC03_ACTOR=$(realbin_noop) || { stab_skip "CC-03: no real ELF actor fixture"; exit 0; }
+"$CC03_ACTOR" &
 CHILD=$!
 "$DAEMON" --unpin >>"$STAB_DIR/cc03-pin.log" 2>&1
 UNPIN_RC=$?

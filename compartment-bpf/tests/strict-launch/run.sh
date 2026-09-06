@@ -103,7 +103,7 @@ PROFILE="$TMP/strict.conf"
     printf 'actor-strict slm = %s launcher=%s\n' "$ACTOR_ABS" "$LAUNCHER_ABS"
     if [ -n "$SLM_TRACEME_ABS" ]; then
         # V-7 P1-B (SL-8c): register the LSM-direct helper as a second
-        # launcher of the same actor. comp_bprm_check_security sets
+        # launcher of the same actor. comp_bprm_committed_creds sets
         # marker.state=1 on slm-traceme exec; the helper then calls
         # ptrace(PTRACE_TRACEME) with NO seccomp filter in the path, so
         # the syscall reaches comp_ptrace_traceme. Distinct from the
@@ -297,7 +297,7 @@ run_witness "SL-4-fork-write" 0 \
 # SL-5 foreign-helper chain break: launcher → actor → exec slm-foreign.
 # Counter: marker_set_total + marker_clear_foreign_exec_total. The
 # foreign exec replaces the marked task; the actor's subsequent exec
-# of slm-foreign trips bprm_check_security's foreign-exec branch.
+# of slm-foreign trips bprm_committed_creds's foreign-exec branch.
 run_witness "SL-5-exec-foreign-helper" 0 \
     "$LAUNCHER_ABS exec $FOREIGN_ABS" \
     "" "" marker_set_total=1 marker_clear_foreign_exec_total=1
@@ -408,6 +408,66 @@ fi
     fi
 }
 
+# SL-11 (v0.8): NEGATIVE witness for `marker_set_fail_total`. The marker is
+# allocated by comp_bprm_committed_creds via bpf_task_storage_get(F_CREATE)
+# from a sleepable (lsm.s/) attach, so the allocation blocks rather than
+# failing under transient pressure. On a healthy host it must never fail. A
+# nonzero value here means markers were silently dropped and the affected
+# actors fell back to a strict-launch-missing deny for a reason that has
+# nothing to do with policy — exactly the failure this counter exists to make
+# visible. SL-1..SL-8 above have already driven several sealed-launcher execs.
+#
+# (Deliberately spelled in prose: naming the audit token verbatim here would
+# fake-witness the action surface that coverage-manifest.tsv still carries as
+# acknowledged debt pending a real audit-line grep.)
+{
+    setfail=$(read_counter marker_set_fail_total)
+    if [ "$setfail" = "0" ]; then
+        printf 'PASS %-36s marker_set_fail=0 (no silent marker-alloc failure)\n' "SL-11-marker-alloc-negative"
+        PASS=$((PASS+1)); RESULT[SL-11-marker-alloc-negative]="PASS"
+    else
+        printf 'FAIL %-36s marker_set_fail=%s (expected 0; markers were silently dropped)\n' \
+            "SL-11-marker-alloc-negative" "$setfail"
+        FAIL=$((FAIL+1)); RESULT[SL-11-marker-alloc-negative]="FAIL"
+    fi
+}
+
+# SL-12 (v0.8): the marker hook is attached at bprm_committed_creds, and the
+# old pre-commit attach point is gone.
+#
+# Every other strict-launch witness here passes identically whether the marker
+# is set from lsm.s/bprm_check_security (v0.4..v0.7) or lsm.s/
+# bprm_committed_creds (v0.8): both run during exec and both leave a marker
+# behind, so a revert of the v0.8 move would be invisible to SL-1..SL-11. The
+# move is the whole point of the ABI bump — bprm_check_security runs BEFORE
+# bprm->point_of_no_return, so a failure after it (the reachable one is
+# open_exec(PT_INTERP) returning -ENOENT) hands the marker back to the caller's
+# original image. What distinguishes the two is which link the loader pinned.
+#
+# The loader pins each attached link as PIN_ROOT/links/<BPF program name>
+# (pin_one_link()), so the pin tree is the assertion surface. bpftool's own
+# `prog show` output is not: the kernel truncates program names to 15 chars,
+# so comp_bprm_committed_creds appears there as "comp_bprm_commi".
+{
+    sl12_links="$PIN_ROOT/links"
+    if [ ! -d "$sl12_links" ]; then
+        printf 'FAIL %-36s no link pin tree at %s\n' "SL-12-marker-hook-attach-point" "$sl12_links"
+        FAIL=$((FAIL+1)); RESULT[SL-12-marker-hook-attach-point]="FAIL"
+    elif [ ! -e "$sl12_links/comp_bprm_committed_creds" ]; then
+        printf 'FAIL %-36s comp_bprm_committed_creds not attached (marker hook moved back off bprm_committed_creds?)\n' \
+            "SL-12-marker-hook-attach-point"
+        FAIL=$((FAIL+1)); RESULT[SL-12-marker-hook-attach-point]="FAIL"
+    elif [ -e "$sl12_links/comp_bprm_check_security" ]; then
+        printf 'FAIL %-36s enforcement object still attaches comp_bprm_check_security (pre-v0.8 marker hook)\n' \
+            "SL-12-marker-hook-attach-point"
+        FAIL=$((FAIL+1)); RESULT[SL-12-marker-hook-attach-point]="FAIL"
+    else
+        printf 'PASS %-36s marker set from comp_bprm_committed_creds; pre-v0.8 comp_bprm_check_security absent\n' \
+            "SL-12-marker-hook-attach-point"
+        PASS=$((PASS+1)); RESULT[SL-12-marker-hook-attach-point]="PASS"
+    fi
+}
+
 # SL-10 deny-storm under ringbuf pressure. 200 direct denies (lighter
 # than the spike's 1000 to keep `make check` under the mesh timeout cap;
 # exactness is the point, not count). Even if audit events drop, the
@@ -469,7 +529,7 @@ fi
 # wrapper seccomp filter denies ptrace before the LSM hook fires; that
 # leaves comp_ptrace_traceme unwitnessed. SL-8c bypasses the seccomp
 # layer by exec'ing a static helper that is itself a registered
-# strict-launch launcher. bprm_check_security sets actor_marker on the
+# strict-launch launcher. bprm_committed_creds sets actor_marker on the
 # helper; the helper then calls ptrace(PTRACE_TRACEME) directly with no
 # seccomp filter installed, so the syscall reaches the LSM hook. We
 # require BOTH a counter delta AND an audit-line emission so a regression
@@ -518,6 +578,7 @@ fi
 read_counter strict_launch_missing_total >"$RESULTS/strict_launch_missing_total"
 read_counter strict_launch_allowed_total >"$RESULTS/strict_launch_allowed_total"
 read_counter marker_set_total            >"$RESULTS/marker_set_total"
+read_counter marker_set_fail_total       >"$RESULTS/marker_set_fail_total"
 read_counter marker_clear_foreign_exec_total >"$RESULTS/marker_clear_foreign_exec_total"
 read_counter marker_copy_fork_total      >"$RESULTS/marker_copy_fork_total"
 read_counter marker_stale_generation_total >"$RESULTS/marker_stale_generation_total"
