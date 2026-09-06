@@ -38,6 +38,7 @@
 #include <unistd.h>
 // name_to_handle_at / open_by_handle_at live in <fcntl.h> on glibc but
 // require _GNU_SOURCE which CFLAGS already supplies.
+#include <linux/falloc.h>
 #include <linux/types.h>
 
 enum {
@@ -411,6 +412,33 @@ static int do_write_via_old_fd(const char *p)
 	return classify(n < 0 ? -1 : 0, err);
 }
 
+// LIMITATIONS.md "VFS write-class transitive coverage" / "Pre-existing
+// writable file descriptors": vfs_fallocate() contains no security_*
+// call at all, so FALLOC_FL_PUNCH_HOLE through a writable fd that
+// predates the seal zeroes a no-write sealed file with no deny and no
+// audit event. There is no hook to attach; the row is the whole answer.
+// These two ops turn that prose into an executed witness, so a change in
+// either direction — an upstream hook appearing, or the transitive
+// write coverage regressing — is visible instead of silent.
+//
+// Both take an ALREADY-OPEN inherited descriptor rather than a path: the
+// point is a descriptor obtained before the policy went live, and
+// reopening /proc/self/fd/N would be a fresh open that comp_file_open
+// gates.
+static int do_punch_hole_via_fd(const char *fdstr)
+{
+	int fd = (int)strtol(fdstr, NULL, 10);
+	int r = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096);
+	return classify(r, errno);
+}
+
+static int do_write_to_fd(const char *fdstr)
+{
+	int fd = (int)strtol(fdstr, NULL, 10);
+	ssize_t n = pwrite(fd, "x", 1, 0);
+	return classify(n < 0 ? -1 : 0, errno);
+}
+
 // V-3 D-V3.E: directory ops on caller-supplied explicit paths. Differ
 // from create-in / mkdir-in / symlink-in / hardlink-in (which auto-name
 // a path inside a given directory); V-3 needs deterministic per-cell
@@ -480,6 +508,8 @@ static void usage(void)
 "  mprotect-rw PATH\n"
 "  open-by-handle-wronly PATH\n"
 "  write-via-fd PATH\n"
+"  punch-hole-via-fd FD        (inherited descriptor, not a path)\n"
+"  write-to-fd FD              (inherited descriptor, not a path)\n"
 "  bench-open MODE PATH ITERS  (MODE=ro|wronly)\n"
 "\n"
 "Exit: 0=ALLOW 1=DENY 2=USAGE 3=UNEXPECTED_ERRNO 4=STAGE_ERROR\n",
@@ -524,6 +554,8 @@ int main(int argc, char **argv)
 	if (!strcmp(op, "mprotect-rw"))        { NEEDARGS(3); return do_mprotect_shared_to_rw(argv[2]); }
 	if (!strcmp(op, "open-by-handle-wronly")) { NEEDARGS(3); return do_open_by_handle_wronly(argv[2]); }
 	if (!strcmp(op, "write-via-fd"))       { NEEDARGS(3); return do_write_via_old_fd(argv[2]); }
+	if (!strcmp(op, "punch-hole-via-fd"))  { NEEDARGS(3); return do_punch_hole_via_fd(argv[2]); }
+	if (!strcmp(op, "write-to-fd"))        { NEEDARGS(3); return do_write_to_fd(argv[2]); }
 	if (!strcmp(op, "bench-open"))         { NEEDARGS(5); return do_bench_open(argv[2], argv[3], atol(argv[4])); }
 
 	usage();

@@ -287,7 +287,18 @@ check-actor-hook: compartment.bpf.o
 # but `make check` never invoked them — they gated nothing, which is exactly
 # how OPEN-1 and the recursive dir-seal drift stayed green. All new suites
 # detect-and-SKIP cleanly (rc=77) on a non-root / non-BPF developer host.
-check: check-coverage-static smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-wrapper check-strict-launch check-observe check-deny-candidate check-howto-examples
+check: check-coverage-static smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-limitations check-wrapper check-strict-launch check-observe check-deny-candidate check-howto-examples
+
+# LIMITATIONS.md honest witnesses. Every "not enforced" row in that file
+# was prose with nothing under tests/ recording today's behaviour, so a
+# silent change in either direction was invisible — an upstream hook
+# appearing (docs go stale) or the transitive coverage that currently
+# compensates regressing (nothing says so). Root + BPF LSM; SKIPs
+# cleanly with rc=77 on a dev host, like its siblings.
+check-limitations: compartment-bpf test-tools
+	@rc=0; bash tests/limitations-witness.sh || rc=$$?; \
+	if [ "$$rc" = "77" ]; then exit 0; fi; \
+	exit $$rc
 
 # Coverage-gaps 2026-05-16 GAP-H-12: HOWTO §7.2 dir-destination
 # headliner regressed THREE V-6 cycles before this gate landed. Each
@@ -684,4 +695,4 @@ check-release: check-env
 	rm -f "$$log"; \
 	echo "[check-release] PASS — full suite ran with no critical env skips"
 
-.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-release
+.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-limitations check-release
