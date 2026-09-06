@@ -50,9 +50,19 @@
 #include <sys/types.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <linux/landlock.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
+
+/* SECCOMP_RET_LOG needs Linux 4.14 headers; SECCOMP_RET_KILL_PROCESS 4.14
+ * as well.  Both are part of the stable seccomp ABI. */
+#ifndef SECCOMP_RET_LOG
+#define SECCOMP_RET_LOG          0x7ffc0000U
+#endif
+#ifndef SECCOMP_RET_KILL_PROCESS
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 
@@ -60,8 +70,25 @@
 #define MAX_BLOCKED_SC    256
 #define MAX_ALLOWED_SC    512
 #define MAX_ENV_VARS      64
+#define MAX_NET_PORTS     64
 #define MAX_LINE          1024
 #define MAX_INHERIT_DEPTH 2
+
+/* ── seccomp default action ─────────────────────────────────────────
+ *
+ * What happens to a syscall the filter does not permit.  ERRNO(EPERM) is
+ * the historical default and stays the default for compatibility, but it
+ * is the weakest of the three: a program that does not check the return
+ * value corrupts its own logic instead of dying, and an attacker can probe
+ * the filter one call at a time because every denial returns cleanly.
+ * KILL terminates the process with SIGSYS (and leaves an audit record);
+ * LOG permits the call and records it, for working out what a policy needs
+ * before enforcing it. */
+typedef enum {
+    SECCOMP_DEFAULT_ERRNO = 0,
+    SECCOMP_DEFAULT_KILL,
+    SECCOMP_DEFAULT_LOG
+} SeccompAction;
 
 /* ── Path rule ──────────────────────────────────────────────────────── */
 
@@ -70,7 +97,17 @@ typedef enum { PATH_RO, PATH_RW, PATH_EXEC, PATH_RWX } PathMode;
 typedef struct {
     const char *path;
     PathMode    mode;
+    int         optional;   /* trailing '?': skip silently when absent */
 } PathRule;
+
+/* ── Mount flag rule (compartment-root) ─────────────────────────────
+ *
+ * One `mount-ro` / `mount-noexec` / `mount-nosuid` / `mount-nodev`
+ * directive: a path inside the new root and the MS_* flag to force on it. */
+typedef struct {
+    const char   *path;
+    unsigned long flags;
+} MountFlagRule;
 
 /* ── Configuration (shared base fields) ────────────────────────────── */
 
@@ -78,12 +115,20 @@ typedef struct {
     PathRule    paths[MAX_PATHS];
     int         path_count;
 
+    /* Landlock TCP port rules (ABI 4+).  Ports are host byte order. */
+    int         net_bind_ports[MAX_NET_PORTS];
+    int         net_bind_count;
+    int         net_connect_ports[MAX_NET_PORTS];
+    int         net_connect_count;
+    int         net_default_deny;    /* 0 = ignore (network unhandled) */
+
     int         blocked_syscalls[MAX_BLOCKED_SC];
     int         blocked_count;
 
     int         allowed_syscalls[MAX_ALLOWED_SC];
     int         allowed_sc_count;
     int         seccomp_allow_mode;  /* 0=deny-list (block), 1=allow-list (allow only) */
+    SeccompAction seccomp_default;   /* action for a call the filter denies */
 
     const char *env_deny[MAX_ENV_VARS];
     int         env_deny_count;
@@ -119,6 +164,9 @@ typedef struct {
     int         loopback;
     const char *mount_masks[MAX_PATHS];
     int         mount_mask_count;
+    unsigned long rootdir_flags;     /* extra MS_* for the rootdir bind */
+    MountFlagRule mount_flags[MAX_PATHS];
+    int         mount_flags_count;
     char       *uid_map;        /* "<inside> <outside> <count>\n", NULL = identity */
     char       *gid_map;        /* idem for gids */
 } Config;
@@ -540,9 +588,51 @@ static inline int cfg_add_path(Config *c, const char *where,
 {
     if (c->path_count >= MAX_PATHS)
         return policy_full(where, "path", path, MAX_PATHS);
-    c->paths[c->path_count].path = dup ? xstrdup(path) : path;
-    c->paths[c->path_count].mode = mode;
+
+    /* A trailing '?' marks the rule optional.  A rule naming a path that
+     * does not exist is otherwise fatal — it silently grants nothing, and
+     * a policy that believes it granted something is worse than one that
+     * refuses to start.  '?' is the escape hatch for the genuinely
+     * conditional entries (`ro /lib32?`), and it is deliberately visible in
+     * the profile rather than an invisible property of the tool.
+     *
+     * A path whose last character really is '?' cannot be written; no such
+     * path exists in any policy this tool is meant for. */
+    size_t len = strlen(path);
+    int optional = (len > 1 && path[len - 1] == '?');
+    if (optional) {
+        char *trimmed = xstrdup(path);
+        trimmed[len - 1] = '\0';
+        c->paths[c->path_count].path = trimmed;
+    } else {
+        c->paths[c->path_count].path = dup ? xstrdup(path) : path;
+    }
+    c->paths[c->path_count].mode     = mode;
+    c->paths[c->path_count].optional = optional;
     c->path_count++;
+    return 0;
+}
+
+/* Append a TCP port rule.  Ports are validated here so a typo in a profile
+ * is reported with a line number rather than as a bare EINVAL from the
+ * kernel. */
+static inline int cfg_add_net_port(const char *where,
+                                   const char *what, const char *val,
+                                   int *arr, int *count)
+{
+    char *end;
+    errno = 0;
+    long port = strtol(val, &end, 10);
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (errno != 0 || end == val || (end && *end != '\0') ||
+        port < 0 || port > 65535) {
+        fprintf(stderr, "compartment: %s: invalid %s port '%s' "
+                "(expected 0-65535)\n", where, what, val);
+        return -1;
+    }
+    if (*count >= MAX_NET_PORTS)
+        return policy_full(where, what, val, MAX_NET_PORTS);
+    arr[(*count)++] = (int)port;
     return 0;
 }
 
@@ -581,6 +671,78 @@ static inline int cfg_add_env_allow(Config *c, const char *where,
         return policy_full(where, "env-allow", name, MAX_ENV_VARS);
     c->env_allow[c->env_allow_count++] = dup ? xstrdup(name) : name;
     c->env_allow_mode = 1;
+    return 0;
+}
+
+/* ── Mount flags (compartment-root) ──────────────────────────────
+ *
+ * The MS_* values are spelled out rather than taken from <sys/mount.h>:
+ * compartment.h is included by compartment-user too, which has no business
+ * pulling in the mount API.  They are part of the kernel ABI and have been
+ * stable since 2.4. */
+#define COMPARTMENT_MS_RDONLY  1UL
+#define COMPARTMENT_MS_NOSUID  2UL
+#define COMPARTMENT_MS_NODEV   4UL
+#define COMPARTMENT_MS_NOEXEC  8UL
+
+/* Suffix of a `mount-<flag> PATH` directive → the flag it forces on.
+ * Returns 0 for anything else, which is how the parser tells a real
+ * directive from a typo such as `mount-readonly`. */
+static inline unsigned long mount_flag_for_directive(const char *suffix)
+{
+    if (strcmp(suffix, "ro") == 0)     return COMPARTMENT_MS_RDONLY;
+    if (strcmp(suffix, "nosuid") == 0) return COMPARTMENT_MS_NOSUID;
+    if (strcmp(suffix, "nodev") == 0)  return COMPARTMENT_MS_NODEV;
+    if (strcmp(suffix, "noexec") == 0) return COMPARTMENT_MS_NOEXEC;
+    return 0;
+}
+
+/* "nosuid,nodev,noexec,ro" → the corresponding MS_* bitmask. */
+static inline int parse_mount_flag_list(const char *where, const char *val,
+                                        unsigned long *out)
+{
+    char buf[MAX_LINE];
+    if (strlen(val) >= sizeof(buf)) {
+        fprintf(stderr, "compartment: %s: mount flag list too long\n", where);
+        return -1;
+    }
+    memcpy(buf, val, strlen(val) + 1);
+    unsigned long flags = 0;
+    int any = 0;
+    for (char *tok = strtok(buf, ", \t"); tok; tok = strtok(NULL, ", \t")) {
+        unsigned long f = mount_flag_for_directive(tok);
+        if (f == 0) {
+            fprintf(stderr, "compartment: %s: unknown mount flag '%s' "
+                    "(use ro, nosuid, nodev, noexec)\n", where, tok);
+            return -1;
+        }
+        flags |= f;
+        any = 1;
+    }
+    if (!any) {
+        fprintf(stderr, "compartment: %s: empty mount flag list\n", where);
+        return -1;
+    }
+    *out = flags;
+    return 0;
+}
+
+static inline int cfg_add_mount_flag(Config *c, const char *where,
+                                     const char *path, unsigned long flags)
+{
+    if (c->mount_flags_count >= MAX_PATHS)
+        return policy_full(where, "mount-flag", path, MAX_PATHS);
+    /* Two directives naming the same path are merged rather than stored
+     * twice: each one costs a bind + remount pass inside the container. */
+    for (int i = 0; i < c->mount_flags_count; i++) {
+        if (strcmp(c->mount_flags[i].path, path) == 0) {
+            c->mount_flags[i].flags |= flags;
+            return 0;
+        }
+    }
+    c->mount_flags[c->mount_flags_count].path  = xstrdup(path);
+    c->mount_flags[c->mount_flags_count].flags = flags;
+    c->mount_flags_count++;
     return 0;
 }
 
@@ -994,6 +1156,46 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                         "— allow NOT applied (typo? or arch-specific syscall)\n",
                         path, lineno, val);
             }
+        } else if (strcmp(directive, "net-bind") == 0) {
+            if (cfg_add_net_port(where, "net-bind", val,
+                                 cfg->net_bind_ports, &cfg->net_bind_count) != 0) {
+                fclose(fp); return PROFILE_ERROR;
+            }
+        } else if (strcmp(directive, "net-connect") == 0) {
+            if (cfg_add_net_port(where, "net-connect", val,
+                                 cfg->net_connect_ports,
+                                 &cfg->net_connect_count) != 0) {
+                fclose(fp); return PROFILE_ERROR;
+            }
+        } else if (strcmp(directive, "net-default") == 0) {
+            if (strcmp(val, "deny") == 0) {
+                cfg->net_default_deny = 1;
+            } else if (strcmp(val, "ignore") == 0) {
+                /* One-way, like every other security switch: a profile may
+                 * turn the port policy on, never off.  Otherwise an
+                 * inherited profile could undo its parent's `net-default
+                 * deny` with one line. */
+                if (cfg->net_default_deny) {
+                    fprintf(stderr, "compartment: %s: 'net-default ignore' "
+                            "cannot undo an earlier 'net-default deny' — a "
+                            "profile may only tighten policy.\n", where);
+                    fclose(fp); return PROFILE_ERROR;
+                }
+            } else {
+                fprintf(stderr, "compartment: %s: invalid value for "
+                        "net-default: '%s' (use deny/ignore)\n", where, val);
+                fclose(fp); return PROFILE_ERROR;
+            }
+        } else if (strcmp(directive, "seccomp-default") == 0) {
+            if (strcmp(val, "errno") == 0)      cfg->seccomp_default = SECCOMP_DEFAULT_ERRNO;
+            else if (strcmp(val, "kill") == 0)  cfg->seccomp_default = SECCOMP_DEFAULT_KILL;
+            else if (strcmp(val, "log") == 0)   cfg->seccomp_default = SECCOMP_DEFAULT_LOG;
+            else {
+                fprintf(stderr, "compartment: %s: invalid value for "
+                        "seccomp-default: '%s' (use errno/kill/log)\n",
+                        where, val);
+                fclose(fp); return PROFILE_ERROR;
+            }
         } else if (strcmp(directive, "seccomp-mode") == 0) {
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
                 cfg->seccomp_allow_mode = 1;
@@ -1177,6 +1379,18 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 cfg->gid_map = xstrdup(map);
         } else if (strcmp(directive, "mount-mask") == 0) {
             if (cfg_add_str(cfg->mount_masks, &cfg->mount_mask_count, MAX_PATHS, where, "mount-mask", val, 1) != 0) {
+                fclose(fp); return PROFILE_ERROR;
+            }
+        } else if (strcmp(directive, "rootdir-flags") == 0) {
+            unsigned long f = 0;
+            if (parse_mount_flag_list(where, val, &f) != 0) {
+                fclose(fp); return PROFILE_ERROR;
+            }
+            cfg->rootdir_flags |= f;
+        } else if (strncmp(directive, "mount-", 6) == 0 &&
+                   mount_flag_for_directive(directive + 6) != 0) {
+            if (cfg_add_mount_flag(cfg, where, val,
+                                   mount_flag_for_directive(directive + 6)) != 0) {
                 fclose(fp); return PROFILE_ERROR;
             }
         } else {
@@ -1634,6 +1848,397 @@ static inline void sanitize_env(Config *cfg)
     }
 }
 
+/* ── Landlock ────────────────────────────────────────────────────── */
+
+/* Landlock syscall numbers are architecture-independent (444-446) since
+ * Linux 5.13.  Provide fallbacks if the kernel headers are too old. */
+#ifndef __NR_landlock_create_ruleset
+#define __NR_landlock_create_ruleset 444
+#define __NR_landlock_add_rule       445
+#define __NR_landlock_restrict_self  446
+#endif
+#ifndef LANDLOCK_CREATE_RULESET_VERSION
+#define LANDLOCK_CREATE_RULESET_VERSION (1U << 0)
+#endif
+
+/* Fallback definitions for build hosts whose headers are older than the
+ * kernel the binary will run on.  Every Landlock constant this file uses
+ * is listed, because a missing one is invisible: the right simply drops
+ * out of the handled mask and nothing says so.  That is not theoretical —
+ * Ubuntu 24.04 ships linux-libc-dev 6.8, whose <linux/landlock.h> has the
+ * ABI-4 network constants but *not* LANDLOCK_ACCESS_FS_IOCTL_DEV, so the
+ * old `#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV` guard silently left device
+ * ioctls unhandled on every kernel.
+ *
+ * ABI → kernel:  1 = 5.13, 2 = 5.19 (REFER), 3 = 6.2 (TRUNCATE),
+ *                4 = 6.7 (TCP bind/connect), 5 = 6.10 (IOCTL_DEV),
+ *                6 = 6.12 (scoping). */
+#ifndef LANDLOCK_ACCESS_FS_REFER
+#define LANDLOCK_ACCESS_FS_REFER        (1ULL << 13)   /* ABI 2 */
+#endif
+#ifndef LANDLOCK_ACCESS_FS_TRUNCATE
+#define LANDLOCK_ACCESS_FS_TRUNCATE     (1ULL << 14)   /* ABI 3 */
+#endif
+#ifndef LANDLOCK_ACCESS_FS_IOCTL_DEV
+#define LANDLOCK_ACCESS_FS_IOCTL_DEV    (1ULL << 15)   /* ABI 5 */
+#endif
+#ifndef LANDLOCK_ACCESS_NET_BIND_TCP
+#define LANDLOCK_ACCESS_NET_BIND_TCP    (1ULL << 0)    /* ABI 4 */
+#endif
+#ifndef LANDLOCK_ACCESS_NET_CONNECT_TCP
+#define LANDLOCK_ACCESS_NET_CONNECT_TCP (1ULL << 1)    /* ABI 4 */
+#endif
+
+/* LANDLOCK_RULE_NET_PORT is an *enumerator*, not a macro, so `#ifndef`
+ * can never see it and a fallback #define would collide on a new header.
+ * struct landlock_net_port_attr does not exist at all before 6.7.  Both
+ * are therefore spelled out here and used unconditionally — the same
+ * approach compartment-root already takes for struct mount_attr. */
+#define COMPARTMENT_RULE_NET_PORT 2
+
+struct compartment_net_port_attr {
+    uint64_t allowed_access;
+    uint64_t port;      /* HOST byte order.  Every other port field in this
+                         * project is network order; this one is not. */
+};
+
+/* struct landlock_ruleset_attr grew handled_access_net in 6.7 and
+ * handled_access_scoped in 6.12, and the size passed to
+ * landlock_create_ruleset(2) is what tells the kernel which ABI the
+ * caller speaks.  Declaring our own keeps that decision here instead of
+ * in whatever <linux/landlock.h> the build host happens to ship. */
+struct compartment_ruleset_attr {
+    uint64_t handled_access_fs;
+    uint64_t handled_access_net;
+};
+
+static inline int landlock_abi(void)
+{
+    return (int)syscall(__NR_landlock_create_ruleset, NULL, 0,
+                        LANDLOCK_CREATE_RULESET_VERSION);
+}
+
+/* Rights that a rule on a non-directory may carry.  Asking for a
+ * directory-only right (READ_DIR, MAKE_*, REMOVE_*, REFER) on a regular
+ * file or a device node is rejected by the kernel with EINVAL, which is
+ * how every per-file rule used to install nothing at all. */
+static inline uint64_t landlock_file_rights(int abi)
+{
+    uint64_t r = LANDLOCK_ACCESS_FS_EXECUTE |
+                 LANDLOCK_ACCESS_FS_READ_FILE |
+                 LANDLOCK_ACCESS_FS_WRITE_FILE;
+    if (abi >= 3) r |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    if (abi >= 5) r |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    return r;
+}
+
+/*
+ * landlock_add_path — install one path rule.
+ *
+ * Returns 1 when a rule was installed, 0 when an optional rule was skipped
+ * because the path does not exist, and -1 on any error.
+ *
+ * Symlinks are followed deliberately.  O_PATH|O_NOFOLLOW on a symlink does
+ * not fail with ELOOP — it succeeds and hands back an fd to the *symlink*,
+ * which the kernel then rejects with EINVAL.  On every usr-merged distro
+ * /lib and /lib64 are symlinks, so the two rules that matter most for
+ * running any dynamically linked program installed nothing.  Following the
+ * link is also the correct semantics: it is what the confined process
+ * experiences at open() time.
+ */
+static inline int landlock_add_path(const char *tool, int ruleset_fd,
+                                    const PathRule *rule, uint64_t access,
+                                    uint64_t file_rights, int verbose)
+{
+    int fd = open(rule->path, O_PATH | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT && rule->optional) {
+            if (verbose)
+                fprintf(stderr, "%s: landlock: %s does not exist — optional "
+                        "rule skipped\n", tool, rule->path);
+            return 0;
+        }
+        fprintf(stderr, "%s: landlock: %s: %s\n",
+                tool, rule->path, strerror(errno));
+        if (errno == ENOENT)
+            fprintf(stderr, "  A rule for a path that does not exist grants "
+                    "nothing.  Write '%s?' to make it optional.\n", rule->path);
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "%s: landlock: fstat %s: %s\n",
+                tool, rule->path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode))
+        access &= file_rights;
+
+    if (access == 0) {
+        fprintf(stderr, "%s: landlock: %s: no applicable access right "
+                "for this file type\n", tool, rule->path);
+        close(fd);
+        return -1;
+    }
+
+    struct landlock_path_beneath_attr attr = {
+        .allowed_access = access,
+        .parent_fd      = fd,
+    };
+    int r = (int)syscall(__NR_landlock_add_rule, ruleset_fd,
+                         LANDLOCK_RULE_PATH_BENEATH, &attr, 0);
+    close(fd);
+    if (r < 0) {
+        /* EINVAL used to be swallowed here, which is what made both of the
+         * failures above silent.  Never again: a rule that did not install
+         * is a policy the operator does not have. */
+        fprintf(stderr, "%s: landlock add_rule %s: %s\n",
+                tool, rule->path, strerror(errno));
+        return -1;
+    }
+    return 1;
+}
+
+static inline int landlock_add_port(const char *tool, int ruleset_fd,
+                                    int port, uint64_t access,
+                                    const char *what)
+{
+    struct compartment_net_port_attr attr = {
+        .allowed_access = access,
+        .port           = (uint64_t)port,
+    };
+    if (syscall(__NR_landlock_add_rule, ruleset_fd,
+                COMPARTMENT_RULE_NET_PORT, &attr, 0) != 0) {
+        fprintf(stderr, "%s: landlock add_rule %s %d: %s\n",
+                tool, what, port, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * config_check_additive — refuse a policy Landlock cannot express.
+ *
+ * Landlock unions the rights of every rule matching an ancestor of the
+ * path being opened, so a narrower rule *never* takes anything away from a
+ * wider one.  `rw $W/proj` together with `ro $W/proj/secrets` reads like a
+ * carve-out and is not one: the secrets stay writable.  The syntax invites
+ * the mistake, so the only safe answer is to make it unsayable.
+ *
+ * Only `ro` is refused, not `exec`.  `ro` is restriction-shaped — it says
+ * "read-only here" and does not deliver.  `exec` is grant-shaped: writing
+ * `rw /work` plus `exec /work/run.sh` really does add execute to one file
+ * inside a W^X workspace, which is a pattern worth keeping.
+ *
+ * Compares canonicalised paths on component boundaries, so /a/bc is not
+ * treated as living inside /a/b.
+ */
+static inline int config_check_additive(const Config *cfg, const char *tool)
+{
+    for (int i = 0; i < cfg->path_count; i++) {
+        if (cfg->paths[i].mode != PATH_RO)
+            continue;
+        char inner[PATH_MAX];
+        if (!realpath(cfg->paths[i].path, inner))
+            snprintf(inner, sizeof(inner), "%s", cfg->paths[i].path);
+
+        for (int j = 0; j < cfg->path_count; j++) {
+            if (i == j)
+                continue;
+            if (cfg->paths[j].mode != PATH_RW && cfg->paths[j].mode != PATH_RWX)
+                continue;
+            char outer[PATH_MAX];
+            if (!realpath(cfg->paths[j].path, outer))
+                snprintf(outer, sizeof(outer), "%s", cfg->paths[j].path);
+
+            size_t olen = strlen(outer);
+            while (olen > 1 && outer[olen - 1] == '/')
+                olen--;
+            if (strncmp(inner, outer, olen) != 0)
+                continue;
+            if (inner[olen] != '/')     /* strict descendant only */
+                continue;
+
+            fprintf(stderr, "%s: '%s' is inside the writable path '%s'\n",
+                    tool, cfg->paths[i].path, cfg->paths[j].path);
+            fprintf(stderr,
+                "  Landlock is additive: the rights of every matching rule\n"
+                "  are unioned, so a 'ro' rule under a 'rw'/'rwx' rule cannot\n"
+                "  restrict anything — '%s' would stay writable.\n"
+                "  Split the writable rules instead of carving one out.\n",
+                cfg->paths[i].path);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * apply_landlock — build and enforce the ruleset.
+ *
+ * `tool` is the program name used in diagnostics.  Returns 0 on success.
+ */
+static inline int apply_landlock(Config *cfg, const char *tool)
+{
+    int abi = landlock_abi();
+    if (abi < 0) {
+        fprintf(stderr, "%s: Landlock not available (%s)\n",
+                tool, strerror(errno));
+        return -1;
+    }
+
+    /* Access rights we control — must include ALL rights we want to
+     * restrict, otherwise Landlock silently allows them. */
+    uint64_t handled_fs =
+        LANDLOCK_ACCESS_FS_READ_FILE   |
+        LANDLOCK_ACCESS_FS_READ_DIR    |
+        LANDLOCK_ACCESS_FS_WRITE_FILE  |
+        LANDLOCK_ACCESS_FS_REMOVE_DIR  |
+        LANDLOCK_ACCESS_FS_REMOVE_FILE |
+        LANDLOCK_ACCESS_FS_MAKE_CHAR   |
+        LANDLOCK_ACCESS_FS_MAKE_REG    |
+        LANDLOCK_ACCESS_FS_MAKE_DIR    |
+        LANDLOCK_ACCESS_FS_MAKE_SYM    |
+        LANDLOCK_ACCESS_FS_MAKE_BLOCK  |
+        LANDLOCK_ACCESS_FS_MAKE_SOCK   |
+        LANDLOCK_ACCESS_FS_MAKE_FIFO   |
+        LANDLOCK_ACCESS_FS_EXECUTE;
+    if (abi >= 2) handled_fs |= LANDLOCK_ACCESS_FS_REFER;
+    if (abi >= 3) handled_fs |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    if (abi >= 5) handled_fs |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+
+    /* Network.  Handle only the access types the policy actually names:
+     * handling a right with no matching rule denies it outright, so
+     * `net-connect 443` must not also forbid every bind().  `net-default
+     * deny` is the explicit "handle both, allow only what is listed". */
+    uint64_t handled_net = 0;
+    if (cfg->net_default_deny)
+        handled_net = LANDLOCK_ACCESS_NET_BIND_TCP |
+                      LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    if (cfg->net_bind_count > 0)
+        handled_net |= LANDLOCK_ACCESS_NET_BIND_TCP;
+    if (cfg->net_connect_count > 0)
+        handled_net |= LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    if (handled_net != 0 && abi < 4) {
+        fprintf(stderr, "%s: WARNING: Landlock ABI v%d has no network "
+                "support (v4 / Linux 6.7 is the minimum) — the TCP port "
+                "policy in this profile is NOT active\n", tool, abi);
+        handled_net = 0;
+    }
+
+    /* An empty ruleset (0 paths) with a non-zero handled mask would deny
+     * ALL filesystem access — the process could not even load libc. */
+    if (cfg->path_count == 0) {
+        fprintf(stderr, "%s: landlock enabled but no paths "
+                "configured — this would deny all filesystem access\n", tool);
+        return -1;
+    }
+
+    struct compartment_ruleset_attr rs_attr = {
+        .handled_access_fs  = handled_fs,
+        .handled_access_net = handled_net,
+    };
+    /* Pass only the fs field when there is no network policy: an ABI-1..3
+     * kernel knows nothing about the second word. */
+    size_t attr_size = handled_net
+        ? sizeof(rs_attr)
+        : offsetof(struct compartment_ruleset_attr, handled_access_net);
+
+    int ruleset_fd = (int)syscall(__NR_landlock_create_ruleset,
+                                  &rs_attr, attr_size, 0);
+    if (ruleset_fd < 0) {
+        fprintf(stderr, "%s: create_ruleset: %s\n", tool, strerror(errno));
+        return -1;
+    }
+
+    uint64_t read_access =
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+    uint64_t write_access =
+        LANDLOCK_ACCESS_FS_WRITE_FILE  |
+        LANDLOCK_ACCESS_FS_REMOVE_DIR  |
+        LANDLOCK_ACCESS_FS_REMOVE_FILE |
+        LANDLOCK_ACCESS_FS_MAKE_CHAR   |
+        LANDLOCK_ACCESS_FS_MAKE_REG    |
+        LANDLOCK_ACCESS_FS_MAKE_DIR    |
+        LANDLOCK_ACCESS_FS_MAKE_SYM    |
+        LANDLOCK_ACCESS_FS_MAKE_BLOCK  |
+        LANDLOCK_ACCESS_FS_MAKE_SOCK   |
+        LANDLOCK_ACCESS_FS_MAKE_FIFO;
+    if (abi >= 2) write_access |= LANDLOCK_ACCESS_FS_REFER;
+    if (abi >= 3) write_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    if (abi >= 5) write_access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    uint64_t exec_access = LANDLOCK_ACCESS_FS_EXECUTE;
+    uint64_t file_rights = landlock_file_rights(abi);
+
+    int installed = 0;
+    for (int i = 0; i < cfg->path_count; i++) {
+        uint64_t access = 0;
+        switch (cfg->paths[i].mode) {
+        case PATH_RO:   access = read_access | exec_access; break;
+        case PATH_RW:   access = read_access | write_access; break; /* W^X */
+        /* `exec` is read + execute and nothing else.  On a directory it
+         * also needs READ_DIR to be traversable and listable; on a file it
+         * is exactly the per-binary execute grant that makes
+         * `exec /bin/ls` an allow-list entry. */
+        case PATH_EXEC: access = LANDLOCK_ACCESS_FS_READ_FILE | exec_access |
+                                 LANDLOCK_ACCESS_FS_READ_DIR; break;
+        case PATH_RWX:  access = read_access | write_access | exec_access; break;
+        }
+        int r = landlock_add_path(tool, ruleset_fd, &cfg->paths[i], access,
+                                  file_rights, cfg->verbose);
+        if (r < 0) {
+            fprintf(stderr, "%s: landlock: failed to add rule for %s\n",
+                    tool, cfg->paths[i].path);
+            close(ruleset_fd);
+            return -1;
+        }
+        installed += r;
+    }
+
+    int net_rules = 0;
+    if (handled_net & LANDLOCK_ACCESS_NET_BIND_TCP) {
+        for (int i = 0; i < cfg->net_bind_count; i++) {
+            if (landlock_add_port(tool, ruleset_fd, cfg->net_bind_ports[i],
+                                  LANDLOCK_ACCESS_NET_BIND_TCP,
+                                  "net-bind") != 0) {
+                close(ruleset_fd);
+                return -1;
+            }
+            net_rules++;
+        }
+    }
+    if (handled_net & LANDLOCK_ACCESS_NET_CONNECT_TCP) {
+        for (int i = 0; i < cfg->net_connect_count; i++) {
+            if (landlock_add_port(tool, ruleset_fd, cfg->net_connect_ports[i],
+                                  LANDLOCK_ACCESS_NET_CONNECT_TCP,
+                                  "net-connect") != 0) {
+                close(ruleset_fd);
+                return -1;
+            }
+            net_rules++;
+        }
+    }
+
+    if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) != 0) {
+        fprintf(stderr, "%s: restrict_self: %s\n", tool, strerror(errno));
+        close(ruleset_fd);
+        return -1;
+    }
+    close(ruleset_fd);
+
+    if (cfg->verbose) {
+        fprintf(stderr, "%s: landlock enforced (ABI v%d, %d of %d path "
+                "rules installed", tool, abi, installed, cfg->path_count);
+        if (handled_net)
+            fprintf(stderr, ", %d TCP port rule%s", net_rules,
+                    net_rules == 1 ? "" : "s");
+        fprintf(stderr, ")\n");
+    }
+    return 0;
+}
+
 /* ── seccomp BPF (raw, no libseccomp) ────────────────────────────── */
 
 /*
@@ -1723,6 +2328,29 @@ static inline int build_seccomp_bpf(int *syscalls, int count,
     int r = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
     free(f);
     return r;
+}
+
+/* The action taken on a syscall the policy denies.  In deny-list mode this
+ * is the action for a *listed* syscall; in allow-list mode it is the action
+ * for everything not listed. */
+static inline uint32_t seccomp_deny_action(const Config *cfg)
+{
+    switch (cfg->seccomp_default) {
+    case SECCOMP_DEFAULT_KILL: return SECCOMP_RET_KILL_PROCESS;
+    case SECCOMP_DEFAULT_LOG:  return SECCOMP_RET_LOG;
+    case SECCOMP_DEFAULT_ERRNO:
+    default:                   return SECCOMP_RET_ERRNO | (EPERM & 0xFFFF);
+    }
+}
+
+static inline const char *seccomp_action_name(const Config *cfg)
+{
+    switch (cfg->seccomp_default) {
+    case SECCOMP_DEFAULT_KILL: return "kill";
+    case SECCOMP_DEFAULT_LOG:  return "log";
+    case SECCOMP_DEFAULT_ERRNO:
+    default:                   return "errno";
+    }
 }
 
 static inline int apply_seccomp(Config *cfg)
