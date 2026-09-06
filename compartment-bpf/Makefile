@@ -306,7 +306,15 @@ check-actor-hook: compartment.bpf.o
 	@grep -q 'deny_pin_tamper' compartment.bpf.c || { echo "error: deny_pin_tamper missing in compartment.bpf.c"; exit 1; }
 	@# Both new counters must be pinned AND frozen, or --stats reads
 	@# nothing and --unpin leaves an orphan behind.
-	@for c in bpf_self_denied_total pin_tamper_denied_total; do 		grep -q "\"$$c\", *skel->maps.$$c" compartment-bpf.c || { echo "error: counter $$c is not in both pin_counter_maps() and freeze_seal_maps() in compartment-bpf.c"; exit 1; }; 		grep -q "$$c" COUNTERS.md || { echo "error: counter $$c missing from COUNTERS.md (smoke-telemetry TM-5 counts the catalogue)"; exit 1; }; 	done
+	@# Two occurrences, not one: the same "<name>, skel->maps.<name>" shape appears
+	@# in pin_counter_maps() and in freeze_seal_maps(), and grep -q is satisfied by
+	@# either alone -- so dropping the freeze entry passed a gate whose own error
+	@# message claims to check both.
+	@for c in bpf_self_denied_total pin_tamper_denied_total; do \
+		n=$$(grep -c "\"$$c\", *skel->maps.$$c" compartment-bpf.c); \
+		[ "$$n" -ge 2 ] || { echo "error: counter $$c appears in $$n of the two tables (pin_counter_maps and freeze_seal_maps) in compartment-bpf.c; missing from either means an orphan pin or an unfrozen map"; exit 1; }; \
+		grep -q "$$c" COUNTERS.md || { echo "error: counter $$c missing from COUNTERS.md (smoke-telemetry TM-5 counts the catalogue)"; exit 1; }; \
+	done
 	@# HIGH-6 (Review-1): wrapper-loader env-list identity invariant.
 	@# Both translation units must reference the shared header so a
 	@# future drift cannot land silently.
