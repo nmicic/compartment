@@ -258,6 +258,13 @@ fi
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'head -1 /proc/self/mountinfo'
 expect_contains "container root mounted nosuid,nodev" "nosuid,nodev"
 
+# cap-allow has to survive the fork into the PID 1 reaper and the exec:
+# CAP_NET_BIND_SERVICE is bit 10, i.e. 0x400 in every cap set.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -A CAP_NET_BIND_SERVICE -- /bin/sh -c \
+    'grep -E "^Cap(Eff|Bnd|Amb)" /proc/self/status'
+expect_contains "cap-allow: effective set kept" "CapEff:	0000000000000400"
+expect_contains "cap-allow: ambient set raised" "CapAmb:	0000000000000400"
+
 NNP_CONF="${WORK}/nnp.conf"
 printf 'rootdir %s\nusername ctsvc\nuid 60000\ngid 60000\nno-new-privs off\n' "${JAIL}" > "${NNP_CONF}"
 run_cr --profile "${NNP_CONF}" -- /bin/sh -c 'grep ^NoNewPrivs /proc/self/status'

@@ -207,7 +207,7 @@ not run:
 sudo ./tests/scripts/root.d/compartment-root.sh
 ```
 
-57 assertions against a real container: start-up with a plain-directory
+59 assertions against a real container: start-up with a plain-directory
 rootdir, the `/dev` device nodes, the default seccomp filter, the
 privilege drop and `no-new-privs`, `/proc` and `/sys` masking, namespace
 isolation and escape attempts (host mounts, `/proc/1/root`, a pre-opened
