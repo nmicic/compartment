@@ -850,7 +850,14 @@ session cannot reach because no rule in `limited-root.conf` grants
 
 Adjust the paths in that profile to your install before loading it — the
 loader refuses the whole file if any path is missing or is a symlink at the
-leaf. Sealing pins the filesystem, so `--unpin` before a `dpkg` run that
+leaf. `--dry-run` names every one of them and touches no kernel state:
+
+```bash
+./compartment-bpf --dry-run profiles/limited-root-authpath.conf
+# ... [dry-run] summary: N seals resolved, 2 actor groups, M errors
+```
+
+Fix the `M` before you `--pin`. Sealing pins the filesystem, so `--unpin` before a `dpkg` run that
 rewrites a sealed file, before a kernel or grub upgrade, and before any
 account maintenance: the account database is sealed shut, so `passwd(1)` and
 `usermod(8)` do not work while the policy is loaded.
