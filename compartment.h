@@ -1698,6 +1698,37 @@ static inline int audit_open_private_dir(const char *path, uid_t want_uid)
     return dfd;
 }
 
+/* An audit trail the confined process can rewrite is not a trail.  Landlock
+ * grants are per-subtree, so a log directory anywhere under a `rw`/`rwx`
+ * rule is fully reachable from inside the sandbox.  This is a warning, not
+ * a refusal: an operator may deliberately want the log inside the workspace,
+ * and only they can weigh that. */
+static inline void audit_warn_if_writable(const Config *cfg, const char *dir)
+{
+    char real[PATH_MAX];
+    if (!realpath(dir, real))
+        snprintf(real, sizeof(real), "%s", dir);
+
+    for (int i = 0; i < cfg->path_count; i++) {
+        if (cfg->paths[i].mode != PATH_RW && cfg->paths[i].mode != PATH_RWX)
+            continue;
+        char outer[PATH_MAX];
+        if (!realpath(cfg->paths[i].path, outer))
+            snprintf(outer, sizeof(outer), "%s", cfg->paths[i].path);
+        size_t olen = strlen(outer);
+        while (olen > 1 && outer[olen - 1] == '/')
+            olen--;
+        if (strncmp(real, outer, olen) != 0)
+            continue;
+        if (real[olen] != '/' && real[olen] != '\0')
+            continue;
+        fprintf(stderr, "compartment: WARNING: the audit log directory %s is "
+                "inside the writable rule '%s' — the sandboxed process can "
+                "rewrite its own audit trail\n", dir, cfg->paths[i].path);
+        return;
+    }
+}
+
 static inline int audit_log_open(Config *cfg)
 {
     char dir[PATH_MAX - 32];  /* leave room for /YYYY-MM-DD.log */
@@ -1764,6 +1795,8 @@ static inline int audit_log_open(Config *cfg)
             return -1;
         }
     }
+
+    audit_warn_if_writable(cfg, dir);
 
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
