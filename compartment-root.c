@@ -107,6 +107,41 @@ static void apply_default_seccomp_denylist(Config *config);
 static void container_init(char **cmd_args);
 static void print_help(const char *prog_name);
 
+/* ── Built-in container filesystem layout ───────────────────────────── */
+
+/* Device nodes bind-mounted from the old root into the container's /dev
+ * (mknod is unavailable in a user namespace — see child_func step 5). */
+static const char *const default_dev_nodes[] = {
+    "null", "zero", "full", "random", "urandom", "tty", NULL
+};
+
+/* Paths masked inside the container by default: a directory is covered
+ * with an empty read-only tmpfs, a file with a bind of /dev/null.  Targets
+ * absent on the running kernel are skipped (see mask_path). */
+static const char *const default_proc_masks[] = {
+    "/proc/acpi", "/proc/bus", "/proc/fs", "/proc/irq",
+    "/proc/kallsyms", "/proc/kcore", "/proc/keys",
+    "/proc/latency_stats", "/proc/modules", "/proc/sched_debug",
+    "/proc/scsi", "/proc/sys", "/proc/sysrq-trigger",
+    "/proc/timer_list", "/proc/timer_stats", NULL
+};
+
+static int count_strv(const char *const *v)
+{
+    int n = 0;
+    while (v[n]) n++;
+    return n;
+}
+
+/* Reverse syscall_table lookup, for --dry-run --verbose. */
+static const char *syscall_name(int nr)
+{
+    for (int i = 0; syscall_table[i].name; i++)
+        if (syscall_table[i].nr == nr)
+            return syscall_table[i].name;
+    return "?";
+}
+
 /* ── Built-in seccomp deny-list ──────────────────────────────────────── */
 
 /*
@@ -321,7 +356,7 @@ int main(int argc, char *argv[])
         case 'l': config.loopback = 1; break;
         case 'S': config.use_seccomp = 0; break;
         case 'N': config.use_env_sanitize = 0; break;
-        case 'd': config.dry_run = 1; config.verbose = 1; break;
+        case 'd': config.dry_run = 1; break;
         case 'v': config.verbose = 1; break;
         case 'D': config.audit = 1; break;
         case 'V': {
@@ -457,14 +492,56 @@ int main(int argc, char *argv[])
         else if (config.env_deny_count > 0)
             fprintf(stderr, "  env: DENY-LIST (%d stripped)\n",
                     config.env_deny_count);
+        fprintf(stderr, "  no-new-privs: yes (cannot be disabled)\n");
         fprintf(stderr, "  cgroups: %d\n", config.cgroups_count);
-        fprintf(stderr, "  mount-masks: %d (+ 4 default)\n",
-                config.mount_mask_count);
-        if (config.audit)
-            fprintf(stderr, "  audit: yes (log: %s)\n",
-                    config.audit_log_dir ? config.audit_log_dir :
-                    "/var/tmp/compartment-audit-$UID/");
+        fprintf(stderr, "  mount-masks: %d (+ %d built-in)\n",
+                config.mount_mask_count, count_strv(default_proc_masks));
+        if (config.audit) {
+            /* audit-log names a *directory*; the file inside it is named
+             * after the day.  The banner used to print the directory as
+             * though it were the log file. */
+            const char *dir = config.audit_log_dir
+                            ? config.audit_log_dir
+                            : "/var/tmp/compartment-audit-$UID";
+            fprintf(stderr, "  audit: yes (log dir: %s, file: "
+                    "%s/YYYY-MM-DD.log)\n", dir, dir);
+        }
         fprintf(stderr, "  command: %s\n", argv[optind]);
+
+        /* --verbose adds the parts of the policy that are built in and
+         * therefore invisible in the summary above. */
+        if (config.verbose) {
+            fprintf(stderr, "  ── built-in, always applied ──\n");
+            fprintf(stderr, "  container root: recursive bind of %s, "
+                    "remounted nosuid,nodev\n", config.rootdir);
+            fprintf(stderr, "  /proc: fresh procfs (nosuid,noexec,nodev)\n");
+            fprintf(stderr, "  /sys: read-only sysfs (+ /sys/firmware "
+                    "masked), or an empty tmpfs if the kernel refuses\n");
+            fprintf(stderr, "  /dev: tmpfs with bind-mounted");
+            for (int i = 0; default_dev_nodes[i]; i++)
+                fprintf(stderr, "%s /dev/%s", i ? "," : "",
+                        default_dev_nodes[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "  masked paths (%d, skipped when absent):\n",
+                    count_strv(default_proc_masks));
+            for (int i = 0; default_proc_masks[i]; i++)
+                fprintf(stderr, "    %s\n", default_proc_masks[i]);
+            for (int i = 0; i < config.mount_mask_count; i++)
+                fprintf(stderr, "    %s (from policy)\n",
+                        config.mount_masks[i]);
+            fprintf(stderr, "  init: PID 1 reaper, forwards SIGTERM/SIGINT/"
+                    "SIGHUP/SIGQUIT, PR_SET_PDEATHSIG=SIGKILL\n");
+            fprintf(stderr, "  privilege drop: bounding set emptied, "
+                    "setgid/setuid, PR_SET_DUMPABLE(0)\n");
+            if (config.use_seccomp && !config.seccomp_allow_mode) {
+                fprintf(stderr, "  blocked syscalls (%d):\n",
+                        config.blocked_count);
+                for (int i = 0; i < config.blocked_count; i++)
+                    fprintf(stderr, "    %s (%d)\n",
+                            syscall_name(config.blocked_syscalls[i]),
+                            config.blocked_syscalls[i]);
+            }
+        }
         return 0;
     }
 
@@ -790,19 +867,16 @@ static int child_func(void *arg)
      * The tmpfs is MS_NOSUID|MS_NOEXEC but deliberately NOT MS_NODEV —
      * MS_NODEV would make the nodes we just bound in unusable.
      */
-    static const char *dev_nodes[] = {
-        "null", "zero", "full", "random", "urandom", "tty", NULL
-    };
     (void)mkdir("/dev", 0755);
     if (mount("tmpfs", "/dev", "tmpfs",
               MS_NOSUID | MS_NOEXEC, "size=64k,mode=0755") != 0) {
         perror("compartment-root: mount /dev tmpfs");
         exit(EXIT_FAILURE);
     }
-    for (int i = 0; dev_nodes[i]; i++) {
+    for (int i = 0; default_dev_nodes[i]; i++) {
         char src[PATH_MAX], dst[PATH_MAX];
-        snprintf(src, sizeof(src), "/.pivot_old/dev/%s", dev_nodes[i]);
-        snprintf(dst, sizeof(dst), "/dev/%s", dev_nodes[i]);
+        snprintf(src, sizeof(src), "/.pivot_old/dev/%s", default_dev_nodes[i]);
+        snprintf(dst, sizeof(dst), "/dev/%s", default_dev_nodes[i]);
         /* A bind mount needs an existing target — an empty regular file
          * is enough, the bind replaces it with the device node. */
         int dfd = open(dst, O_CREAT | O_WRONLY | O_CLOEXEC, 0666);
@@ -856,15 +930,8 @@ static int child_func(void *arg)
      * skipped: /proc/timer_stats was removed in 4.11, /proc/latency_stats
      * needs CONFIG_LATENCYTOP, /proc/scsi needs CONFIG_SCSI_PROC_FS and
      * /proc/acpi needs ACPI. */
-    static const char *proc_masks[] = {
-        "/proc/acpi", "/proc/bus", "/proc/fs", "/proc/irq",
-        "/proc/kallsyms", "/proc/kcore", "/proc/keys",
-        "/proc/latency_stats", "/proc/modules", "/proc/sched_debug",
-        "/proc/scsi", "/proc/sys", "/proc/sysrq-trigger",
-        "/proc/timer_list", "/proc/timer_stats", NULL
-    };
-    for (int i = 0; proc_masks[i]; i++) {
-        if (mask_path(config, proc_masks[i]) != 0)
+    for (int i = 0; default_proc_masks[i]; i++) {
+        if (mask_path(config, default_proc_masks[i]) != 0)
             exit(EXIT_FAILURE);
     }
 
@@ -1520,14 +1587,21 @@ static void print_help(const char *prog_name)
     printf("      --no-env-sanitize            Don't strip environment variables\n");
     printf("\nGeneral:\n");
     printf("      --dry-run                    Show what would be applied, don't enforce\n");
-    printf("  -v, --verbose                    Print actions to stderr\n");
+    printf("  -v, --verbose                    Print actions to stderr; with\n");
+    printf("                                   --dry-run, also list the built-in\n");
+    printf("                                   masks, devices and blocked syscalls\n");
     printf("      --audit                      Log events to stderr + file\n");
-    printf("  -L, --audit-log <dir>            Set audit log directory (implies --audit)\n");
+    printf("  -L, --audit-log <dir>            Audit log DIRECTORY (implies --audit);\n");
+    printf("                                   the log file is <dir>/YYYY-MM-DD.log\n");
     printf("      --verify                     Check system support and exit\n");
     printf("  -h, --help                       This help\n");
     printf("\nHardening (always on):\n");
-    printf("  pivot_root (old root unmounted), minimal /dev, /proc masking,\n");
-    printf("  UTS hostname isolation, PR_SET_DUMPABLE(0), PR_SET_NO_NEW_PRIVS\n");
+    printf("  pivot_root (old root unmounted), container root remounted\n");
+    printf("  nosuid+nodev, /dev with bind-mounted device nodes, read-only\n");
+    printf("  /sys, %d masked /proc paths, UTS hostname isolation,\n",
+           count_strv(default_proc_masks));
+    printf("  setgroups denied, PID 1 reaper + PR_SET_PDEATHSIG,\n");
+    printf("  PR_SET_DUMPABLE(0), PR_SET_NO_NEW_PRIVS, seccomp BPF\n");
     printf("\nExamples:\n");
     printf("  %s --profile container -- /bin/sh\n", prog_name);
     printf("  %s -c /srv/jail -u 1000 -g 1000 -U svc -- /usr/bin/myapp\n", prog_name);
