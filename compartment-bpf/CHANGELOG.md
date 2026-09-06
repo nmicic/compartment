@@ -143,6 +143,14 @@ and reserved) is the principled fix and is a follow-up, not part of v0.8.
   the loader alongside `sealed_inodes` / `sealed_dirs` and frozen with them.
   Not pinned (like the other seal maps); listed in `KNOWN_MAP_NAMES` for
   forward compatibility.
+- **Two further action codes** `ACTION_DENY_BPF_SELF = 16` and
+  `ACTION_DENY_PIN_TAMPER = 17` for the opt-in self-protection above, also
+  inside `0x0008` — a second bump inside one unreleased version would publish
+  a `0x0008` that exists in no artefact. Code 16 is the one action whose
+  `(dev, ino)` pair is not a filesystem object: `dev` is 0 and `ino` carries
+  the BPF map id, so a consumer must not try to resolve it as an inode.
+- **Two further maps** `protected_map_ids` and `loader_ids`, plus
+  `protected_pins` and `self_protect_cfg_map`. None of the four is pinned.
 - The bump makes a v0.7 audit consumer reject v0.8 events loud instead of
   printing `action=?` for code 14.
 
@@ -277,15 +285,16 @@ and reserved) is the principled fix and is a follow-up, not part of v0.8.
   at commit time is the interpreter, and `mm->exe_file` for a script exec is
   the interpreter too, so `launcher=` must name an ELF binary.
 
-### New counter: `marker_set_fail_total` (13th)
+### New counter: `marker_set_fail_total`
 
 - Bumped when `bprm_committed_creds` cannot allocate the task-storage
   marker. The behaviour is fail-closed — the actor is denied at its first
   protected operation — but it was silent. A nonzero value tells an operator
   the denies came from allocation pressure, not from an attack on the
   launcher chain. Expected to stay 0; strict-launch SL-11 is the negative
-  witness. `TM_MIN_COUNTERS` floor moves 12 → 13 and the freeze table
-  moves 17 → 18.
+  witness. `TM_MIN_COUNTERS` floor moves 12 → 13, and 13 → 15 with the two
+  self-protection counters; the freeze table moves 17 → 18, and 18 → 23 with
+  the four self-protection maps.
 
 ### Loader
 
