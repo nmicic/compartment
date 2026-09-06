@@ -498,6 +498,7 @@ bench-overhead: compartment-bpf
 # Three legs on the same box back to back: no policy, plain --pin (the
 # program is not autoloaded), --pin --self-protect. rc=77 SKIPs cleanly
 # off a root+BPF host.
+.PHONY: bench-bpf-syscall
 bench-bpf-syscall: compartment-bpf
 	@bash tests/bench/bpf-syscall-overhead.sh; rc=$$?; \
 	if [ "$$rc" -eq 77 ]; then echo "[bench-bpf-syscall] SKIP"; exit 0; \
@@ -796,4 +797,4 @@ check-release: check-env
 	rm -f "$$log"; \
 	echo "[check-release] PASS — full suite ran with no critical env skips"
 
-.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency bench-bpf-syscall mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-release
+.PHONY: all check-env clean smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check check-pin-passphrase check-profile-e2e demo test-tools bench bench-overhead bench-concurrency mesh-stubs check-mesh check-wrapper check-strict-launch check-observe check-deny-candidate check-stability check-stability-quick check-counter-longevity check-howto-examples check-coverage-static check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-release
