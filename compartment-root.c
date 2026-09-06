@@ -78,6 +78,7 @@ static void drop_capabilities(Config *config, int cap_last);
 static void apply_kept_caps(Config *config);
 static int  assign_to_cgroups(Config *config, pid_t pid);
 static int  path_has_dotdot(const char *path);
+static int  mask_path(Config *config, const char *path);
 static void join_netns(const char *netns_name);
 static void set_rlimits(void);
 static void print_help(const char *prog_name);
@@ -629,13 +630,52 @@ static int child_func(void *arg)
     if (symlink("/proc/self/fd/1", "/dev/stdout") < 0) { /* best-effort */ }
     if (symlink("/proc/self/fd/2", "/dev/stderr") < 0) { /* best-effort */ }
 
-    /* Default masks: hide kernel tunables and memory */
-    (void)mount("tmpfs", "/proc/sys", "tmpfs",
-                MS_RDONLY | MS_NOSUID | MS_NOEXEC, "size=0");
-    (void)mount("/dev/null", "/proc/sysrq-trigger", NULL, MS_BIND, NULL);
-    (void)mount("/dev/null", "/proc/kcore", NULL, MS_BIND, NULL);
-    (void)mount("tmpfs", "/proc/acpi", "tmpfs",
-                MS_RDONLY | MS_NOSUID | MS_NOEXEC, "size=0");
+    /* 5b. /sys — a fresh read-only sysfs.
+     *
+     * Subject to the same mount_too_revealing() constraint as /proc (see
+     * step 3), so it has to happen here, while the host's /sys is still
+     * reachable through /.pivot_old.  If the kernel refuses the mount
+     * anyway — a host /sys with locked submounts covering non-empty
+     * directories fails the visibility check — fall back to covering /sys
+     * with an empty read-only tmpfs, so the container never sees a
+     * writable or host-shared sysfs either way. */
+    (void)mkdir("/sys", 0555);
+    if (mount("sysfs", "/sys", "sysfs",
+              MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) != 0) {
+        if (config->verbose)
+            fprintf(stderr, "compartment-root: mount sysfs: %s — masking "
+                    "/sys instead\n", strerror(errno));
+        if (mask_path(config, "/sys") != 0)
+            exit(EXIT_FAILURE);
+    } else {
+        if (config->verbose)
+            fprintf(stderr, "compartment-root: /sys mounted read-only\n");
+        /* Hardware/firmware interfaces are of no use to a container and
+         * have a history of privilege-escalation bugs. */
+        if (mask_path(config, "/sys/firmware") != 0)
+            exit(EXIT_FAILURE);
+    }
+
+    /* Default masks: hide kernel tunables, kernel memory and hardware
+     * state.  Matches the OCI/runc baseline.  Every one of these is a
+     * security control, so a mask that fails on an existing target is
+     * fatal (they used to be `(void)mount(...)`, and two of them failed
+     * on every run).  Targets that do not exist on this kernel are
+     * skipped: /proc/timer_stats was removed in 4.11, /proc/latency_stats
+     * needs CONFIG_LATENCYTOP, /proc/scsi needs CONFIG_SCSI_PROC_FS and
+     * /proc/acpi needs ACPI. */
+    static const char *proc_masks[] = {
+        "/proc/acpi", "/proc/bus", "/proc/fs", "/proc/irq",
+        "/proc/kallsyms", "/proc/kcore", "/proc/keys",
+        "/proc/latency_stats", "/proc/modules", "/proc/sched_debug",
+        "/proc/scsi", "/proc/sys", "/proc/sysrq-trigger",
+        "/proc/timer_list", "/proc/timer_stats", NULL
+    };
+    for (int i = 0; proc_masks[i]; i++) {
+        if (mask_path(config, proc_masks[i]) != 0)
+            exit(EXIT_FAILURE);
+    }
+
     /* Extra masks from profile/CLI */
     for (int i = 0; i < config->mount_mask_count; i++) {
         if (config->mount_masks[i][0] != '/') {
@@ -648,11 +688,8 @@ static int child_func(void *arg)
                     config->mount_masks[i]);
             exit(EXIT_FAILURE);
         }
-        if (config->verbose)
-            fprintf(stderr, "compartment-root: mount-mask %s\n",
-                    config->mount_masks[i]);
-        (void)mount("tmpfs", config->mount_masks[i], "tmpfs",
-                    MS_RDONLY | MS_NOSUID | MS_NOEXEC, "size=0");
+        if (mask_path(config, config->mount_masks[i]) != 0)
+            exit(EXIT_FAILURE);
     }
 
     /* g) Detach the old root — everything that needed it (procfs
@@ -906,6 +943,53 @@ static void apply_kept_caps(Config *config)
     if (config->verbose)
         fprintf(stderr, "compartment-root: effective+permitted caps restored "
                 "for service user (%d caps)\n", config->cap_allowed_count);
+}
+
+/* ── Mount masking (child, inside the new mount namespace) ─────────── */
+
+/*
+ * mask_path — hide one path from the container.
+ *
+ * A directory is covered with an empty read-only tmpfs; anything else is
+ * covered with a bind of /dev/null, which is why the /dev nodes have to be
+ * in place first (step 5).  Both are ordinary bind/tmpfs mounts, so unlike
+ * the procfs and sysfs mounts they are not subject to mount_too_revealing()
+ * and can run after the old root is gone.
+ *
+ * Returns 0 when the path was masked or does not exist on this kernel,
+ * -1 when it exists and could not be masked.
+ */
+static int mask_path(Config *config, const char *path)
+{
+    struct stat st;
+
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT) {
+            if (config->verbose)
+                fprintf(stderr, "compartment-root: mask %s: absent, skipped\n",
+                        path);
+            return 0;
+        }
+        fprintf(stderr, "compartment-root: mask %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    int is_dir = S_ISDIR(st.st_mode);
+    int r = is_dir
+        ? mount("tmpfs", path, "tmpfs",
+                MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=0")
+        : mount("/dev/null", path, NULL, MS_BIND, NULL);
+
+    if (r != 0) {
+        fprintf(stderr, "compartment-root: mask %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    if (config->verbose)
+        fprintf(stderr, "compartment-root: mask %s (%s)\n", path,
+                is_dir ? "empty tmpfs" : "/dev/null");
+    return 0;
 }
 
 /* ── Cgroup assignment (called by parent, host filesystem context) ──── */
