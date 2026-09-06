@@ -168,13 +168,12 @@ block clock_settime
 block clock_adjtime
 block adjtimex
 
-# Environment deny list
-env-deny LD_PRELOAD
-env-deny LD_LIBRARY_PATH
-env-deny LD_AUDIT
-env-deny DYLD_INSERT_LIBRARIES
-env-deny DYLD_LIBRARY_PATH
-env-deny _JAVA_OPTIONS
+# Environment deny list ('*' at the end is a prefix match)
+env-deny LD_*
+env-deny GLIBC_TUNABLES
+env-deny PYTHON*
+env-deny PROMPT_COMMAND
+env-deny GIT_SSH_COMMAND
 env-deny JAVA_TOOL_OPTIONS
 
 # Feature toggles (on/off)
@@ -199,7 +198,7 @@ audit-log $HOME/.local/state/compartment
 | `rw` | path | `rw $HOME` |
 | `exec` | path | `exec /opt/bin` |
 | `block` | syscall name | `block ptrace` |
-| `env-deny` | variable name | `env-deny LD_PRELOAD` |
+| `env-deny` | variable name or `PREFIX*` | `env-deny LD_*` |
 | `landlock` | `on` only | `landlock on` |
 | `seccomp` | `on` only | `seccomp on` |
 | `no-new-privs` | `on` only | `no-new-privs on` |
@@ -208,6 +207,36 @@ audit-log $HOME/.local/state/compartment
 | `audit-log` | directory path | `audit-log ~/.local/state/compartment` |
 | `workdir` | path | `workdir $HOME/projects` |
 | `inherit` | profile name | `inherit ai-agent` |
+
+### Environment name patterns
+
+A trailing `*` in an `env-deny` or `env-allow` entry makes it a prefix
+match; anything else is an exact variable name. `env-deny LD_*` covers
+`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `LD_DEBUG`, `LD_PROFILE`,
+`LD_ORIGIN_PATH` and whatever the loader grows next — which is the point,
+because an exhaustive list of injection variables goes stale the moment
+it is written. The built-in profile uses `LD_*`, `DYLD_*`, `BASH_FUNC_*`,
+`PYTHON*`, `PERL5*` and `GIT_CONFIG_*` for exactly that reason.
+
+### What the built-in profile does *not* strip
+
+Model-provider credentials — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY` and the like — are **deliberately left in place**.
+compartment-user exists to run those agents; stripping the key the agent
+needs to start would make the tool useless for its main job.
+
+Cloud, VCS and database credentials (`AWS_*` keys,
+`GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_CLIENT_SECRET`, `GITHUB_TOKEN`,
+`GH_TOKEN`, `GITLAB_TOKEN`, `NPM_TOKEN`, `DATABASE_URL`, `PGPASSWORD`,
+`MYSQL_PWD`, `SSH_AUTH_SOCK`) *are* stripped, because an agent that needs
+them is the exception rather than the rule.
+
+The honest rule: **environment sanitization removes what the sandboxed
+process should not have; it cannot protect a secret you hand it on
+purpose.** If a key must not reach the agent, do not export it into the
+agent's environment — use `--env-allow` to name exactly what should
+survive, or keep the credential in a file the Landlock ruleset does not
+grant.
 
 ### Security switches are one-way
 

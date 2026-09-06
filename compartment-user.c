@@ -136,14 +136,26 @@ static int apply_profile_ai_agent(Config *cfg)
             return -1;
     }
 
-    /* Dangerous env vars to strip */
+    /* Dangerous env vars to strip.
+     *
+     * A trailing '*' is a prefix match, which is what keeps this list
+     * honest: "LD_*" covers LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH,
+     * LD_DEBUG, LD_PROFILE, LD_ORIGIN_PATH and whatever the loader grows
+     * next, instead of naming three of them and missing the rest.
+     *
+     * Deliberately NOT stripped: ANTHROPIC_API_KEY, OPENAI_API_KEY and
+     * other model-provider keys. compartment-user exists to run those
+     * agents; removing their credentials would make the tool useless for
+     * its main job. See the credential note in HOWTO.md — if an agent
+     * must not see a key, do not export it into the agent's environment. */
     const char *deny_env[] = {
-        /* Dynamic linker injection */
-        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+        /* Dynamic linker and libc behaviour */
+        "LD_*",                             /* whole ld.so family */
+        "GLIBC_TUNABLES",                   /* CVE-2023-4911 vector */
         "GCONV_PATH",                       /* glibc iconv arbitrary .so load */
         "HOSTALIASES",                      /* hostname resolution hijack */
         "LOCPATH", "NLSPATH",               /* locale/message catalog injection */
-        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+        "DYLD_*",                           /* macOS loader family */
         "_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS",
         /* Cloud credentials — prevent ambient credential leakage */
         "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
@@ -151,13 +163,23 @@ static int apply_profile_ai_agent(Config *cfg)
         "AZURE_CLIENT_SECRET",
         /* VCS / CI tokens */
         "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "NPM_TOKEN",
-        /* Interpreter startup injection */
+        /* Shell startup and behaviour hijack */
         "BASH_ENV", "ENV",                  /* sourced by non-interactive bash/sh */
+        "BASH_FUNC_*",                      /* exported shell functions */
+        "PROMPT_COMMAND",                   /* runs on every bash prompt */
+        "IFS",                              /* word-splitting hijack */
+        "ZDOTDIR",                          /* zsh startup file location */
+        "CDPATH", "GLOBIGNORE",
+        /* Interpreter startup injection */
         "NODE_OPTIONS",                     /* Node.js flag injection */
-        "PYTHONSTARTUP",                    /* Python startup code injection */
-        "PERL5OPT", "PERL5LIB",            /* Perl arbitrary code load */
-        "RUBYOPT", "RUBYLIB",              /* Ruby arbitrary code load */
-        "CDPATH", "GLOBIGNORE",             /* shell behavior hijack */
+        "PYTHON*",                          /* PYTHONPATH/HOME/STARTUP/... */
+        "PERL5*", "PERLLIB",                /* Perl arbitrary code load */
+        "RUBYOPT", "RUBYLIB",               /* Ruby arbitrary code load */
+        /* git: each of these names a program git will execute */
+        "GIT_SSH_COMMAND", "GIT_CONFIG_*", "GIT_EDITOR",
+        "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR",
+        /* Programs launched by other programs (git, man, sudoedit, ...) */
+        "PAGER", "MANPAGER", "EDITOR", "VISUAL",
         /* SSH agent — prevents key use via forwarded socket */
         "SSH_AUTH_SOCK",
         /* Database credentials */

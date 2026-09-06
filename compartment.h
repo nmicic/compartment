@@ -1457,37 +1457,58 @@ static inline int audit_log_open(Config *cfg)
 
 /* ── Environment sanitize ────────────────────────────────────────── */
 
+/* A trailing '*' makes an entry a prefix, so one "LD_*" covers the whole
+ * loader family — including the variables that did not exist when the
+ * list was written. Anything else is an exact name. */
+static inline int env_name_matches(const char *pattern, const char *name)
+{
+    size_t plen = strlen(pattern);
+    if (plen > 0 && pattern[plen - 1] == '*')
+        return strncmp(pattern, name, plen - 1) == 0;
+    return strcmp(pattern, name) == 0;
+}
+
 static inline void sanitize_env(Config *cfg)
 {
+    const char **pats;
+    int npats, keep_on_match;
+
     if (cfg->env_allow_mode) {
-        /* Allow-list: save allowed values, clear everything, restore */
-        char *saved[MAX_ENV_VARS];
-        for (int i = 0; i < cfg->env_allow_count; i++) {
-            const char *val = getenv(cfg->env_allow[i]);
-            saved[i] = val ? xstrdup(val) : NULL;
-        }
-
-        clearenv();
-
-        for (int i = 0; i < cfg->env_allow_count; i++) {
-            if (saved[i]) {
-                setenv(cfg->env_allow[i], saved[i], 1);
-                if (cfg->verbose)
-                    fprintf(stderr, "compartment: keep %s\n",
-                            cfg->env_allow[i]);
-                free(saved[i]);
-            }
-        }
+        pats = cfg->env_allow;
+        npats = cfg->env_allow_count;
+        keep_on_match = 1;   /* allow-list: drop everything unmatched */
     } else {
-        /* Deny-list: strip specific dangerous vars */
-        for (int i = 0; i < cfg->env_deny_count; i++) {
-            if (getenv(cfg->env_deny[i])) {
-                if (cfg->verbose)
-                    fprintf(stderr, "compartment: unset %s\n",
-                            cfg->env_deny[i]);
-                unsetenv(cfg->env_deny[i]);
+        pats = cfg->env_deny;
+        npats = cfg->env_deny_count;
+        keep_on_match = 0;   /* deny-list: drop everything matched */
+    }
+
+    /* unsetenv() rebuilds environ, so find one victim, remove it, and
+     * start over. At most one pass per variable. */
+    for (;;) {
+        char *victim = NULL;
+        for (char **e = environ; *e && !victim; e++) {
+            const char *eq = strchr(*e, '=');
+            size_t nlen = eq ? (size_t)(eq - *e) : strlen(*e);
+            if (nlen == 0) continue;
+            char *name = strndup(*e, nlen);
+            if (!name) {
+                fputs("compartment: out of memory\n", stderr);
+                exit(1);
             }
+            int matched = 0;
+            for (int i = 0; i < npats && !matched; i++)
+                matched = env_name_matches(pats[i], name);
+            if (matched == keep_on_match)
+                free(name);
+            else
+                victim = name;
         }
+        if (!victim) break;
+        if (cfg->verbose)
+            fprintf(stderr, "compartment: unset %s\n", victim);
+        unsetenv(victim);
+        free(victim);
     }
 }
 

@@ -98,6 +98,25 @@ Disable seccomp filtering.
 .TP
 .BI \-\-env\-deny " VAR"
 Strip an environment variable. Repeatable.
+A trailing \fB*\fR makes the entry a prefix match, so
+.B \-\-env\-deny
+.I LD_*
+strips the whole loader family.
+The same applies to
+.BR \-\-env\-allow .
+.PP
+The built-in profile strips the loader, shell-startup, interpreter and
+git-helper families along with cloud, VCS and database credentials.
+It deliberately does
+.B not
+strip model-provider API keys such as
+.I ANTHROPIC_API_KEY
+or
+.IR OPENAI_API_KEY :
+removing the credential the sandboxed agent needs to start would defeat
+the tool's main purpose.
+Environment sanitization removes what the sandboxed process should not
+have; it cannot protect a secret deliberately handed to it.
 .TP
 .B \-\-no\-env\-sanitize
 Do not strip dangerous environment variables.
@@ -255,7 +274,7 @@ block ptrace
 block mount
 
 # Environment
-env-deny LD_PRELOAD
+env-deny LD_*
 
 # Features
 landlock on
