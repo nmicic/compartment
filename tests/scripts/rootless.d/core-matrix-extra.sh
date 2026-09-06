@@ -405,23 +405,34 @@ echo ""
 
 echo "--- G: sandboxed child state ---"
 
+# The control runs FIRST. `Seccomp: 2` is true whenever ANY filter is
+# loaded, including one the container runtime installed before we
+# started, so the positive assertion below is only attributable when the
+# unsandboxed control shows `Seccomp: 0`. Inside ubuntu:22.04 under
+# Docker it does not: the control failed and the positive case still
+# counted as a pass, which is the wrong way round — the suite's own
+# doctrine ("take a baseline", tests/README.md) applied here.
+cu --profile ai-agent --no-seccomp -- /bin/sh -c 'grep -E "^Seccomp:" /proc/self/status'
+SECCOMP_ATTRIBUTABLE=0
+if echo "${OUT}" | grep -qE '^Seccomp:[[:space:]]*0$'; then
+    SECCOMP_ATTRIBUTABLE=1
+    pass "--no-seccomp really installs no filter (control case)"
+else
+    skip "--no-seccomp control: an outer seccomp filter is present, so filter-mode is not attributable (got: $(echo "${OUT}" | tr '\n' '|'))"
+fi
+
 cu --profile ai-agent -- /bin/sh -c 'grep -E "^(NoNewPrivs|Seccomp):" /proc/self/status'
 if echo "${OUT}" | grep -qE '^NoNewPrivs:[[:space:]]*1$'; then
     pass "sandboxed child has NoNewPrivs=1"
 else
     fail "sandboxed child has NoNewPrivs=1 (got: $(echo "${OUT}" | tr '\n' '|'))"
 fi
-if echo "${OUT}" | grep -qE '^Seccomp:[[:space:]]*2$'; then
+if [ "${SECCOMP_ATTRIBUTABLE}" -eq 0 ]; then
+    skip "sandboxed child runs in seccomp filter mode (not attributable — see the control above)"
+elif echo "${OUT}" | grep -qE '^Seccomp:[[:space:]]*2$'; then
     pass "sandboxed child runs in seccomp filter mode (Seccomp=2)"
 else
     fail "sandboxed child runs in seccomp filter mode (got: $(echo "${OUT}" | tr '\n' '|'))"
-fi
-
-cu --profile ai-agent --no-seccomp -- /bin/sh -c 'grep -E "^Seccomp:" /proc/self/status'
-if echo "${OUT}" | grep -qE '^Seccomp:[[:space:]]*0$'; then
-    pass "--no-seccomp really installs no filter (control case)"
-else
-    fail "--no-seccomp still installed a filter (got: $(echo "${OUT}" | tr '\n' '|'))"
 fi
 
 echo ""
