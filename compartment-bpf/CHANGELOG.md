@@ -34,8 +34,13 @@ and reserved) is the principled fix and is a follow-up, not part of v0.8.
 
 ### ABI bump 0x0007 → 0x0008
 
-- **New action code** `ACTION_DENY_MOUNT = 14` with a value-drift
-  `_Static_assert`; `action_name()` prints `DENY_MOUNT`.
+- **New action codes** `ACTION_DENY_MOUNT = 14` and
+  `ACTION_DENY_UMOUNT = 15`, each with a value-drift `_Static_assert`;
+  `action_name()` prints `DENY_MOUNT` / `DENY_UMOUNT`.
+- **New map** `sealed_devs` (`__u64 s_dev` → `__u32` refcount), populated by
+  the loader alongside `sealed_inodes` / `sealed_dirs` and frozen with them.
+  Not pinned (like the other seal maps); listed in `KNOWN_MAP_NAMES` for
+  forward compatibility.
 - The bump makes a v0.7 audit consumer reject v0.8 events loud instead of
   printing `action=?` for code 14.
 
@@ -72,11 +77,53 @@ and reserved) is the principled fix and is a follow-up, not part of v0.8.
   the `move_mount` hook without first passing `sb_mount`.
 - Retires the LIMITATIONS rows "bind-mount-OVER sealed path" and
   "Mount-inside-sealed-subtree bypass"; a residual row lists what is still
-  open (umount of a sealed-inode-hosting filesystem, `pivot_root`, mounts on
-  the root of a pre-existing nested mount).
+  open (`pivot_root`, mounts on the root of a pre-existing nested mount,
+  and unmounting a bind mount that was itself the sealed path).
 - `tests/bypass/07-mount-bind-decoy.sh` now asserts the deny (it used to
   document the gap); new `tests/bypass/17-mount-inside-sealed-dir.sh`; mesh
   §3.23 row (a) flips from KNOWN-GAP to ENFORCED.
+
+### Closed: path shadowing by detaching the filesystem (`sb_umount`)
+
+- Gating the mount *destination* covers only half the shadowing class. The
+  other half needs no mount to start: `umount -l /data` detaches the
+  filesystem, the sealed path then resolves to the mountpoint dentry in the
+  **parent** filesystem — which carries no seal — and the follow-up
+  `mount -t tmpfs none /data` sails straight through the destination gate.
+  The sealed inodes are untouched and completely unreachable; every sealed
+  path reads attacker content.
+- The loader's held `O_PATH` fds made a plain `umount` return `EBUSY` in
+  daemon mode, but that was an implementation accident, not a control: it
+  never blocked `MNT_DETACH`, and in daemonless `--pin` mode the fds die
+  with the loader.
+- `sb_umount` now denies `umount` and `umount -l` on any filesystem that
+  hosts sealed inodes, and `move_mount`'s new from-side gate denies moving
+  such a filesystem away from its mountpoint, both with a new
+  `ACTION_DENY_UMOUNT = 15`. (Residual: the classic `mount(2)`+`MS_MOVE`
+  spelling of `mount --move` is not gated on the source side — no hook can
+  see it. `do_move_mount_old()` bypasses `security_move_mount()` and
+  `security_sb_mount()` gets the source only as an unresolvable string.
+  Recorded in LIMITATIONS.) The hook is handed a `struct vfsmount`
+  and has no route back to an inode, so it needs its own state: a new
+  `sealed_devs` HASH (`__u64 s_dev` → refcount) that the loader populates as
+  it writes `sealed_inodes` / `sealed_dirs`, frozen with them. The freeze
+  table moves 18 → 19.
+- Precision matters, because `s_dev` alone is far too coarse — seal one file
+  on `/` and every bind mount of a root-filesystem directory would become
+  unmountable. The hook therefore also requires `mnt->mnt_root ==
+  sb->s_root`, i.e. it denies only detaches of the **whole filesystem**.
+  Unmounting a bind mount of a subdirectory detaches nothing and stays
+  allowed; `tests/bypass/20` G is the over-deny guard for exactly that.
+- **Operational consequence:** while a policy is live you cannot unmount a
+  filesystem that holds sealed paths. Run `compartment-bpf --unpin` first.
+  `tests/inode-seal-witness.sh` W4 changes shape accordingly: it used to
+  infer the held-fd pin from `EBUSY`, but `security_sb_umount()` is the
+  opening statement of `do_umount()` and now answers first, so W4 asserts the
+  deny (with the `DENY_UMOUNT` audit line proving it is ours) and W3's direct
+  `/proc/<pid>/fd` read carries the held-fd proof.
+- Witness: `tests/bypass/20-umount-shadow.sh`; mesh §3.23(e) flips from
+  "unmount succeeds, entries orphaned" to "unmount denied, seal still
+  enforced".
 
 ### Closed: inode-flag ioctls and timestamp forgery under `no-chmod`
 
@@ -140,7 +187,7 @@ and reserved) is the principled fix and is a follow-up, not part of v0.8.
 
 ### Loader
 
-- `pin_links()` pins 27 links (16 v0.3 + 5 v0.4 + 6 v0.8); `KNOWN_LINK_NAMES`
+- `pin_links()` pins 28 links (16 v0.3 + 5 v0.4 + 7 v0.8); `KNOWN_LINK_NAMES`
   extended; `make check-actor-hook` gains grep gates for every v0.8 hook, its
   `PIN_LINK`, its unpin-table entry, the `file_ioctl_compat` BTF probe and
   the `sb_mount` `MS_BIND` dispatch-order guard.

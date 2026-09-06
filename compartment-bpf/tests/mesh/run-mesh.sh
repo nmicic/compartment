@@ -2271,10 +2271,12 @@ echo "[mesh] ME-22 fs variations: $ME22_PASS PASS / $ME22_FAIL FAIL"
 # --- ME-23 §3.23 mount/remount/bind-mount scenarios ---
 #
 # v0.8: compartment-bpf hooks sb_mount + move_mount (a new mount ON a
-# sealed inode or INSIDE a sealed subtree is denied, ACTION_DENY_MOUNT);
-# sb_remount / sb_umount / sb_pivotroot are still unhooked. The seal is
-# keyed by (dev,ino); mount changes alter which inode a path resolves to.
-# Witness the four classes:
+# sealed inode or INSIDE a sealed subtree is denied, ACTION_DENY_MOUNT)
+# and sb_umount (detaching a filesystem that hosts sealed inodes is
+# denied, ACTION_DENY_UMOUNT). sb_remount stays deliberately unhooked —
+# LSM denies are independent of MS_RDONLY, so a remount defeats nothing —
+# and sb_pivotroot is still open. The seal is keyed by (dev,ino); mount
+# changes alter which inode a path resolves to. Witness the five classes:
 #
 #   Tier 1 (mandatory, three bind scenarios):
 #     (a) bind OVER sealed path → DENY (v0.8 sb_mount; pre-v0.8 KNOWN-GAP)
@@ -2284,8 +2286,9 @@ echo "[mesh] ME-22 fs variations: $ME22_PASS PASS / $ME22_FAIL FAIL"
 #   Tier 2 (best-effort, two):
 #     (d) remount ro→rw of a loop-mounted FS containing sealed inode
 #         → seal unaffected (per-inode, not per-sb-flag)
-#     (e) unmount of FS containing sealed inodes → orphan map entries;
-#         subsequent path access returns ENOENT (kernel-level, before LSM)
+#     (e) unmount of FS containing sealed inodes → DENY (v0.8 sb_umount;
+#         through v0.7 this succeeded and left orphan map entries with the
+#         path returning ENOENT — a documented gap, now closed)
 #
 # Mount on the ROOT of a nested mount that already sits inside a sealed
 # tree: still a gap (the BPF d_parent walk stops at a mount root, so the
@@ -2453,11 +2456,22 @@ else
 fi
 
 # (e) Unmount of FS containing sealed inodes. Use the ME-22 tmpfs
-# mount (sealed leaf inside). After unmount, path resolution at the
-# leaf returns ENOENT (kernel-level, before LSM). Witnessed: seal map
-# entry becomes orphan (no kernel inode); subsequent probe is ERROR.
-# We do NOT remove this from ME22_MOUNTS so the cleanup-trap umount-l
-# is harmless (umount-l after umount is a no-op).
+# mount (sealed leaf inside).
+#
+# Through v0.7 this succeeded: the filesystem detached, the sealed path
+# resolved to the (empty) underlying mountpoint directory, and the probe
+# returned ENOENT. The seal map entries were orphaned and every sealed
+# path pointed at whatever the parent filesystem held — including anything
+# a follow-up mount put there, which the v0.8 destination gate cannot see
+# because the mountpoint dentry carries no seal.
+#
+# v0.8 attaches sb_umount against a loader-populated sealed_devs (s_dev)
+# set, so both `umount` and `umount -l` are now DENIED while the policy is
+# live. This block asserts the deny and then re-asserts that the seal is
+# still in force through the still-mounted path.
+#
+# The mount stays in ME22_MOUNTS so the cleanup trap reaps it; cleanup()
+# kills the daemon before it umounts, so the teardown is unaffected.
 ME23_TMPFS_PATH=""
 for entry in "${ME22_FS_AVAILABLE[@]}"; do
 	IFS=':' read -r fs path <<<"$entry"
@@ -2470,26 +2484,44 @@ if [ -n "$ME23_TMPFS_PATH" ]; then
 	actual=$(run_trial "$stub" write "$sealed_tmpfs")
 	me23_record unmount-pre-outsider b1 write "$sealed_tmpfs" DENY "$actual" \
 		"sealed-before-unmount"
-	# Unmount.
-	if umount "$ME23_TMPFS_PATH" 2>/dev/null; then
-		# Path now resolves under the underlying $WORK/me22/tmpfs-mnt
-		# dir which is empty (the tmpfs hid it). open-wronly returns
-		# ENOENT → stub classifies as ERROR (rc=2).
-		stub=$(caller_path b1)
-		actual=$(run_trial "$stub" write "$sealed_tmpfs")
-		# Expect ERROR(2) — explicitly record the orphan-state witness.
-		case "$actual" in
-			ERROR\(2\)) verdict=PASS; PASS=$((PASS+1)); ME23_PASS=$((ME23_PASS+1)) ;;
-			ERROR*)     verdict="$actual"; ERR=$((ERR+1)) ;;
-			*)          verdict=FAIL; FAIL=$((FAIL+1)); ME23_FAIL=$((ME23_FAIL+1)) ;;
-		esac
-		printf 'ME23-mount,unmount-post-orphan-witness,%s,write,n/a,ENOENT-expected,%s,%s\n' \
-			"$sealed_tmpfs" "$actual" "$verdict" >> "$CSV"
-	else
-		printf 'ME23-mount,unmount-failed,%s,umount,setup,n/a,umount-failed,SKIP\n' \
-			"$ME23_TMPFS_PATH" >> "$CSV"
-		SKIP=$((SKIP+1))
-	fi
+	# Unmount must be DENIED (v0.8 sb_umount + sealed_devs). A bare
+	# "umount failed" is NOT enough to credit: the loader's held O_PATH fds
+	# already made a plain umount EBUSY through v0.7, which is exactly how
+	# this row managed to sit at SKIP for releases without anyone noticing.
+	# Require a DENY_UMOUNT audit line so only OUR refusal counts.
+	me23_umount_denied() {
+		# $1 = subcase, $2 = op label, rest = the umount argv
+		_sub=$1; _op=$2; shift 2
+		if "$@" 2>/dev/null; then
+			printf 'ME23-mount,%s,%s,%s,n/a,DENY,ALLOW,FAIL\n' \
+				"$_sub" "$ME23_TMPFS_PATH" "$_op" >> "$CSV"
+			FAIL=$((FAIL+1)); ME23_FAIL=$((ME23_FAIL+1)); return
+		fi
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			grep -q 'DENY_UMOUNT' "$DAEMON_LOG" 2>/dev/null && break
+			sleep 0.2
+		done
+		if grep -q 'DENY_UMOUNT' "$DAEMON_LOG" 2>/dev/null; then
+			printf 'ME23-mount,%s,%s,%s,n/a,DENY,DENY,PASS\n' \
+				"$_sub" "$ME23_TMPFS_PATH" "$_op" >> "$CSV"
+			PASS=$((PASS+1)); ME23_PASS=$((ME23_PASS+1))
+		else
+			printf 'ME23-mount,%s,%s,%s,n/a,DENY,refused-without-audit,FAIL\n' \
+				"$_sub" "$ME23_TMPFS_PATH" "$_op" >> "$CSV"
+			FAIL=$((FAIL+1)); ME23_FAIL=$((ME23_FAIL+1))
+		fi
+	}
+	me23_umount_denied unmount-denied umount umount "$ME23_TMPFS_PATH"
+	# Lazy unmount must be denied too — MNT_DETACH is the shape the
+	# loader's held O_PATH fds never blocked, so it is the one that
+	# actually needed a hook.
+	me23_umount_denied unmount-lazy-denied umount-l umount -l "$ME23_TMPFS_PATH"
+	# The filesystem is still mounted and the seal is still enforced
+	# through it — the point of denying the detach.
+	stub=$(caller_path b1)
+	actual=$(run_trial "$stub" write "$sealed_tmpfs")
+	me23_record unmount-post-still-sealed b1 write "$sealed_tmpfs" DENY "$actual" \
+		"sealed-after-denied-unmount"
 else
 	printf 'ME23-mount,unmount-no-tmpfs,n/a,umount,setup,n/a,tmpfs-unavailable,SKIP\n' >> "$CSV"
 	SKIP=$((SKIP+1))

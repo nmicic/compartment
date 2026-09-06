@@ -228,7 +228,8 @@ check-actor-hook: compartment.bpf.o
 	@grep -q 'ACTION_DENY_MOUNT' compartment-abi.h || { echo "error: ACTION_DENY_MOUNT missing in compartment-abi.h (ABI v0.8)"; exit 1; }
 	@grep -q 'case ACTION_DENY_MOUNT' compartment-bpf.c || { echo "error: action_name() lacks ACTION_DENY_MOUNT in compartment-bpf.c (ABI v0.8)"; exit 1; }
 	@for h in comp_inode_set_acl comp_inode_remove_acl comp_file_ioctl \
-	          comp_file_ioctl_compat comp_sb_mount comp_move_mount; do \
+	          comp_file_ioctl_compat comp_sb_mount comp_sb_umount \
+	          comp_move_mount; do \
 		grep -q "$$h" compartment.bpf.c || { echo "error: v0.8 hook $$h missing in compartment.bpf.c"; exit 1; }; \
 		grep -q "PIN_LINK($$h)" compartment-bpf.c || { echo "error: v0.8 hook $$h not pinned in compartment-bpf.c pin_links()"; exit 1; }; \
 		grep -q "\"$$h\"" compartment-bpf.c || { echo "error: v0.8 hook $$h missing from KNOWN_LINK_NAMES in compartment-bpf.c"; exit 1; }; \
@@ -241,6 +242,13 @@ check-actor-hook: compartment.bpf.o
 	@# before the propagation bits, so exempting on a propagation bit alone
 	@# reopens the MS_BIND|MS_PRIVATE bypass.
 	@grep -q 'MS_BIND' compartment.bpf.c || { echo "error: comp_sb_mount lacks the MS_BIND dispatch-order guard in compartment.bpf.c (ABI v0.8)"; exit 1; }
+	@# sb_umount needs the sealed_devs map on both sides: without the loader
+	@# half the hook is a no-op that no test can distinguish from working.
+	@grep -q 'ACTION_DENY_UMOUNT' compartment-abi.h || { echo "error: ACTION_DENY_UMOUNT missing in compartment-abi.h (ABI v0.8)"; exit 1; }
+	@grep -q 'case ACTION_DENY_UMOUNT' compartment-bpf.c || { echo "error: action_name() lacks ACTION_DENY_UMOUNT in compartment-bpf.c (ABI v0.8)"; exit 1; }
+	@grep -q 'sealed_devs' compartment.bpf.c || { echo "error: sealed_devs map missing in compartment.bpf.c (ABI v0.8)"; exit 1; }
+	@grep -q 'record_sealed_dev' compartment-bpf.c || { echo "error: loader does not populate sealed_devs (record_sealed_dev missing in compartment-bpf.c)"; exit 1; }
+	@grep -Eq '_Static_assert\(ACTION_DENY_UMOUNT +== +15' compartment-abi.h || { echo "error: ACTION_DENY_UMOUNT value-drift assert missing in compartment-abi.h"; exit 1; }
 	@for m in launcher_to_actor policy_state_map actor_marker_map \
 	          marker_set_total marker_set_fail_total marker_copy_fork_total \
 	          marker_stale_generation_total marker_clear_foreign_exec_total \

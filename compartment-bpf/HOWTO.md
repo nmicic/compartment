@@ -34,7 +34,11 @@ covered from v0.8), inode-flag ioctls such as `chattr +i/+a`
 (`file_ioctl`, v0.8) and explicit timestamp changes (`touch -d`,
 `utimensat`; v0.8). Truncation remains write-class (`no-write`). Any
 seal flag also refuses new mounts on or under the sealed path
-(`sb_mount` / `move_mount`, v0.8) so the path cannot be shadowed.
+(`sb_mount` / `move_mount`, v0.8) so the path cannot be shadowed, and
+refuses to let the filesystem hosting the sealed path be detached or moved
+away from under it (`sb_umount`, v0.8). Note the operational consequence:
+while a policy is loaded, `umount` of a filesystem holding sealed paths is
+denied — run `compartment-bpf --unpin` first.
 
 The loader resolves paths once at load time via
 `open(O_PATH | O_NOFOLLOW)` + `fstat`, then keys the seal by
@@ -121,12 +125,13 @@ forgeable.
 
 ### 2.3 Hook-side semantics (ED-4 / ED-6)
 
-At each of the 27 LSM hooks `compartment.bpf.c` attaches (the 16
+At each of the 28 LSM hooks `compartment.bpf.c` attaches (the 16
 file/inode/path hooks of v0.3; the five v0.4 strict-launch hooks
 `bprm_committed_creds`, `task_alloc`, `task_prctl`,
-`ptrace_access_check`, `ptrace_traceme`; and the six v0.8
+`ptrace_access_check`, `ptrace_traceme`; and the seven v0.8
 metadata/mount hooks `inode_set_acl`, `inode_remove_acl`,
-`file_ioctl`, `file_ioctl_compat`, `sb_mount`, `move_mount`),
+`file_ioctl`, `file_ioctl_compat`, `sb_mount`, `sb_umount`,
+`move_mount`),
 after the
 existing seal+flag check passes the kernel runs an actor match
 against `current->mm->exe_file`'s `(dev, ino)`. On mismatch the

@@ -60,6 +60,11 @@ ACTION_FLAG = {
     # the mountpoint outside the sealed subtree — both operator decisions.
     # REVIEW-ONLY, like the other structural denies above.
     "DENY_MOUNT": None,
+    # DENY_UMOUNT (v0.8): the filesystem hosting the seals was about to be
+    # detached or moved. There is no seal flag to relax — the fix is to
+    # --unpin before the umount, or to keep the sealed paths off that
+    # filesystem. REVIEW-ONLY.
+    "DENY_UMOUNT": None,
 }
 
 # The daemon emits three deny line shapes: basic (uniform-deny, no caller/actor),

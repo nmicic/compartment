@@ -33,6 +33,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `file_ioctl` | witnessed |  |
 | `file_ioctl_compat` | witnessed |  |
 | `sb_mount` | witnessed |  |
+| `sb_umount` | witnessed |  |
 | `move_mount` | witnessed |  |
 ## observe-hook
 
@@ -64,6 +65,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `DENY_PTRACE_ACCESS` | witnessed |  |
 | `DENY_PTRACE_TRACEME` | witnessed |  |
 | `DENY_MOUNT` | witnessed |  |
+| `DENY_UMOUNT` | witnessed |  |
 | `DENY_UNLINK` | witnessed |  |
 | `DENY_RENAME` | witnessed |  |
 | `DENY_CREATE` | witnessed |  |

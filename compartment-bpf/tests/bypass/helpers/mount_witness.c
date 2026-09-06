@@ -13,6 +13,16 @@
 //       is a two-step operation in util-linux, so only a raw mount(2) call
 //       reproduces the single-syscall form.
 //
+//   move-fs <src> <dst>
+//       move_mount(AT_FDCWD, src, AT_FDCWD, dst, 0) on an ATTACHED mount —
+//       the new-mount-API spelling of `mount --move`. This is the only
+//       spelling that reaches security_move_mount(): `mount(2)` with MS_MOVE
+//       runs do_move_mount_old(), which calls do_move_mount() directly and
+//       never the hook (verified in fs/namespace.c on both 6.8 and 7.0), so a
+//       `mount --move` shell probe cannot tell our deny apart from the EINVAL
+//       a shared-propagation parent produces. Only a direct move_mount(2)
+//       call is a deterministic witness.
+//
 //   opentree-move <src> <dst>
 //       open_tree(AT_FDCWD, src, OPEN_TREE_CLONE|AT_RECURSIVE) followed by
 //       move_mount(fd, "", AT_FDCWD, dst, MOVE_MOUNT_F_EMPTY_PATH). This is
@@ -65,14 +75,27 @@ int main(int argc, char **argv)
 	if (argc != 4) {
 		fprintf(stderr,
 			"usage: %s bind-private <src> <dst>\n"
+			"       %s move-fs <src> <dst>\n"
 			"       %s opentree-move <src> <dst>\n",
-			argv[0], argv[0]);
+			argv[0], argv[0], argv[0]);
 		return 2;
 	}
 
 	if (strcmp(argv[1], "bind-private") == 0)
 		return classify(mount(argv[2], argv[3], NULL,
 				      MS_BIND | MS_PRIVATE, NULL));
+
+	if (strcmp(argv[1], "move-fs") == 0) {
+#if defined(__NR_move_mount)
+		int rc = (int)syscall(__NR_move_mount, AT_FDCWD, argv[2],
+				      AT_FDCWD, argv[3], 0);
+		if (rc < 0 && errno == ENOSYS)
+			return 77;
+		return classify(rc);
+#else
+		return 77;
+#endif
+	}
 
 	if (strcmp(argv[1], "opentree-move") == 0) {
 #if defined(__NR_open_tree) && defined(__NR_move_mount)

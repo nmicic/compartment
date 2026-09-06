@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <ftw.h>
 #include <limits.h>
+#include <stdint.h>   /* UINT32_MAX (sealed_devs refcount saturation) */
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/resource.h>
@@ -1542,6 +1543,7 @@ static const char *action_name(__u32 a)
 	case ACTION_DENY_PTRACE_ACCESS:         return "DENY_PTRACE_ACCESS";
 	case ACTION_DENY_PTRACE_TRACEME:        return "DENY_PTRACE_TRACEME";
 	case ACTION_DENY_MOUNT:                 return "DENY_MOUNT";
+	case ACTION_DENY_UMOUNT:                return "DENY_UMOUNT";
 	default: return "?";
 	}
 }
@@ -1846,6 +1848,48 @@ static int validate_recursive_dir_seal(const char *path)
 // the leaf, so "seal /usr/bin/python" sealed whatever python pointed to
 // (e.g. python3.13). Now we refuse a symlink leaf and tell the operator
 // to pass the target path explicitly. The README documents this.
+// v0.8: register `dev` in sealed_devs (or bump its refcount) so
+// comp_sb_umount knows this superblock hosts sealed state. Called once per
+// successfully written seal, from seal_path() below.
+//
+// The value is a refcount purely for diagnostics — the hook tests presence.
+// A lost update under a concurrent loader is not possible here (policy load
+// is single-threaded and holds the pin lifecycle lock), so a plain
+// lookup/increment/update is correct.
+static int record_sealed_dev(struct compartment_bpf *skel, __u64 dev,
+			     const char *path)
+{
+	int dfd = bpf_map__fd(skel->maps.sealed_devs);
+	__u32 n = 0;
+
+	if (dfd < 0) {
+		fprintf(stderr, "seal %s: sealed_devs map fd unavailable\n", path);
+		return -1;
+	}
+	if (bpf_map_lookup_elem(dfd, &dev, &n) < 0) {
+		if (errno != ENOENT) {
+			fprintf(stderr, "seal %s: sealed_devs lookup: %s\n",
+				path, strerror(errno));
+			return -1;
+		}
+		n = 0;
+	}
+	if (n < UINT32_MAX)
+		n++;
+	if (bpf_map_update_elem(dfd, &dev, &n, BPF_ANY) < 0) {
+		// E2BIG here means the profile spans more distinct filesystems
+		// than sealed_devs holds. Refuse rather than attach a policy
+		// whose umount protection silently covers only some of them.
+		fprintf(stderr,
+			"seal %s: sealed_devs update (dev=0x%llx): %s. "
+			"The profile spans more filesystems than the "
+			"sealed_devs map holds; refusing fail-closed.\n",
+			path, (unsigned long long)dev, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 static int seal_path(struct compartment_bpf *skel, const char *path,
 		     __u32 flags, const struct actor_group *actor_ref,
 		     struct held_fds *held, struct profile_state *ps)
@@ -2126,6 +2170,17 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 
 	if (bpf_map_update_elem(mfd, &k, &sv, BPF_ANY) < 0) {
 		fprintf(stderr, "seal %s: map update: %s\n", path, strerror(errno));
+		close(pfd);
+		return -1;
+	}
+
+	// v0.8: record the hosting superblock in sealed_devs so comp_sb_umount
+	// can refuse to let the filesystem be detached out from under this
+	// path. The hook is handed a struct vfsmount and has no way back to an
+	// inode, so this is the only state that can answer it. Fail-closed: a
+	// seal we cannot register is a seal whose path guarantee we cannot
+	// keep, so refuse the load rather than attach a half-covered policy.
+	if (record_sealed_dev(skel, dev, path) < 0) {
 		close(pfd);
 		return -1;
 	}
@@ -2959,14 +3014,14 @@ static void pin_lifecycle_unlock(int fd)
 static int pin_links(struct compartment_bpf *skel)
 {
 	// pin_one_link writes into pinned[*pinned_count] without an
-	// explicit bound. We currently make 27 pin calls (25 PIN_LINK, plus
+	// explicit bound. We currently make 28 pin calls (26 PIN_LINK, plus
 	// the canonical-name inode_setattr pin and the conditional
 	// file_ioctl_compat pin) and have 32 slots. The assert hard-codes the
 	// current count because KNOWN_LINK_NAMES is declared later in the
 	// file; if the pin count below grows, bump the literal in lockstep.
 	char pinned[32][PATH_MAX];
-	_Static_assert(sizeof(pinned) / PATH_MAX >= 27,
-		       "pinned[] must hold all PIN_LINK invocations (currently 27: 16 v0.3 + 5 v0.4 + 6 v0.8)");
+	_Static_assert(sizeof(pinned) / PATH_MAX >= 28,
+		       "pinned[] must hold all PIN_LINK invocations (currently 28: 16 v0.3 + 5 v0.4 + 7 v0.8)");
 	int pinned_count = 0;
 
 	if (ensure_bpffs("/sys/fs/bpf") < 0 ||
@@ -3023,6 +3078,7 @@ static int pin_links(struct compartment_bpf *skel)
 	if (skel->links.comp_file_ioctl_compat)
 		PIN_LINK(comp_file_ioctl_compat);
 	PIN_LINK(comp_sb_mount);
+	PIN_LINK(comp_sb_umount);
 	PIN_LINK(comp_move_mount);
 
 #undef PIN_LINK
@@ -3072,6 +3128,7 @@ static const char *const KNOWN_LINK_NAMES[] = {
 	"comp_file_ioctl",
 	"comp_file_ioctl_compat",
 	"comp_sb_mount",
+	"comp_sb_umount",
 	"comp_move_mount",
 };
 static const size_t N_KNOWN_LINK_NAMES =
@@ -3120,6 +3177,7 @@ static int pin_tree_exists(void)
 	static const char *const KNOWN_MAP_NAMES[] = {
 	"sealed_inodes",
 	"sealed_dirs",
+	"sealed_devs",
 	"audit_rb",
 	"deny_total",
 	"audit_drop_total",
@@ -3646,6 +3704,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		/* v0 / v0.1 seal map shapes */
 		{ "sealed_inodes",                    skel->maps.sealed_inodes },
 		{ "sealed_dirs",                      skel->maps.sealed_dirs },
+		{ "sealed_devs",                      skel->maps.sealed_devs },
 		/* v0 counters — userspace reads only via bpf_map_lookup_elem;
 		 * freezing blocks userspace writes, BPF-side (*v)++ still works. */
 		{ "deny_total",                       skel->maps.deny_total },
@@ -3669,11 +3728,11 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		{ "ptrace_traceme_denied_total",      skel->maps.ptrace_traceme_denied_total },
 	};
 	const size_t n = sizeof(entries) / sizeof(entries[0]);
-	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 1 v0.8 = 18.
+	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 2 v0.8 = 19.
 	 * If you add a freezable map to compartment.bpf.c without extending
 	 * this table, the assert below catches it at build time. */
-	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 18,
-		"freeze_seal_maps entry count drift (expected: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 1 v0.8 = 18)");
+	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 19,
+		"freeze_seal_maps entry count drift (expected: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 2 v0.8 = 19)");
 
 	for (size_t i = 0; i < n; i++) {
 		int fd = bpf_map__fd(entries[i].map);
@@ -4237,9 +4296,9 @@ static int unpin_action(const char *requested)
 	// hard upper bound — one prog per link pin. Stack-sized array keeps
 	// the drain path allocation-free.
 	__u32 link_prog_ids[64];
-	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 28,
+	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 29,
 		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id "
-		       "(currently 28: 27 live pins + the legacy "
+		       "(currently 29: 28 live pins + the legacy "
 		       "comp_bprm_check_security sweep entry)");
 	size_t n_link_prog_ids;
 

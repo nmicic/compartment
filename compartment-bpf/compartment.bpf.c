@@ -17,11 +17,12 @@
 //     moved here from bprm_check_security in v0.8 — see the hook comment),
 //     task_alloc (G6 marker copy on fork), task_prctl (PR_SET_MM deny),
 //     ptrace_access_check, ptrace_traceme
-//   v0.8 metadata + mount coverage (6):
+//   v0.8 metadata + mount coverage (7):
 //     inode_set_acl, inode_remove_acl (POSIX ACL writes bypass the xattr
 //     hooks), file_ioctl + file_ioctl_compat (FS_IOC_SETFLAGS /
 //     FSSETXATTR / SETVERSION, native and 32-bit compat entry points),
-//     sb_mount, move_mount (no new mount on or under a sealed path)
+//     sb_mount, move_mount (no new mount on or under a sealed path),
+//     sb_umount (no detaching the filesystem out from under one)
 //
 // v0.1 maps:
 //   sealed_inodes : (dev, ino) -> struct seal_value     (per-file)
@@ -163,6 +164,22 @@ struct {
 	__type(key, struct inode_key);
 	__type(value, struct seal_value);
 } sealed_dirs SEC(".maps");
+
+// v0.8: the set of superblock devices that host at least one sealed inode
+// or sealed directory. Populated by the loader as it writes sealed_inodes /
+// sealed_dirs, and frozen with them.
+//
+// comp_sb_umount is handed a `struct vfsmount *`, not an inode, so the
+// per-inode maps cannot answer the only question that hook needs to ask:
+// "does this filesystem host anything sealed?". The value is a refcount of
+// the seals on that device, kept for diagnostics; the hook only tests
+// presence.
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u64);
+	__type(value, __u32);
+} sealed_devs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -1970,10 +1987,12 @@ int BPF_PROG(comp_file_ioctl_compat, struct file *file, unsigned int cmd,
 // (including the ancestor walk) still applies through it — the mesh
 // §3.23 (b)/(c) rows witness that.
 //
-// Not covered: umount of a filesystem hosting sealed inodes (the path
-// then resolves into the parent FS), pivot_root, and a mount placed on
-// the root of a nested mount that already sits inside a sealed tree (the
-// d_parent walk stops at a mount root). See LIMITATIONS.md.
+// The complementary shape — detaching the filesystem instead of mounting
+// over it — is comp_sb_umount's job, below.
+//
+// Not covered by either: pivot_root, and a mount placed on the root of a
+// nested mount that already sits inside a sealed tree (the d_parent walk
+// stops at a mount root). See LIMITATIONS.md.
 static __always_inline int
 deny_mount_on_dentry(struct dentry *mp, struct caller_id *cid)
 {
@@ -2038,6 +2057,85 @@ int BPF_PROG(comp_sb_mount, const char *dev_name, const struct path *path,
 	return deny_mount_on_dentry(mp, &cid);
 }
 
+// A filesystem hosting sealed inodes must not be detached, and its own
+// mount must not be moved away from under the sealed path.
+//
+// Gating the mount DESTINATION (comp_sb_mount / comp_move_mount above) only
+// covers half the shadowing class. The other half needs no mount at all to
+// start: `umount -l /data` detaches the filesystem, the sealed path then
+// resolves to the (unsealed) mountpoint dentry in the PARENT filesystem, and
+// a fresh `mount -t tmpfs none /data` sails past the destination gate
+// because nothing at that dentry is sealed. Every sealed path now resolves
+// to attacker content. The sealed inodes are still protected — they are just
+// unreachable, which is not what an operator was promised.
+//
+// In daemon mode the held O_PATH fds make umount EBUSY, but that is an
+// accident of implementation, not a control: `umount -l` detaches anyway,
+// and in daemonless `--pin` mode the fds died with the loader.
+//
+// Precision matters here, because s_dev alone is far too coarse: seal one
+// file on the root filesystem and every mount whose superblock is the root
+// filesystem — every bind mount of a root-fs directory, every container
+// setup — would become unmountable. So require BOTH:
+//
+//   (a) the superblock hosts at least one seal (sealed_devs hit), AND
+//   (b) mnt->mnt_root == mnt->mnt_sb->s_root, i.e. this vfsmount is a mount
+//       of the WHOLE filesystem, not a bind mount of some subdirectory of
+//       it. Detaching a bind mount leaves the filesystem — and every path
+//       into it through its real mount — exactly where it was.
+//
+// Residual: a bind mount at a sealed path is still unmountable-away
+// (condition (b) fails, so it is allowed), which re-exposes the path at
+// whatever the underlying dentry is. That is the same nested-mount class
+// already documented for comp_sb_mount, and it is recorded in
+// LIMITATIONS.md rather than papered over here.
+static __always_inline int
+deny_umount_of_sealed_dev(struct vfsmount *mnt)
+{
+	struct super_block *sb;
+	struct dentry *mnt_root, *s_root;
+	__u64 dev;
+	__u32 *hit;
+
+	if (!mnt)
+		return 0;
+	sb = BPF_CORE_READ(mnt, mnt_sb);
+	if (!sb)
+		return 0;
+
+	dev = (__u64)BPF_CORE_READ(sb, s_dev);
+	hit = bpf_map_lookup_elem(&sealed_devs, &dev);
+	if (!hit)
+		return 0;
+
+	// (b): whole-filesystem mount only.
+	mnt_root = BPF_CORE_READ(mnt, mnt_root);
+	s_root   = BPF_CORE_READ(sb, s_root);
+	if (!mnt_root || mnt_root != s_root)
+		return 0;
+
+	struct caller_id cid = {};
+	caller_id_resolve_locked(&cid);
+	emit_audit_actor(ACTION_DENY_UMOUNT, dev, 0,
+	                 cid.valid ? cid.dev : 0,
+	                 cid.valid ? cid.ino : 0,
+	                 (const char *)0);
+	return -EACCES;
+}
+
+// umount(2) / umount2(2), including MNT_DETACH (`umount -l`).
+// fs/namespace.c:do_umount() calls security_sb_umount(&mnt->mnt, flags) as
+// its first statement, before any of the may_umount / propagation work, and
+// the signature is identical on 6.8 and 7.0.
+SEC("lsm/sb_umount")
+int BPF_PROG(comp_sb_umount, struct vfsmount *mnt, int flags, int ret)
+{
+	(void)flags;   /* MNT_DETACH and MNT_FORCE are denied like a plain umount */
+	if (ret != 0)
+		return ret;
+	return deny_umount_of_sealed_dev(mnt);
+}
+
 // move_mount(2), including the tail of the new mount API flows
 // (open_tree(OPEN_TREE_CLONE) + move_mount, fsopen/fsmount + move_mount):
 // the mount at from_path is attached at to_path. Gate the destination the
@@ -2051,10 +2149,34 @@ SEC("lsm/move_mount")
 int BPF_PROG(comp_move_mount, const struct path *from_path,
 	     const struct path *to_path, int ret)
 {
-	(void)from_path;
 	if (ret != 0)
 		return ret;
 
+	// FROM side: moving the whole filesystem that hosts the seals away
+	// from its current mountpoint breaks the path guarantee exactly like
+	// unmounting it. Same two conditions as comp_sb_umount, plus a third:
+	// from_path must BE the mount root, otherwise this is a bind-style
+	// move of a subtree and the filesystem stays where it is.
+	//
+	// RESIDUAL: this only covers move_mount(2). The classic
+	// mount(2)+MS_MOVE spelling runs do_move_mount_old(), which calls
+	// do_move_mount() directly and never security_move_mount() (verified in
+	// fs/namespace.c on both 6.8 and 7.0), while security_sb_mount() sees
+	// only the DESTINATION path plus the source as a char* string it cannot
+	// resolve. There is no hook that can see the source mount on that path.
+	// LIMITATIONS.md carries the row; tests/bypass/20 W3 therefore drives
+	// move_mount(2) directly rather than `mount --move`, which would be a
+	// false pass (a shared-propagation parent returns EINVAL of its own).
+	struct vfsmount *from_mnt = BPF_CORE_READ(from_path, mnt);
+	struct dentry *from_dentry = BPF_CORE_READ(from_path, dentry);
+	if (from_mnt && from_dentry &&
+	    from_dentry == BPF_CORE_READ(from_mnt, mnt_root)) {
+		int r = deny_umount_of_sealed_dev(from_mnt);
+		if (r)
+			return r;
+	}
+
+	// TO side: attaching anything on or under a sealed path.
 	struct dentry *mp = BPF_CORE_READ(to_path, dentry);
 	struct caller_id cid = {};
 	return deny_mount_on_dentry(mp, &cid);

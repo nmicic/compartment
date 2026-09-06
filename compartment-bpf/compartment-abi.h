@@ -146,14 +146,26 @@
 // ABI v0.8 — metadata/mount coverage + post-commit strict-launch marker.
 //  * No struct layout change: audit_event, seal_value, launcher_actor,
 //    actor_marker and policy_state are unchanged on the wire.
-//  * New action code:
+//  * New action codes:
 //    - ACTION_DENY_MOUNT = 14. Emitted by the sb_mount / move_mount hooks
 //      when a new mount would be attached ON a sealed inode or anywhere
 //      INSIDE a sealed subtree (path-shadowing class; the pre-v0.8
 //      LIMITATIONS rows "bind-mount-OVER sealed path" and
 //      "Mount-inside-sealed-subtree bypass"). dev/ino carry the sealed
 //      inode (or covering sealed directory) that fired.
-//  * New hooks (compartment.bpf.c), no new maps:
+//    - ACTION_DENY_UMOUNT = 15. Emitted by the sb_umount hook, and by
+//      move_mount's from-side gate, when a filesystem that hosts sealed
+//      inodes would be detached or moved away. dev carries the
+//      superblock's s_dev; ino is 0 — the subject is the whole filesystem,
+//      not one inode.
+//  * New map:
+//    - sealed_devs: HASH keyed by __u64 s_dev, value __u32 refcount. The
+//      loader inserts the superblock device of every sealed path (file and
+//      directory) as it populates sealed_inodes / sealed_dirs, and the map
+//      is frozen with the rest. It is the only state comp_sb_umount needs:
+//      an umount hook sees a struct vfsmount, not an inode, so per-inode
+//      seals cannot answer "does this filesystem host anything sealed?".
+//  * New hooks (compartment.bpf.c):
 //    - inode_set_acl / inode_remove_acl: since Linux 6.2 POSIX ACL writes
 //      go through vfs_set_acl()/vfs_remove_acl(), which have their own LSM
 //      hooks and never reach inode_setxattr/inode_removexattr. A `no-chmod`
@@ -165,8 +177,18 @@
 //      project ids) mutate inode metadata via ->fileattr_set with no
 //      inode_setattr or xattr hook; gated under SEAL_NO_CHMOD (same two
 //      codes). Both the native and the 32-bit compat ioctl entry points
-//      are hooked — they are separate LSM hooks in the kernel.
+//      are hooked — they are separate LSM hooks in the kernel, and an i386
+//      caller reaches only security_file_ioctl_compat(). The compat
+//      program is autoload-gated on a BTF probe for
+//      bpf_lsm_file_ioctl_compat, because the hook was backported into
+//      stable 6.6.y and a kernel-version test would be wrong.
 //    - sb_mount / move_mount: see ACTION_DENY_MOUNT.
+//    - sb_umount: see ACTION_DENY_UMOUNT. Gating the mount DESTINATION
+//      alone left the complementary shape open — detach the filesystem
+//      that hosts the seals and the sealed path resolves into the parent
+//      filesystem, where the (now unsealed) mountpoint dentry accepts a
+//      fresh mount that the destination gate happily allows. The sealed
+//      inodes stay protected throughout; the path guarantee does not.
 //  * Strict-launch marker mutation moved from bprm_check_security to
 //    bprm_committed_creds. security_bprm_check() runs in
 //    search_binary_handler() immediately before fmt->load_binary(); every
@@ -189,10 +211,6 @@
 //    marker_set_fail_total, records the residual allocation failure so a
 //    strict-launch deny caused by memory pressure is distinguishable from
 //    one caused by an attack on the launcher chain.
-//  * New hook file_ioctl_compat, autoload-gated on a BTF probe for
-//    bpf_lsm_file_ioctl_compat: a 32-bit caller reaches
-//    security_file_ioctl_compat() and never security_file_ioctl(), so
-//    without it the ioctl gate above is bypassed by an i386 process.
 //  * inode_setattr: explicit timestamp writes (utimensat / touch -d) on a
 //    directly sealed inode are now chmod-class, matching the v0.5
 //    parent-dir rule. Truncation stays write-class.
@@ -278,6 +296,14 @@ struct inode_key {
 // Uniform-deny seals emit this code; actor-bound seals emit
 // ACTION_DENY_ACTOR_MISMATCH on a non-actor caller as everywhere else.
 #define ACTION_DENY_MOUNT             14
+// v0.8: umount/detach deny. Emitted by comp_sb_umount when a filesystem
+// that hosts sealed inodes would be detached, and by comp_move_mount when
+// such a filesystem's own mount would be moved away from under its path.
+// dev = the superblock's s_dev; ino = 0 (the whole filesystem is the
+// subject, not one inode). Distinct from ACTION_DENY_MOUNT=14: 14 means
+// "something was about to be attached ON a seal", 15 means "the ground
+// under the seals was about to be pulled away".
+#define ACTION_DENY_UMOUNT            15
 
 // Per-constant value-drift asserts. The struct-size assert on
 // audit_event catches layout drift but not value drift on SEAL_*/ACTION_*;
@@ -302,6 +328,7 @@ _Static_assert(ACTION_DENY_PRCTL_SET_MM   == 11, "ACTION_DENY_PRCTL_SET_MM value
 _Static_assert(ACTION_DENY_PTRACE_ACCESS  == 12, "ACTION_DENY_PTRACE_ACCESS value drift (v0.7)");
 _Static_assert(ACTION_DENY_PTRACE_TRACEME == 13, "ACTION_DENY_PTRACE_TRACEME value drift (v0.7)");
 _Static_assert(ACTION_DENY_MOUNT          == 14, "ACTION_DENY_MOUNT value drift (v0.8)");
+_Static_assert(ACTION_DENY_UMOUNT         == 15, "ACTION_DENY_UMOUNT value drift (v0.8)");
 
 // ABI v0.3 layout (gcc-verified sizeof on LP64, natural alignment):
 //   off  0: __u32 version       — MUST be at offset 0; per the

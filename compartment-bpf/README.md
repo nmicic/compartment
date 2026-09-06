@@ -39,8 +39,9 @@ enforces the seal on every matching operation regardless of uid or capability.
 | `inode_create` / `link` / `mkdir` / `mknod` / `symlink` / `rmdir` | create inside sealed dir |
 | `file_open` / `file_permission` / `file_truncate` | write-open, write through old FD, truncation |
 | `mmap_file` / `file_mprotect` | new shared-writable mapping of sealed file |
-| `inode_setattr` / xattr hooks / `inode_set_acl` / `inode_remove_acl` / `file_ioctl` | size / mode / owner / timestamp / xattr / POSIX-ACL / inode-flag (`chattr`) changes |
+| `inode_setattr` / xattr hooks / `inode_set_acl` / `inode_remove_acl` / `file_ioctl` (+ `file_ioctl_compat`) | size / mode / owner / timestamp / xattr / POSIX-ACL / inode-flag (`chattr`) changes, native and 32-bit callers |
 | `sb_mount` / `move_mount` | new mount on a sealed inode or inside a sealed subtree (path shadowing) |
+| `sb_umount` | detaching a filesystem that hosts sealed inodes (`umount`, `umount -l`; `move_mount(2)` is gated by `move_mount`'s from-side) |
 | `bprm_committed_creds` / `task_alloc` / `task_prctl` / `ptrace_*` | actor-strict marker lifecycle and identity-swap hardening |
 
 Seal flags: `no-unlink`, `no-rename`, `no-write`, `no-chmod` (or `full` for all four).
@@ -154,7 +155,7 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 | Suite | Coverage |
 |-------|----------|
 | `make check` | loader negative-path, multi-actor, error-path, regression (24+ checks) |
-| `tests/bypass/run-all.sh` | 38 bypass scenarios (19 seal-class + 19 exec-domain; kernel hook coverage per flag class) |
+| `tests/bypass/run-all.sh` | 39 bypass scenarios (20 seal-class + 19 exec-domain; kernel hook coverage per flag class) |
 | `tests/strict-launch/run.sh` | 15 strict-launch-marker witnesses |
 | `tests/observe/run.sh` | 25 observe pipeline witnesses |
 | `tests/mesh/run-mesh.sh` | 3276 (actor × operation × flag) enforcement matrix rows |
@@ -170,10 +171,14 @@ fstats, then maps `(dev, ino) → flags`. Symlink leaves are rejected. See
 See `LIMITATIONS.md` for the full table. Highlights:
 
 - **Mount shadowing (residual)**: v0.8 denies new mounts on or under sealed
-  paths. Still open for `CAP_SYS_ADMIN`: unmounting a filesystem that hosts
-  sealed inodes, `pivot_root`, and mounting on the root of a nested mount
-  that already sat inside a sealed tree at load time. The sealed inodes
-  stay protected in every case; only the path guarantee breaks.
+  paths, and denies detaching or moving away the filesystem that hosts them.
+  A consequence worth knowing before you load a policy: **you cannot
+  `umount` a filesystem holding sealed paths without `--unpin` first.** Still
+  open for `CAP_SYS_ADMIN`: `pivot_root`, mounting on the root of a nested
+  mount that already sat inside a sealed tree at load time, and unmounting a
+  bind mount that was itself the sealed path (the filesystem is not detached
+  by that, so it is deliberately allowed). The sealed inodes stay protected
+  in every case; only the path guarantee breaks.
 - **`chattr`-class ioctls**: gated on `no-chmod` seals for native *and*
   32-bit compat callers (`file_ioctl` + `file_ioctl_compat`). The compat
   program is autoload-gated on a BTF probe; on a kernel that lacks
