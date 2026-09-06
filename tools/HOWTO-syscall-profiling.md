@@ -20,12 +20,21 @@ python3 tools/syscall.py profile -o my-program.conf -- ./my-program
 ./compartment-user --profile ./my-program.conf -- ./my-program
 ```
 
+A profile argument without a `/` is treated as a *name* and gets `.conf`
+appended, so pass `./my-program.conf` (or an absolute path) when you mean a
+file in the current directory.
+
+Generated profiles are self-contained: they carry their own Landlock path
+rules, syscall rules and env rules, and load without any other file being
+present. Read one before you use it — profiling only sees the code paths
+that actually ran.
+
 ## Two Modes: Deny vs Allow
 
 ### Deny-list (default — safe, won't break program)
 
 Blocks dangerous syscalls (ptrace, mount, reboot, etc.) that the
-program does NOT use. Everything else is allowed.
+program never used successfully. Everything else is allowed.
 
 ```bash
 python3 syscall.py profile -- ls /tmp
@@ -33,13 +42,31 @@ python3 syscall.py profile -- ls /tmp
 
 Output:
 ```conf
-inherit ai-agent
+ro /etc
+ro /usr/bin
+ro /usr/lib
 block acct
 block bpf
 block chroot
 block mount
 block ptrace
-# ... (only dangerous syscalls the program never called)
+# ... (only dangerous syscalls the program never called successfully)
+```
+
+"Successfully" matters. A dangerous syscall the program *attempted* and that
+failed with `EPERM` is still blocked, and the profile records why:
+
+```conf
+# Attempted but never succeeded — blocked anyway, since
+# a call that already fails loses nothing by being denied:
+#   mount (1 attempts, 0 succeeded)
+```
+
+Anything the program really does use is left open, and named:
+
+```conf
+# NEEDED (not blocked — the program really uses these):
+#   unshare (3 successful calls)
 ```
 
 **When to use:** general-purpose sandboxing. Low risk of breakage.
@@ -56,12 +83,18 @@ python3 syscall.py profile --seccomp-mode allow -- ls /tmp
 Output:
 ```conf
 seccomp-mode allowlist
-allow 0   # read
-allow 1   # write
-allow 2   # open
-allow 3   # close
+allow read
+allow write
+allow openat
+allow close
 # ... (only syscalls actually observed)
 ```
+
+Syscalls are emitted by name whenever `compartment.h`'s `syscall_table[]`
+knows the name, because names are portable across architectures. Anything
+the table does not name falls back to a raw number with the name in a
+trailing comment (`allow 435  # clone3`); those numbers are valid only on
+the architecture the profile was generated on, and the profile says so.
 
 **When to use:** high-security isolation where you've profiled all
 code paths. Beware: rare paths (error handling, signal handling,
@@ -85,10 +118,16 @@ env-allow TERM
 ```
 
 > **Note:** `--with-env` generates a conservative default list (PATH,
-> HOME, TERM, LANG, XDG vars, plus any proxy/API key vars currently
-> set in your environment). It does NOT dynamically discover which
-> env vars the program reads — that would require LD_PRELOAD or eBPF.
-> Review and trim the list for your deployment.
+> HOME, TERM, LANG, XDG vars, plus any proxy variables currently set).
+> It does NOT dynamically discover which env vars the program reads —
+> `getenv(3)` makes no syscall, so there is nothing to trace. Review and
+> trim the list for your deployment.
+>
+> It never emits an `env-allow` line for a variable whose name looks like a
+> credential (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, ...). An
+> `env-allow` line re-admits a variable into a sandbox whose whole job is
+> to strip it, so if your program genuinely needs one, add it by hand and
+> take the decision consciously.
 
 ## Workflow: Profiling a Long-Running Program
 
@@ -97,13 +136,13 @@ AI agents run for hours. Use `--duration` to capture a representative sample:
 ```bash
 # Profile for 5 minutes, following child processes
 python3 syscall.py profile --seccomp-mode allow --duration 300 \
-    -o claude.conf -- claude --model claude-opus-4-6
+    -o my-agent.conf -- my-agent --model some-model
 
 # Review what was observed
-python3 syscall.py trace --duration 300 -- claude --model claude-opus-4-6
+python3 syscall.py trace --duration 300 -- my-agent --model some-model
 
 # Check if the ai-agent default would have been fine
-python3 syscall.py check --profile ai-agent --duration 300 -- claude
+python3 syscall.py check --profile ai-agent --duration 300 -- my-agent
 ```
 
 > **Important:** A single profiling run will miss rare code paths.
@@ -168,19 +207,25 @@ world-writable; the same goes for the directory holding them.
 mkdir -p ~/.config/compartment
 chmod go-w ~/.config/compartment
 python3 syscall.py profile -m allow --with-env \
-    -o ~/.config/compartment/claude.conf -- claude
+    -o ~/.config/compartment/my-agent.conf -- my-agent
 
 # System profile (as root)
 python3 syscall.py profile -m allow --with-env \
-    -o /etc/compartment/claude.conf -- claude
+    -o /etc/compartment/my-agent.conf -- my-agent
 
 # Use by name (no path needed)
-compartment-user --profile claude -- claude
+compartment-user --profile my-agent -- my-agent
 ```
 
 ## Profile Inheritance
 
-Custom profiles can inherit from base profiles:
+Custom profiles can inherit from base profiles. `inherit NAME` resolves to
+a *file*: first `NAME.conf` beside the inheriting profile, then the standard
+search paths. It never resolves to compartment-user's compiled-in `ai-agent`
+policy, so `inherit ai-agent` only works when an `ai-agent.conf` file exists
+in one of those places (`examples/ai-agent.conf` is such a file, but
+`make install` does not deploy it). Generated profiles are self-contained
+for exactly this reason.
 
 ```conf
 # ~/.config/compartment/my-agent.conf
@@ -196,8 +241,8 @@ conflict with the allow-list):
 ```conf
 # Full allow-list profile (no inherit)
 seccomp-mode allowlist
-allow 0   # read
-allow 1   # write
+allow read
+allow write
 ...
 
 env-mode allowlist
@@ -217,11 +262,14 @@ ro /lib
 python3 syscall.py profile -- ls /tmp > deny.conf
 python3 syscall.py profile --seccomp-mode allow -- ls /tmp > allow.conf
 
-# deny.conf: blocks 37 dangerous syscalls (inherits ai-agent)
-# allow.conf: permits only 23 observed syscalls (everything else denied)
+# deny.conf: blocks the dangerous syscalls the program never used
+# allow.conf: permits only the syscalls actually observed
 #
-# allow.conf blocks ~277 more syscalls than deny.conf
-# but may break if a rare code path uses an unobserved syscall
+# allow.conf denies far more than deny.conf, but breaks if a rare code
+# path uses a syscall that profiling never saw.
+#
+# Both carry the same Landlock path rules, derived from the paths the
+# program opened during the trace.
 ```
 
 ## Troubleshooting
@@ -237,15 +285,21 @@ strace -f ./my-program 2>&1 | grep EPERM
 strace -c -f ./my-program   # shows summary of all syscalls
 
 # Add the missing syscall to the profile
-echo "allow 435  # clone3" >> ~/.config/compartment/my-program.conf
+echo "allow clone3" >> ~/.config/compartment/my-program.conf
 ```
 
 ### "unknown syscall" in profile
 
-syscall.py emits numeric IDs (`allow 59  # execve`).
-compartment-user accepts both names (135 entries covering all
-common and dangerous syscalls) and numbers. If you see "unknown
-syscall", the value is neither a known name nor a valid number.
+compartment-user accepts both names and numbers. The names it knows are
+the ones in `compartment.h`'s `syscall_table[]` — `compartment-user
+--verify` prints the current count. syscall.py reads that same table and
+emits a name when there is one, a number when there is not. If you see
+"unknown syscall", the value is neither a known name nor a valid number.
+
+Note that no inline comment is allowed after a *name*: the parser takes
+everything after the directive as the value, so `block ptrace  # why`
+looks for a syscall literally called `ptrace  # why`. Numbers are the one
+exception (`allow 435  # clone3` parses). Put comments on their own line.
 
 ### strace not available
 

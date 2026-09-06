@@ -26,16 +26,21 @@ if docker inspect "$CONTAINER" &>/dev/null; then
 fi
 
 echo "Starting squid..."
+# --network host, not -p: squid.conf binds 127.0.0.1:8080, which has to be
+# the host's loopback for the bind to mean anything.  A bridge-networked
+# container cannot bind the host loopback, so it would have to listen on all
+# of its own interfaces and rely on the published port alone — reachable
+# from every other container on the same bridge.
 docker run -d \
   --name "$CONTAINER" \
   --restart=always \
   --read-only \
+  --network host \
   --tmpfs /var/run/squid:uid=13,gid=13,mode=0755 \
   --tmpfs /tmp:mode=1777 \
-  -p 127.0.0.1:8080:3128 \
   -v "${CONF_DIR}/squid.conf":/etc/squid/squid.conf:ro \
   -v "${LOG_DIR}":/var/log/squid \
   "$IMAGE"
 
-echo "Squid started. Test with:"
+echo "Squid started on 127.0.0.1:8080 (host loopback only). Test with:"
 echo "  curl -x http://127.0.0.1:8080 https://example.com -I"

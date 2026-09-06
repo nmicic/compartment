@@ -5,19 +5,28 @@
 set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-ENTRY="@reboot ${BASE_DIR}/start.sh >> ${BASE_DIR}/logs/cron-start.log 2>&1"
-MARKER="# tinyproxy-autostart"
+# shellcheck source=crontab.sh
+. "${BASE_DIR}/crontab.sh"
 
-# Check if already present
-if crontab -l 2>/dev/null | grep -qF "$MARKER"; then
+ENTRY="@reboot ${BASE_DIR}/start.sh >> ${BASE_DIR}/logs/cron-start.log 2>&1"
+
+crontab_lock
+CUR="${BASE_DIR}/run/crontab.current.$$"
+NEW="${BASE_DIR}/run/crontab.new.$$"
+trap 'rm -f "${CUR}" "${NEW}"' EXIT
+
+crontab_snapshot "$CUR"
+if grep -qF "$CRONTAB_MARKER" "$CUR"; then
   echo "Already enabled in crontab."
   exit 0
 fi
 
-# Append to existing crontab (or create new)
-( crontab -l 2>/dev/null; echo "${MARKER}"; echo "${ENTRY}" ) | crontab -
+crontab_backup_from "$CUR"
+{ cat "$CUR"; echo "${CRONTAB_MARKER}"; echo "${ENTRY}"; } > "$NEW"
+crontab_install "$NEW"
+crontab_unlock
 
 echo "Enabled. tinyproxy will start automatically on next login/reboot."
 echo ""
 echo "Crontab entry:"
-crontab -l | grep -A1 "$MARKER"
+crontab -l | grep -A1 -F "$CRONTAB_MARKER"

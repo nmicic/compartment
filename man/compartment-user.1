@@ -105,7 +105,18 @@ expanded inside a profile value.
 Grant read-only + execute access to \fIPATH\fR.
 .TP
 .BI \-\-rw " PATH"
-Grant read-write + execute access to \fIPATH\fR.
+Grant read-write access to \fIPATH\fR.
+Execute is deliberately
+.B not
+granted: compartment-user enforces W^X, so a directory that a program can
+write to is never a directory it can execute from.
+Use
+.B \-\-exec
+(or
+.BR \-\-ro )
+for execute access, and note that a path listed both \fB\-\-rw\fR and
+\fB\-\-exec\fR ends up read-write-execute, because Landlock rules are
+additive.
 .TP
 .BI \-\-exec " PATH"
 Grant read + execute access (alias for \fB\-\-ro\fR).

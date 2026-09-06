@@ -10,15 +10,18 @@ PID_FILE="${BASE_DIR}/run/tinyproxy.pid"
 LOG_DIR="${BASE_DIR}/logs"
 LOG_FILE="${LOG_DIR}/tinyproxy.log"
 BIN="${HOME}/.local/bin/tinyproxy"
+# shellcheck source=pidfile.sh
+. "${BASE_DIR}/pidfile.sh"
 
 # ── Sanity checks ───────────────────────────────────────────
 [[ -x "$BIN" ]] || { echo "Binary not found: $BIN — run build.sh first."; exit 1; }
 [[ -f "$CONF_TPL" ]] || { echo "Config template missing: $CONF_TPL"; exit 1; }
 
 # ── Already running? ────────────────────────────────────────
+# pidfile_read also checks /proc/<pid>/comm: a recycled PID that now belongs
+# to some other process of ours must not read as "already running".
 if [[ -f "$PID_FILE" ]]; then
-  PID=$(cat "$PID_FILE")
-  if kill -0 "$PID" 2>/dev/null; then
+  if PID=$(pidfile_read "$PID_FILE"); then
     echo "tinyproxy already running (pid $PID)."
     exit 0
   else
@@ -40,8 +43,8 @@ sed \
 "$BIN" -c "$CONF_RUN"
 sleep 0.5
 
-if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-  echo "tinyproxy started (pid $(cat "$PID_FILE"))."
+if PID=$(pidfile_read "$PID_FILE"); then
+  echo "tinyproxy started (pid $PID)."
   echo "Upstream: $(grep '^Upstream' "$CONF_RUN" | head -1)"
   echo "Listening: 127.0.0.1:8080"
   echo ""
