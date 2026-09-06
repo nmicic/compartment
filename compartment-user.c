@@ -60,9 +60,13 @@
 #endif
 
 /* ── AI agent profile ────────────────────────────────────────────────
- * Default paths and blocked syscalls for running Claude/Codex/etc. */
+ * Default paths and blocked syscalls for running AI CLI agents. */
 
-static void apply_profile_ai_agent(Config *cfg)
+/* Location label used by the fail-closed policy-append helpers. */
+#define BUILTIN_WHERE "built-in profile"
+#define CLI_WHERE     "command line"
+
+static int apply_profile_ai_agent(Config *cfg)
 {
     /* Filesystem: read-only system paths */
     const char *ro_paths[] = {
@@ -74,35 +78,24 @@ static void apply_profile_ai_agent(Config *cfg)
         NULL
     };
     for (int i = 0; ro_paths[i]; i++) {
-        if (cfg->path_count < MAX_PATHS) {
-            cfg->paths[cfg->path_count].path = ro_paths[i];
-            cfg->paths[cfg->path_count].mode = PATH_RO;
-            cfg->path_count++;
-        }
+        if (cfg_add_path(cfg, BUILTIN_WHERE, ro_paths[i], PATH_RO, 0) != 0)
+            return -1;
     }
 
     /* Filesystem: read-write for working dirs */
     const char *rw_paths[] = {"/tmp", NULL};
     for (int i = 0; rw_paths[i]; i++) {
-        if (cfg->path_count < MAX_PATHS) {
-            cfg->paths[cfg->path_count].path = rw_paths[i];
-            cfg->paths[cfg->path_count].mode = PATH_RW;
-            cfg->path_count++;
-        }
+        if (cfg_add_path(cfg, BUILTIN_WHERE, rw_paths[i], PATH_RW, 0) != 0)
+            return -1;
     }
 
     /* Add HOME and workdir as RWX (agents write AND execute scripts) */
     const char *home = getenv("HOME");
-    if (home && cfg->path_count < MAX_PATHS) {
-        cfg->paths[cfg->path_count].path = home;
-        cfg->paths[cfg->path_count].mode = PATH_RWX;
-        cfg->path_count++;
-    }
-    if (cfg->workdir && cfg->path_count < MAX_PATHS) {
-        cfg->paths[cfg->path_count].path = cfg->workdir;
-        cfg->paths[cfg->path_count].mode = PATH_RWX;
-        cfg->path_count++;
-    }
+    if (home && cfg_add_path(cfg, BUILTIN_WHERE, home, PATH_RWX, 0) != 0)
+        return -1;
+    if (cfg->workdir &&
+        cfg_add_path(cfg, BUILTIN_WHERE, cfg->workdir, PATH_RWX, 0) != 0)
+        return -1;
 
     /* Syscalls to block */
     const char *blocked[] = {
@@ -129,8 +122,8 @@ static void apply_profile_ai_agent(Config *cfg)
     };
     for (int i = 0; blocked[i]; i++) {
         int nr = resolve_syscall(blocked[i]);
-        if (nr >= 0 && cfg->blocked_count < MAX_BLOCKED_SC)
-            cfg->blocked_syscalls[cfg->blocked_count++] = nr;
+        if (nr >= 0 && cfg_add_blocked(cfg, BUILTIN_WHERE, blocked[i], nr) != 0)
+            return -1;
     }
 
     /* Dangerous env vars to strip */
@@ -162,16 +155,18 @@ static void apply_profile_ai_agent(Config *cfg)
         NULL
     };
     for (int i = 0; deny_env[i]; i++) {
-        if (cfg->env_deny_count < MAX_ENV_VARS)
-            cfg->env_deny[cfg->env_deny_count++] = deny_env[i];
+        if (cfg_add_env_deny(cfg, BUILTIN_WHERE, deny_env[i], 0) != 0)
+            return -1;
     }
+    return 0;
 }
 
 /* ── Strict profile: minimal access ─────────────────────────────── */
 
-static void apply_profile_strict(Config *cfg)
+static int apply_profile_strict(Config *cfg)
 {
-    apply_profile_ai_agent(cfg);  /* start with ai-agent base */
+    if (apply_profile_ai_agent(cfg) != 0)  /* start with ai-agent base */
+        return -1;
 
     /* Also block: personality, lookup_dcookie, nfsservctl, quotactl */
     const char *extra[] = {
@@ -181,9 +176,10 @@ static void apply_profile_strict(Config *cfg)
     };
     for (int i = 0; extra[i]; i++) {
         int nr = resolve_syscall(extra[i]);
-        if (nr >= 0 && cfg->blocked_count < MAX_BLOCKED_SC)
-            cfg->blocked_syscalls[cfg->blocked_count++] = nr;
+        if (nr >= 0 && cfg_add_blocked(cfg, BUILTIN_WHERE, extra[i], nr) != 0)
+            return -1;
     }
+    return 0;
 }
 
 /* ── Landlock enforcement ────────────────────────────────────────── */
@@ -730,7 +726,7 @@ int main(int argc, char *argv[])
         };
         /* Try profile file first, fall back to built-in */
         if (resolve_and_load_profile(&shell_cfg, "ai-agent", 0) != 0)
-            apply_profile_ai_agent(&shell_cfg);
+            (void)apply_profile_ai_agent(&shell_cfg);
 
         int shell_degraded = 0;
 
@@ -814,25 +810,16 @@ int main(int argc, char *argv[])
         switch (opt) {
         case 'P': cfg.profile = optarg; break;
         case 'r': /* --ro */
-            if (cfg.path_count < MAX_PATHS) {
-                cfg.paths[cfg.path_count].path = optarg;
-                cfg.paths[cfg.path_count].mode = PATH_RO;
-                cfg.path_count++;
-            }
+            if (cfg_add_path(&cfg, CLI_WHERE, optarg, PATH_RO, 0) != 0)
+                return 1;
             break;
         case 'w': /* --rw */
-            if (cfg.path_count < MAX_PATHS) {
-                cfg.paths[cfg.path_count].path = optarg;
-                cfg.paths[cfg.path_count].mode = PATH_RW;
-                cfg.path_count++;
-            }
+            if (cfg_add_path(&cfg, CLI_WHERE, optarg, PATH_RW, 0) != 0)
+                return 1;
             break;
         case 'x': /* --exec */
-            if (cfg.path_count < MAX_PATHS) {
-                cfg.paths[cfg.path_count].path = optarg;
-                cfg.paths[cfg.path_count].mode = PATH_EXEC;
-                cfg.path_count++;
-            }
+            if (cfg_add_path(&cfg, CLI_WHERE, optarg, PATH_EXEC, 0) != 0)
+                return 1;
             break;
         case 'W': cfg.workdir = optarg; break;
         case 'b': { /* --block */
@@ -845,8 +832,8 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "\n");
                 return 1;
             }
-            if (cfg.blocked_count < MAX_BLOCKED_SC)
-                cfg.blocked_syscalls[cfg.blocked_count++] = nr;
+            if (cfg_add_blocked(&cfg, CLI_WHERE, optarg, nr) != 0)
+                return 1;
             break;
         }
         case 'l': { /* --allow (syscall allowlist) */
@@ -855,22 +842,18 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "compartment-user: unknown syscall: %s\n", optarg);
                 return 1;
             }
-            if (cfg.allowed_sc_count < MAX_ALLOWED_SC) {
-                cfg.allowed_syscalls[cfg.allowed_sc_count++] = nr;
-                cfg.seccomp_allow_mode = 1;
-            }
+            if (cfg_add_allowed(&cfg, CLI_WHERE, optarg, nr) != 0)
+                return 1;
             break;
         }
         case 'E': /* --env-deny */
-            if (cfg.env_deny_count < MAX_ENV_VARS)
-                cfg.env_deny[cfg.env_deny_count++] = optarg;
+            if (cfg_add_env_deny(&cfg, CLI_WHERE, optarg, 0) != 0)
+                return 1;
             break;
         case 'e': /* --env-allow */
-            if (cfg.env_allow_count < MAX_ENV_VARS) {
-                cfg.env_allow[cfg.env_allow_count++] = optarg;
-                cfg.env_allow_mode = 1;
-                cfg.use_env_sanitize = 1;
-            }
+            if (cfg_add_env_allow(&cfg, CLI_WHERE, optarg, 0) != 0)
+                return 1;
+            cfg.use_env_sanitize = 1;
             break;
         case 'L': cfg.use_landlock = 0; break;
         case 'S': cfg.use_seccomp = 0; break;
@@ -904,10 +887,10 @@ int main(int argc, char *argv[])
         if (resolve_and_load_profile(&cfg, cfg.profile, 0) == 0) {
             /* loaded from file */
         } else if (strcmp(cfg.profile, "ai-agent") == 0) {
-            apply_profile_ai_agent(&cfg);
+            if (apply_profile_ai_agent(&cfg) != 0) return 1;
             cfg.profile_source = "built-in";
         } else if (strcmp(cfg.profile, "strict") == 0) {
-            apply_profile_strict(&cfg);
+            if (apply_profile_strict(&cfg) != 0) return 1;
             cfg.profile_source = "built-in";
         } else {
             fprintf(stderr, "compartment-user: unknown profile: %s\n", cfg.profile);
@@ -927,7 +910,7 @@ int main(int argc, char *argv[])
     /* workdir implies rw — the user expects to write there.
      * The ai-agent built-in does this already; this ensures file-loaded
      * profiles get the same behavior. Skip if already in the path list. */
-    if (cfg.workdir && cfg.path_count < MAX_PATHS) {
+    if (cfg.workdir) {
         int already = 0;
         for (int i = 0; i < cfg.path_count; i++) {
             if (cfg.paths[i].mode == PATH_RW &&
@@ -936,11 +919,9 @@ int main(int argc, char *argv[])
                 break;
             }
         }
-        if (!already) {
-            cfg.paths[cfg.path_count].path = cfg.workdir;
-            cfg.paths[cfg.path_count].mode = PATH_RW;
-            cfg.path_count++;
-        }
+        if (!already &&
+            cfg_add_path(&cfg, CLI_WHERE, cfg.workdir, PATH_RW, 0) != 0)
+            return 1;
     }
 
     /* ── Dry run: show config and exit ──────────────────────────── */

@@ -82,6 +82,9 @@ static void join_netns(const char *netns_name);
 static void set_rlimits(void);
 static void print_help(const char *prog_name);
 
+/* Location label used by the fail-closed policy-append helpers. */
+#define CLI_WHERE "command line"
+
 /* ── main ────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
@@ -184,10 +187,8 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "compartment-root: unknown syscall: %s\n", optarg);
                 return 1;
             }
-            if (config.allowed_sc_count < MAX_ALLOWED_SC) {
-                config.allowed_syscalls[config.allowed_sc_count++] = nr;
-                config.seccomp_allow_mode = 1;
-            }
+            if (cfg_add_allowed(&config, CLI_WHERE, optarg, nr) != 0)
+                return 1;
             break;
         }
         case 'B': { /* --block */
@@ -196,8 +197,8 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "compartment-root: unknown syscall: %s\n", optarg);
                 return 1;
             }
-            if (config.blocked_count < MAX_BLOCKED_SC)
-                config.blocked_syscalls[config.blocked_count++] = nr;
+            if (cfg_add_blocked(&config, CLI_WHERE, optarg, nr) != 0)
+                return 1;
             break;
         }
         case 'n':
@@ -205,27 +206,28 @@ int main(int argc, char *argv[])
             config.netns = xstrdup(optarg);
             break;
         case 'C':
-            if (config.cgroups_count < MAX_PATHS)
-                config.cgroups[config.cgroups_count++] = xstrdup(optarg);
+            if (cfg_add_str(config.cgroups, &config.cgroups_count, MAX_PATHS,
+                            CLI_WHERE, "cgroup", optarg, 1) != 0)
+                return 1;
             break;
         case 'A':
-            if (config.cap_allowed_count < MAX_ENV_VARS)
-                config.cap_allowed_names[config.cap_allowed_count++] = xstrdup(optarg);
+            if (cfg_add_str(config.cap_allowed_names, &config.cap_allowed_count,
+                            MAX_ENV_VARS, CLI_WHERE, "cap-allow", optarg, 1) != 0)
+                return 1;
             break;
         case 'E':
-            if (config.env_deny_count < MAX_ENV_VARS)
-                config.env_deny[config.env_deny_count++] = optarg;
+            if (cfg_add_env_deny(&config, CLI_WHERE, optarg, 0) != 0)
+                return 1;
             break;
         case 'e':
-            if (config.env_allow_count < MAX_ENV_VARS) {
-                config.env_allow[config.env_allow_count++] = optarg;
-                config.env_allow_mode = 1;
-                config.use_env_sanitize = 1;
-            }
+            if (cfg_add_env_allow(&config, CLI_WHERE, optarg, 0) != 0)
+                return 1;
+            config.use_env_sanitize = 1;
             break;
         case 'M':
-            if (config.mount_mask_count < MAX_PATHS)
-                config.mount_masks[config.mount_mask_count++] = xstrdup(optarg);
+            if (cfg_add_str(config.mount_masks, &config.mount_mask_count,
+                            MAX_PATHS, CLI_WHERE, "mount-mask", optarg, 1) != 0)
+                return 1;
             break;
         case 'L': config.audit_log_dir = optarg; config.audit = 1; break;
         case 'l': config.loopback = 1; break;
