@@ -697,12 +697,17 @@ check-release: check-env
 	@command -v clang >/dev/null || { echo "[check-release] FAIL: clang missing"; exit 1; }
 	@[ "$${RUN_E2E:-1}" != "0" ] || { echo "[check-release] FAIL: RUN_E2E=0 removes the daemon end-to-end leg from a release run"; exit 1; }
 	@echo "[check-release] preflight OK — running full suite"
-	@log=$$(mktemp); \
-	if ! $(MAKE) check > "$$log" 2>&1; then \
-	  cat "$$log"; \
-	  echo "[check-release] FAIL: make check returned non-zero"; rm -f "$$log"; exit 1; \
+	@# The status of a pipeline is its LAST command's, so the pre-1.4
+	@# `$(MAKE) check 2>&1 | tee "$$log" || ok=0` could never set ok=0 —
+	@# there is no `pipefail` anywhere in this Makefile and recipes run
+	@# under /bin/sh. Capturing make's own status in a file keeps the
+	@# live output a seven-minute gate needs AND gets the status right.
+	@log=$$(mktemp); rcf=$$(mktemp); \
+	{ $(MAKE) check 2>&1; echo $$? > "$$rcf"; } | tee "$$log"; \
+	rc=$$(cat "$$rcf"); rm -f "$$rcf"; \
+	if [ "$$rc" -ne 0 ]; then \
+	  echo "[check-release] FAIL: make check returned $$rc"; rm -f "$$log"; exit 1; \
 	fi; \
-	cat "$$log"; \
 	if grep -q '^FAIL ' "$$log"; then \
 	  echo "[check-release] FAIL: a suite printed a FAIL line:"; \
 	  grep -n '^FAIL ' "$$log" | sed 's/^/  /'; \
