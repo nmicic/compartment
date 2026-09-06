@@ -71,7 +71,11 @@ is not the loader cannot remove, detach, forge or shadow the enforcement.
   `comp_bpf_map`), returning `-EACCES` like every other path deny: the pin
   objects, both pin directories, `/sys/fs/bpf/compartment` and the bpffs mount
   root are recorded in `protected_pins` and cannot be unlinked, renamed,
-  rmdir'd, unmounted or over-mounted by a non-loader.
+  rmdir'd, unmounted or over-mounted by a non-loader. The first four emit
+  `ACTION_DENY_PIN_TAMPER`; `sb_umount` keeps `ACTION_DENY_UMOUNT`, because
+  "this filesystem cannot be detached while policy is live" is exactly what
+  that code already means and a second code would carry no distinct operator
+  response. All of them increment `deny_total`.
 * Action codes `ACTION_DENY_BPF_SELF` (16) and `ACTION_DENY_PIN_TAMPER` (17),
   both inside ABI `0x0008` — no second bump, because v0.8 is unreleased and no
   consumer has ever seen a `0x0008` stream without them. The `audit_event`
