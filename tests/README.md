@@ -5,8 +5,9 @@
 
 Integration tests for compartment-user and sandbox.sh.
 
-Note: compartment-root requires root and is not covered by this automated
-suite. Test it manually with `sudo ./compartment-root --dry-run --profile examples/container.conf -- /bin/sh`.
+Note: compartment-root requires root and is only partly covered by this
+automated suite. The root-only checks live in `tests/scripts/root.d/` and
+must be started explicitly, as root.
 
 ## Quick Start
 
@@ -32,6 +33,23 @@ make test-integration
 | **Child inheritance** | `run_child_inheritance_tests.sh` | Sandbox restrictions survive fork/exec across 2 levels |
 | **Sandbox proxy/network** | `run_sandbox_proxy_matrix.sh` | sandbox.sh HARD/SOFT modes, network isolation, proxy bridge |
 | **Claude CLI smoke** | `run_claude_smoke.sh` | Claude CLI runs under compartment-user, API reachable, audit logging |
+| **Profile trust** | `rootless.d/profile-trust.sh` | Profile search order and file trust, transactional parsing, one-way switches, `$HOME` validation, `COMPARTMENT_SHELL_DIR`, audit-log hardening, environment deny-list, `--dump-profile` |
+| **Profile trust (root)** | `root.d/profile-trust-root.sh` | compartment-root never reads `$HOME`; `/etc/compartment` ownership and mode checks; every `--profile` spelling; root audit directory |
+
+Scripts under `rootless.d/` and `root.d/` are standalone: each builds its
+own fixtures, prints the same `PASS:`/`FAIL:`/`SKIP:` lines as the suites
+above, and exits non-zero if anything failed. `root.d/` scripts skip
+themselves with exit 0 when not run as uid 0.
+
+Both profile-trust suites accept `COMPARTMENT_USER` and `COMPARTMENT_ROOT`
+environment overrides, so the same assertions can be pointed at an older
+build to confirm they fail there:
+
+```bash
+COMPARTMENT_USER=/path/to/old/compartment-user \
+COMPARTMENT_ROOT=/path/to/old/compartment-root \
+  bash tests/scripts/rootless.d/profile-trust.sh
+```
 
 ## Directory Structure
 
@@ -52,7 +70,11 @@ tests/
 │   ├── run_compartment_user_matrix.sh
 │   ├── run_child_inheritance_tests.sh
 │   ├── run_sandbox_proxy_matrix.sh
-│   └── run_claude_smoke.sh
+│   ├── run_claude_smoke.sh
+│   ├── rootless.d/
+│   │   └── profile-trust.sh    — profile trust, parser, audit, env
+│   └── root.d/
+│       └── profile-trust-root.sh  — root-only profile trust (dry-run only)
 ├── output/                 — test output files (git-ignored)
 └── README.md               — this file
 ```
