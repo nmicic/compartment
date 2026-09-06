@@ -9,7 +9,13 @@
  * single-line results for machine parsing.
  *
  * Output format:
+ *   PROBE_START op=<op> pid=<n>          always the first line
  *   RESULT op=<op> <key>=<val>... rc=<n> errno=<n> name=<errname>
+ *
+ * PROBE_START is a positive "the probe really executed" marker: without it a
+ * harness cannot tell an empty capture caused by a blocked operation from one
+ * caused by the sandbox refusing to exec the probe at all.  stdout is line
+ * buffered so the marker survives a SIGSYS kill (x32 probes).
  *
  * Build:
  *   cc -o deny_probe deny_probe.c
@@ -413,6 +419,22 @@ static int do_sc_io_uring_setup(void)
 #endif
 }
 
+static int do_sc_ptrace_x32(void)
+{
+#if defined(__x86_64__)
+    /* x86-64 x32 ABI: the same syscall number with __X32_SYSCALL_BIT set.
+     * A filter that only compares the low bits of nr lets this through; a
+     * correct one kills the process with SIGSYS. */
+    long r = syscall(__NR_ptrace | 0x40000000L, PTRACE_TRACEME, 0, NULL, NULL);
+    if (r == 0) ptrace(PTRACE_DETACH, 0, NULL, NULL);
+    result("sc_ptrace_x32", "", r >= 0 ? 0 : -1);
+    return r >= 0 ? 0 : 1;
+#else
+    result("sc_ptrace_x32", "arch=not-x86_64", -1);
+    return 1;
+#endif
+}
+
 /* ── Usage ──────────────────────────────────────────────────────────── */
 
 static void usage(void)
@@ -437,7 +459,8 @@ static void usage(void)
         "  spawn_sh <cmd>              spawn_abs_bash <cmd>\n"
         "  spawn_nested <cmd>\n\n"
         "Syscall probes:\n"
-        "  sc_ptrace_traceme           sc_unshare_user\n"
+        "  sc_ptrace_traceme           sc_ptrace_x32\n"
+        "  sc_unshare_user\n"
         "  sc_process_vm_readv         sc_process_vm_writev\n"
         "  sc_userfaultfd              sc_perf_event_open\n"
         "  sc_io_uring_setup\n"
@@ -446,9 +469,16 @@ static void usage(void)
 
 int main(int argc, char *argv[])
 {
+    /* Line buffered: results must reach the harness even when the probe is
+     * killed mid-run (SIGSYS from a seccomp KILL_PROCESS rule). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (argc < 2) { usage(); return 1; }
 
     const char *cmd = argv[1];
+
+    /* Positive "the probe executed" marker — see the header comment. */
+    printf("PROBE_START op=%s pid=%d\n", cmd, (int)getpid());
 
     /* Filesystem */
     if (strcmp(cmd, "fs_read") == 0 && argc >= 3)      return do_fs_read(argv[2]);
@@ -483,6 +513,7 @@ int main(int argc, char *argv[])
 
     /* Syscall probes */
     if (strcmp(cmd, "sc_ptrace_traceme") == 0)          return do_sc_ptrace();
+    if (strcmp(cmd, "sc_ptrace_x32") == 0)              return do_sc_ptrace_x32();
     if (strcmp(cmd, "sc_unshare_user") == 0)            return do_sc_unshare();
     if (strcmp(cmd, "sc_process_vm_readv") == 0)        return do_sc_process_vm_readv();
     if (strcmp(cmd, "sc_process_vm_writev") == 0)       return do_sc_process_vm_writev();
