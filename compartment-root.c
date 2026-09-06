@@ -98,33 +98,6 @@ int main(int argc, char *argv[])
     config.use_no_new_privs = 1;
     config.use_env_sanitize = 1;
 
-    /* ── Pre-scan for --profile (loads BEFORE CLI so CLI overrides) ── */
-    for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "--profile") == 0 || strcmp(argv[i], "-p") == 0)
-            && i + 1 < argc) {
-            config.profile = argv[i + 1];
-            /* PROFILE_OWNER_ROOT and no $HOME search: this process is
-             * root, and the profile decides rootdir, username, cap-allow
-             * and the seccomp policy. */
-            int pr = resolve_and_load_profile(&config, config.profile, 0,
-                                              PROFILE_OWNER_ROOT);
-            if (pr == PROFILE_ERROR) {
-                fprintf(stderr, "compartment-root: profile '%s' was rejected "
-                        "— refusing to run\n", config.profile);
-                return 1;
-            }
-            if (pr == PROFILE_NOT_FOUND) {
-                fprintf(stderr, "compartment-root: unknown profile: %s\n",
-                        config.profile);
-                profile_print_search_path(stderr, config.profile, PROFILE_OWNER_ROOT);
-                return 1;
-            }
-            break;
-        }
-    }
-
-    /* ── Parse CLI (overrides profile values) ───────────────────────── */
-
     static struct option long_options[] = {
         {"profile",         required_argument, 0, 'p'},
         {"rootdir",         required_argument, 0, 'c'},
@@ -152,11 +125,59 @@ int main(int argc, char *argv[])
         {0, 0, 0, 0}
     };
 
+    static const char *optstring =
+        "+p:c:u:g:a:B:n:C:A:E:e:M:L:U:lSNdvDVh";
+
+    /* ── Pass 1: resolve --profile only ─────────────────────────────
+     *
+     * The profile has to load before the rest of the command line so that
+     * CLI options override it. This used to be a hand-rolled pre-scan
+     * that matched only the exact tokens "--profile" and "-p", so
+     * "--profile=FILE" and "-pFILE" fell through to a no-op getopt case
+     * and the entire policy was discarded with no error and exit 0. Let
+     * getopt_long do the parsing, twice. */
     int opt;
-    while ((opt = getopt_long(argc, argv, "+p:c:u:g:a:B:n:C:A:E:e:M:L:U:lSNdvDVh",
-                              long_options, NULL)) != -1) {
+    opterr = 0;
+    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL)) != -1) {
+        if (opt == 'p') { config.profile = optarg; break; }
+        if (opt == '?' || opt == ':') break;   /* pass 2 reports it */
+    }
+    optind = 0;   /* glibc: full reinitialisation for the second pass */
+    opterr = 1;
+
+    if (config.profile) {
+        /* PROFILE_OWNER_ROOT and no $HOME search: this process is root,
+         * and the profile decides rootdir, username, cap-allow and the
+         * seccomp policy. */
+        int pr = resolve_and_load_profile(&config, config.profile, 0,
+                                          PROFILE_OWNER_ROOT);
+        if (pr == PROFILE_ERROR) {
+            fprintf(stderr, "compartment-root: profile '%s' was rejected "
+                    "— refusing to run\n", config.profile);
+            return 1;
+        }
+        if (pr == PROFILE_NOT_FOUND) {
+            fprintf(stderr, "compartment-root: unknown profile: %s\n",
+                    config.profile);
+            profile_print_search_path(stderr, config.profile, PROFILE_OWNER_ROOT);
+            return 1;
+        }
+    }
+
+    /* ── Pass 2: everything else (overrides profile values) ────────── */
+
+    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL)) != -1) {
         switch (opt) {
-        case 'p': /* already handled in pre-scan */ break;
+        case 'p':
+            /* Resolved in pass 1. A different value here means --profile
+             * was given more than once. */
+            if (!config.profile || strcmp(config.profile, optarg) != 0) {
+                fprintf(stderr, "compartment-root: --profile given more than "
+                        "once ('%s' after '%s') — refusing to guess\n",
+                        optarg, config.profile ? config.profile : "(none)");
+                return 1;
+            }
+            break;
         case 'c':
             free(config.rootdir);
             config.rootdir = xstrdup(optarg);
