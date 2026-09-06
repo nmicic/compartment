@@ -148,7 +148,11 @@ else
     MY_SERVICE_TOKEN="test-not-a-real-token" \
         python3 "${SYSCALL_PY}" profile --with-env -o "${ENVGEN}" -- /bin/true \
         >/dev/null 2>"${WORK}/env.err" || true
-    if [ -f "${ENVGEN}" ] && grep -qiE '^env-allow .*(API_KEY|TOKEN|SECRET|PASSWORD)' "${ENVGEN}"; then
+    # A negative grep over a file that was never generated is not a
+    # result. Assert the generator produced something first.
+    if [ ! -s "${ENVGEN}" ]; then
+        fail "--with-env generated no profile: $(head -1 "${WORK}/env.err" 2>/dev/null)"
+    elif grep -qiE '^env-allow .*(API_KEY|TOKEN|SECRET|PASSWORD)' "${ENVGEN}"; then
         fail "--with-env emits a credential: $(grep -iE '^env-allow .*(API_KEY|TOKEN|SECRET|PASSWORD)' "${ENVGEN}" | head -1)"
     else
         pass "--with-env emits no credential-looking env-allow line"
@@ -167,7 +171,9 @@ PYEOF
     M14GEN="${WORK}/gen-m14.conf"
     python3 "${SYSCALL_PY}" profile -o "${M14GEN}" -- \
         python3 "${WORK}/fail-mount.py" >/dev/null 2>&1 || true
-    if [ -f "${M14GEN}" ] && grep -q '^block mount$' "${M14GEN}"; then
+    if [ ! -s "${M14GEN}" ]; then
+        fail "the attempted-but-denied fixture generated no profile"
+    elif grep -q '^block mount$' "${M14GEN}"; then
         pass "attempted-but-denied syscall is still blocked"
     else
         fail "a dangerous syscall that only failed was treated as needed and left unblocked"
@@ -205,7 +211,11 @@ PYEOF
     INJGEN="${WORK}/gen-inject.conf"
     python3 "${SYSCALL_PY}" profile -o "${INJGEN}" -- "${INJ_BIN}" \
         >/dev/null 2>&1 || true
-    if [ -f "${INJGEN}" ] && grep -qE '^[[:space:]]*allow ' "${INJGEN}"; then
+    # The argv[0]-injection test is negative, so a profile that was never
+    # written satisfied it.
+    if [ ! -s "${INJGEN}" ]; then
+        fail "the argv[0]-injection fixture generated no profile to inspect"
+    elif grep -qE '^[[:space:]]*allow ' "${INJGEN}"; then
         fail "a newline in the program name injected a directive: $(grep -nE '^[[:space:]]*allow ' "${INJGEN}" | head -1)"
     else
         pass "a newline in the program name injects no directive"
@@ -220,7 +230,9 @@ echo "--- Test group: extra/ helper scripts ---"
 
 # Every helper the docs tell people to run has to be executable.
 NON_EXEC=""
+EXTRA_ROWS=0
 while read -r mode _ _ path; do
+    EXTRA_ROWS=$((EXTRA_ROWS + 1))
     case "${path}" in
         *.sh) ;;
         *) continue ;;
@@ -228,8 +240,17 @@ while read -r mode _ _ path; do
     head -c2 "${REPO_DIR}/${path}" 2>/dev/null | grep -q '#!' || continue
     [ "${mode}" = "100755" ] || NON_EXEC="${NON_EXEC} ${path}"
 done < <(git -C "${REPO_DIR}" ls-files -s extra 2>/dev/null || true)
-if [ -z "${NON_EXEC}" ]; then
-    pass "every extra/ script with a shebang is committed executable"
+# `git ls-files` yields nothing outside a git checkout — a release
+# tarball, `make dist`, a mutation scratch tree — and the assertion then
+# passed having read no rows at all.
+if [ "${EXTRA_ROWS}" -lt 1 ]; then
+    if git -C "${REPO_DIR}" rev-parse --git-dir >/dev/null 2>&1; then
+        fail "git ls-files lists nothing under extra/ in a git checkout"
+    else
+        skip "extra/ executable bits (not a git checkout: nothing to read)"
+    fi
+elif [ -z "${NON_EXEC}" ]; then
+    pass "every extra/ script with a shebang is committed executable (${EXTRA_ROWS} rows)"
 else
     fail "not executable in the index:${NON_EXEC}"
 fi

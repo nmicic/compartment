@@ -175,10 +175,16 @@ want_out "--verbose reports the ABI"                "ABI v${ABI}"
 # kernel rejected them with EINVAL and the tool still counted them.
 run "${CU}" --verbose "${BASE[@]}" -- /bin/true
 INSTALLED="$(printf '%s\n' "${RUN_OUT}" | sed -n 's/.*(ABI v[0-9]*, \([0-9]*\) of \([0-9]*\) path rules.*/\1 \2/p')"
-if [ "${INSTALLED% *}" = "${INSTALLED#* }" ]; then
-    pass "symlinked /lib and /lib64 install (${INSTALLED% *} of ${INSTALLED#* }) "
-else
+# On no match INSTALLED is empty and both halves of the comparison below
+# are the empty string, so the assertion passed having measured nothing.
+if [ -z "${INSTALLED}" ]; then
+    fail "no 'N of M path rules installed' line to read: $(printf '%s' "${RUN_OUT}" | tr '\n' '|' | cut -c1-160)"
+elif [ "${INSTALLED% *}" != "${INSTALLED#* }" ]; then
     fail "some rules did not install: ${INSTALLED}"
+elif [ "${INSTALLED% *}" -lt "${BASE_PATHS}" ]; then
+    fail "only ${INSTALLED% *} rules were even asked for (want >= ${BASE_PATHS})"
+else
+    pass "symlinked /lib and /lib64 install (${INSTALLED% *} of ${INSTALLED#* })"
 fi
 
 # One optional rule skipped means one fewer installed than asked for.

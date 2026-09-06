@@ -156,8 +156,10 @@ else
 fi
 
 BAD_FLAGS=""
+FLAGS_SEEN=0
 while read -r tool flag; do
     [ -n "${flag}" ] || continue
+    FLAGS_SEEN=$((FLAGS_SEEN + 1))
     case "${tool}" in
         compartment-user) help="${WORK}/cu-help.txt" ;;
         compartment-root) help="${WORK}/cr-help.txt" ;;
@@ -167,8 +169,12 @@ while read -r tool flag; do
 done < <(grep -horE 'compartment-(user|root) --[a-z][a-z0-9-]*' \
              "${EXAMPLES}" 2>/dev/null \
          | sed -E 's/^(compartment-[a-z]+) (--.*)$/\1 \2/' | sort -u)
-if [ -z "${BAD_FLAGS}" ]; then
-    pass "every compartment-* flag named in examples/ exists in --help"
+# Zero matches meant zero loop iterations, an empty BAD_FLAGS and a pass
+# that had read nothing. Require the extractor to have found something.
+if [ "${FLAGS_SEEN}" -lt 1 ]; then
+    fail "the flag extractor found no compartment-* flag in examples/ — it has stopped matching"
+elif [ -z "${BAD_FLAGS}" ]; then
+    pass "every compartment-* flag named in examples/ exists in --help (${FLAGS_SEEN} checked)"
 else
     fail "examples/ recommend flags that do not exist:${BAD_FLAGS}"
 fi

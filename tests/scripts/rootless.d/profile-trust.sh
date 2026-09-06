@@ -476,9 +476,16 @@ FORGED user=root uid=0 event=NOTHING"
     : > "${NLCMD}"
     "${CU}" --no-landlock --no-seccomp --audit -- "${NLCMD}" >/dev/null 2>&1
     LOGF="$(ls "${AUD}/"*.log 2>/dev/null | head -1)"
+    # `grep -c event= == wc -l` is 0 -eq 0 on an empty file, so this
+    # passed when auditing had stopped entirely. Require at least one
+    # real record before comparing.
+    LOG_LINES=0
+    [ -n "${LOGF}" ] && LOG_LINES="$(wc -l < "${LOGF}")"
     if [ -z "${LOGF}" ]; then
         fail "M7: audit log file was not created"
-    elif [ "$(grep -c 'event=' "${LOGF}")" -eq "$(wc -l < "${LOGF}")" ] &&
+    elif [ "${LOG_LINES}" -lt 1 ]; then
+        fail "M7: the audit log is empty — nothing was recorded to forge"
+    elif [ "$(grep -c 'event=' "${LOGF}")" -eq "${LOG_LINES}" ] &&
          ! grep -q '^FORGED' "${LOGF}"; then
         pass "M7: newline in the command cannot forge a log record"
     else
@@ -585,7 +592,11 @@ want_out "M11: dump uses prefix env entries" "env-deny LD_*"
 chmod go-w "${WORK}/dumped.conf"
 A="$("${CU}" --dry-run --profile ai-agent -- /bin/true 2>&1 | grep -v 'profile')"
 B="$("${CU}" --dry-run --profile "${WORK}/dumped.conf" -- /bin/true 2>&1 | grep -v 'profile')"
-if [ "${A}" = "${B}" ]; then
+# Both sides are greps of tool output, so "" = "" satisfied this whenever
+# the tool printed nothing at all. Require a policy to have been printed.
+if ! printf '%s\n' "${A}" | grep -q 'landlock:'; then
+    fail "M11: the built-in dry-run printed no policy to compare against"
+elif [ "${A}" = "${B}" ]; then
     pass "M11: --dump-profile output reloads to the same policy"
 else
     fail "M11: dumped profile does not round-trip"

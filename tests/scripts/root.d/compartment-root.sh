@@ -377,8 +377,17 @@ run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
     'grep " /sys " /proc/self/mountinfo || echo NOSYS'
 expect_contains "/sys mounted read-only" " ro,"
 
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /sys/firmware | wc -l'
-expect_contains "/sys/firmware masked (empty)" "^0$"
+# `ls DIR | wc -l` prints 0 when DIR does not exist, so an absent
+# /sys/firmware was scored as a masked one. Separate the two.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'if [ -d /sys/firmware ]; then
+       echo "FW=[$(ls -A /sys/firmware | tr "\n" " ")]"
+     else echo FW=ABSENT; fi'
+if printf '%s\n' "${RUN_OUT}" | grep -q '^FW=ABSENT$'; then
+    skip "/sys/firmware masked (this container got the empty-tmpfs /sys fallback)"
+else
+    expect_contains "/sys/firmware masked (an empty directory, not a missing one)" "^FW=\[\]$"
+fi
 
 echo ""
 
@@ -440,8 +449,13 @@ expect_not_contains "/proc/1/root does not reach the host root" "boot"
 expect_contains "/proc/1/root is the container root or denied" "host\|Permission denied"
 
 # A directory fd opened by the caller must not survive into the container.
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /proc/self/fd | tr "\n" " "; echo' 9< /
-expect_not_contains "pre-opened host directory fd is closed" "^9$"
+# `ls | tr "\n" " "` collapses the listing to a single line, so the old
+# `grep -q "^9$"` could not match whether the fd leaked or not. Emit a
+# bracketed, space-delimited list and match " 9 " inside it.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "FDS=[ $(ls /proc/self/fd | tr "\n" " ")]"' 9< /
+expect_contains "fd listing captured (probe liveness)" "^FDS=\[ "
+expect_not_contains "pre-opened host directory fd is closed" "FDS=\[.* 9 "
 
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /host | wc -l'
 expect_contains "container root really is the jail" "^0$"
@@ -467,8 +481,10 @@ echo "--- Test group: container init (L4, L5) ---"
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'echo pid=$$'
 expect_contains "target runs under a PID 1 reaper" "pid=2"
 
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /proc/self/fd | tr "\n" " "; echo' 8< /etc/hostname
-expect_not_contains "inherited fd 8 closed before exec" "^8$"
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "FDS=[ $(ls /proc/self/fd | tr "\n" " ")]"' 8< /etc/hostname
+expect_contains "fd listing captured (probe liveness)" "^FDS=\[ "
+expect_not_contains "inherited fd 8 closed before exec" "FDS=\[.* 8 "
 
 # SIGTERM to compartment-root must reach the target through PID 1.
 "${CR}" -c "${JAIL}" "${CRUSER[@]}" -- /bin/sleep 30 >/dev/null 2>&1 &
@@ -504,9 +520,19 @@ echo ""
 
 echo "--- Test group: network namespace ---"
 
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /sys/class/net | tr "\n" " "; echo'
-expect_contains "fresh netns has only loopback" "lo"
-expect_not_contains "host interfaces not visible" "eth0"
+# `expect_not_contains "eth0"` passed on any host whose NIC is named
+# enp0s3 — i.e. every modern one — so dropping CLONE_NEWNET was invisible.
+# Assert the list is exactly "lo", with the host's own interface count as
+# the control that makes the assertion attributable.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "NETIF=[$(ls /sys/class/net | sort | tr "\n" " ")]"'
+expect_contains "fresh netns has only loopback" "^NETIF=\[lo \]$"
+HOST_IFCOUNT="$(ls /sys/class/net | wc -l)"
+if [ "${HOST_IFCOUNT}" -gt 1 ]; then
+    pass "control: the host has ${HOST_IFCOUNT} interfaces, so an empty netns is attributable"
+else
+    skip "control: the host itself has only one interface"
+fi
 
 # IFF_UP is bit 0 of /sys/class/net/lo/flags: 0x9 up, 0x8 down.  (ICMP is
 # not usable as a probe here — ping needs CAP_NET_RAW or a permissive
@@ -632,7 +658,7 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 84
+harness_expect_total 86
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"
