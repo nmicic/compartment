@@ -76,7 +76,11 @@ if [ ! -d "${ROOT_D}" ]; then
     exit 1
 fi
 
-# Shared fixture root (unpredictable, removed on exit).
+# Shared fixture root (unpredictable, removed on exit).  Keep it out of
+# $HOME: under `sudo` that may still be the invoking user's home directory,
+# and a root-owned tree left there after a crash is a nuisance at best.
+: "${COMPARTMENT_FIXTURE_BASE:=${TMPDIR:-/tmp}}"
+export COMPARTMENT_FIXTURE_BASE
 harness_fixtures
 echo "Fixture root: ${FIXTURES}"
 

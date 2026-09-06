@@ -67,11 +67,16 @@ endif
 
 BASE_CFLAGS = -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE -O2
 
-CFLAGS  = $(BASE_CFLAGS) $(HARDEN_CFLAGS)
-LDFLAGS = $(HARDEN_LDFLAGS)
+# EXTRA_CFLAGS / EXTRA_LDFLAGS append to (rather than replace) the flags
+# above, so a sanitizer or coverage build keeps the warning set and the
+# feature macros:
+#   make EXTRA_CFLAGS='-fsanitize=address,undefined -U_FORTIFY_SOURCE -g' #        EXTRA_LDFLAGS='-fsanitize=address,undefined'
+CFLAGS  = $(BASE_CFLAGS) $(HARDEN_CFLAGS) $(EXTRA_CFLAGS)
+LDFLAGS = $(HARDEN_LDFLAGS) $(EXTRA_LDFLAGS)
 
 .PHONY: all clean test test-integration test-quick test-root hardened \
-        install install-man install-profiles show-hardening
+        install install-man install-profiles show-hardening \
+        check check-shell check-modes
 
 # Both tools: zero dependencies
 all: compartment-user compartment-root
@@ -148,6 +153,25 @@ install-profiles:
 	@echo "      the same name — /etc/compartment is searched before the"
 	@echo "      built-ins.  Remove them from $(DESTDIR)$(CONFDIR)/ to keep the"
 	@echo "      compiled-in defaults."
+
+# ── Repository hygiene checks (also run in CI) ─────────────────────
+
+check: check-shell check-modes
+
+# Shell sources of this project.  compartment-bpf/ is a separate subtree
+# with its own conventions and is not gated here.
+SHELL_DIRS = examples extra man scripts tests tools
+
+check-shell:
+	@command -v shellcheck > /dev/null 2>&1 || 		{ echo "check-shell: shellcheck not installed (apt install shellcheck)"; exit 1; }
+	@files=$$(git ls-files '*.sh' 2>/dev/null | grep -v '^compartment-bpf/' || 		find . -name '*.sh' -not -path './compartment-bpf/*' -not -path './.git/*'); 	echo "shellcheck -S warning over $$(echo "$$files" | wc -l) files"; 	shellcheck -S warning $$files
+
+# Every *.sh that starts with a shebang must be executable, and every one
+# that does not (a sourced library) must not be: a test that ships
+# non-executable is silently skipped by anything that iterates over
+# executables, and a "library" that is executable invites being run.
+check-modes:
+	@rc=0; 	for f in $$(git ls-files $(SHELL_DIRS) sandbox.sh 2>/dev/null | grep '\.sh$$'); do 		mode=$$(git ls-files -s "$$f" | awk '{print $$1}'); 		if head -c2 "$$f" | grep -q '^#!'; then 			if [ "$$mode" != "100755" ]; then 				echo "check-modes: $$f has a shebang but is mode $$mode (want 100755)"; rc=1; 			fi; 		else 			if [ "$$mode" = "100755" ]; then 				echo "check-modes: $$f has no shebang but is executable (want 100644)"; rc=1; 			fi; 		fi; 	done; 	if [ $$rc -eq 0 ]; then echo "check-modes: all shell scripts have the right mode"; fi; 	exit $$rc
 
 clean:
 	rm -f compartment-user compartment-root tests/probes/deny_probe
