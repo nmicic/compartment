@@ -115,7 +115,8 @@ static int  remount_with_flags(Config *config, const char *path,
                                int recursive);
 static void set_rlimits(void);
 static void apply_default_seccomp_denylist(Config *config);
-static void container_init(void);
+static void container_init(Config *config);
+static int  policy_covers_reaper(const Config *config);
 static void print_help(const char *prog_name);
 
 /* Location label used by the fail-closed policy-append helpers. */
@@ -1277,10 +1278,10 @@ static int child_func(void *arg)
 
     /* 17. Fork the target under a minimal init.  Returns only in the
      *     child; this process stays behind as PID 1 of the pid namespace
-     *     (see container_init).  Deliberately before the seccomp filter:
-     *     PID 1 has to keep wait4/kill/rt_sigaction available even under
-     *     an allow-list policy that does not mention them. */
-    container_init();
+     *     (see container_init).  The fork is before the filter because the
+     *     reaper installs its own only when the policy provably permits
+     *     what it needs — see policy_covers_reaper(). */
+    container_init(config);
 
     /* 18. seccomp (last enforcement step before exec) */
     if (config->use_seccomp) {
@@ -1321,14 +1322,50 @@ static void init_forward(int sig)
  * the target, reap everything else, and exit with the target's status
  * (128+n if it was killed).  Returns in the child; never returns in PID 1.
  *
- * PID 1 is deliberately left outside the seccomp filter, which the target
- * installs for itself after the fork: an allow-list policy that does not
- * mention wait4/kill/rt_sigaction would otherwise break the reaper.  It is
- * still inside every namespace and carries the same dropped capabilities,
- * dropped uid and no-new-privs as the target; it execs nothing and does
- * nothing but wait.
+ * PID 1 used to be left outside the seccomp filter unconditionally: an
+ * allow-list policy that did not mention wait4/kill/rt_sigaction would
+ * break the reaper, and there was no way to name those syscalls before
+ * syscall_table[] carried them.  It now installs the same filter as the
+ * target, but only when the policy provably permits everything the loop
+ * below uses.  When it does not, PID 1 stays unfiltered and says so under
+ * --verbose: a reaper that dies on its first waitpid() is a worse failure
+ * than one syscall filter fewer on a process that execs nothing.
+ *
+ * Either way PID 1 is inside every namespace and carries the same dropped
+ * capabilities, dropped uid, Landlock ruleset and no-new-privs as the
+ * target.
  */
-static void container_init(void)
+
+/* Syscalls the reaper loop cannot do without.  rt_sigreturn is what the
+ * kernel invokes to leave the signal handler, and its absence kills the
+ * process the first time a signal is forwarded. */
+static const char *const reaper_syscalls[] = {
+    "wait4", "kill", "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
+    "exit_group", "write", NULL
+};
+
+static int policy_covers_reaper(const Config *config)
+{
+    for (int i = 0; reaper_syscalls[i]; i++) {
+        int nr = resolve_syscall(reaper_syscalls[i]);
+        if (nr < 0)
+            return 0;
+        if (config->seccomp_allow_mode) {
+            int found = 0;
+            for (int j = 0; j < config->allowed_sc_count && !found; j++)
+                found = (config->allowed_syscalls[j] == nr);
+            if (!found)
+                return 0;
+        } else {
+            for (int j = 0; j < config->blocked_count; j++)
+                if (config->blocked_syscalls[j] == nr)
+                    return 0;
+        }
+    }
+    return 1;
+}
+
+static void container_init(Config *config)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -1339,6 +1376,22 @@ static void container_init(void)
         return;                             /* target: caller execs */
 
     init_target = pid;
+
+    if (config->use_seccomp) {
+        if (policy_covers_reaper(config)) {
+            if (apply_seccomp(config) != 0) {
+                fprintf(stderr, "compartment-root: seccomp failed for the "
+                        "container init — aborting\n");
+                kill(pid, SIGKILL);
+                _exit(EXIT_FAILURE);
+            }
+        } else if (config->verbose) {
+            fprintf(stderr, "compartment-root: container init left outside "
+                    "the seccomp filter — the policy does not permit every "
+                    "syscall the reaper needs (wait4, kill, rt_sig*, "
+                    "exit_group, write)\n");
+        }
+    }
 
     static const int fwd[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT };
     struct sigaction sa;
