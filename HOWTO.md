@@ -89,7 +89,13 @@ Every profile file is checked on the file descriptor it is read from:
 * it must be a regular file;
 * it must be owned by **root** or by **you** (by root only for
   compartment-root);
-* it must not be group- or world-writable;
+* it must not be group- or world-writable — with one exception: a file or
+  directory that **you** own, in **your own primary group**, may be
+  group-writable when that group has no other members, because
+  `umask 002` plus user-private groups is the default on Debian, Ubuntu
+  and Fedora and group-write there is no wider than owner-write. A
+  root-owned file never qualifies, so `/etc/compartment/` and every
+  compartment-root profile keep the strict rule;
 * its containing directory must pass the same ownership and write check.
 
 Symlinks are followed, so `/etc/alternatives`-style indirection works, but

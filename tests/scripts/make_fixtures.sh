@@ -10,17 +10,8 @@
 set -euo pipefail
 
 FIXTURES="/tmp/compartment-fixtures"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 echo "=== Creating fixture tree at ${FIXTURES} ==="
-
-# compartment-user refuses to load policy from a group- or world-writable
-# file or directory. git does not track those bits, so a checkout made
-# with umask 002 leaves the shipped profiles at 0664/0775. Normalise them
-# so the suite exercises the parser rather than the trust check.
-chmod go-w "${REPO_DIR}/tests/profiles" "${REPO_DIR}/examples" 2>/dev/null || true
-chmod go-w "${REPO_DIR}"/tests/profiles/*.conf "${REPO_DIR}"/examples/*.conf 2>/dev/null || true
 
 rm -rf "${FIXTURES}"
 mkdir -p "${FIXTURES}"/{readable,writable,protected,subdir}
