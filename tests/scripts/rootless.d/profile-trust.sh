@@ -30,6 +30,26 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
 
+# One skip standing in for a block of N assertions, so pass+fail+skip is
+# the same number on every machine (tests/scripts/lib/harness.sh).
+skip_group() {
+    local n="$1" reason="$2"
+    SKIP=$((SKIP + n))
+    echo "  SKIP: ${reason} (${n} assertions)"
+}
+
+# The suite declares its own assertion count, counting this check, so a
+# block that silently stops running fails instead of shrinking the total.
+harness_expect_total() {
+    local want="$1"
+    local got=$((PASS + FAIL + SKIP + 1))
+    if [ "${got}" -eq "${want}" ]; then
+        pass "suite ran all ${want} assertions"
+    else
+        fail "suite ran ${got} assertions, declared ${want} — a block was added, removed or silently skipped"
+    fi
+}
+
 echo "=== Profile trust / parser / audit test suite ==="
 echo ""
 
@@ -146,6 +166,149 @@ echo ""
 
 # ── Profile file trust ────────────────────────────────────────────────
 
+# ── C3: invalid values, unknown directives, other-tool directives ────
+
+echo "--- Test group: directive and value validation (C3) ---"
+
+mkconf() {
+    local name="$1"; shift
+    printf '%s\n' "$@" > "${WORK}/${name}.conf"
+    chmod go-w "${WORK}/${name}.conf"
+    printf '%s\n' "${WORK}/${name}.conf"
+}
+
+# `seccomp-mode` and `env-mode` used to take any value: anything that was
+# not allow/allowlist selected deny-list mode with no diagnostic, so a
+# misspelled mode line silently swapped a default-deny allow-list for a
+# default-allow deny-list. Every other value-taking directive already
+# refused an unknown value.
+for d in seccomp-mode env-mode; do
+    run "${CU}" --dry-run --profile "$(mkconf "bad-${d}" "ro /usr" "${d} allowlst")" -- /bin/true
+    want_rc_nonzero "C3: '${d} allowlst' is fatal"
+    want_out "C3: the ${d} refusal names the valid values" \
+             "invalid value for ${d}: 'allowlst' (use allow/allowlist or deny/denylist)"
+done
+
+# The explicit deny spellings are accepted, so the check is a whitelist
+# and not "anything but a typo I thought of".
+run "${CU}" --dry-run --profile "$(mkconf "sec-deny" "ro /usr" "seccomp-mode denylist" "block ptrace")" -- /bin/true
+want_rc "C3: 'seccomp-mode denylist' is accepted" 0
+want_out "C3: 'denylist' really selects deny-list mode" "DENY-LIST"
+run "${CU}" --dry-run --profile "$(mkconf "env-deny-mode" "ro /usr" "env-mode deny" "env-deny FOO")" -- /bin/true
+want_rc "C3: 'env-mode deny' is accepted" 0
+want_out "C3: 'deny' really selects deny-list mode" "env: DENY-LIST"
+
+# An unknown directive was a warning on stderr and the run continued, so
+# a misspelled security-relevant line left the process running with
+# weaker policy than its author wrote.
+run "${CU}" --dry-run --profile "$(mkconf "typo" "ro /usr" "blokc ptrace")" -- /bin/true
+want_rc_nonzero "C3: an unknown directive is fatal"
+want_out "C3: the refusal names the directive" "unknown directive 'blokc'"
+want_out "C3: the refusal says why it is fatal" "a profile is policy"
+
+# A directive belonging to the OTHER tool is a different situation and
+# gets a different message: the shared parser recognises it, so ignoring
+# it is right — but silently ignoring it is how a cap-allow line reads as
+# policy when it is not.
+run "${CU}" --dry-run --profile "$(mkconf "otherTool" "ro /usr" "cap-allow sys_admin" "rootdir /srv/x")" -- /bin/true
+want_rc "C3: a compartment-root directive does not stop compartment-user" 0
+want_out "C3: the warning names the owning tool (cap-allow)" \
+         "'cap-allow' is a compartment-root directive; compartment-user ignores it"
+want_out "C3: the warning names the owning tool (rootdir)" \
+         "'rootdir' is a compartment-root directive; compartment-user ignores it"
+
+echo ""
+
+# ── T27-T30: the empty allow-list shapes ─────────────────────────────
+
+echo "--- Test group: empty allow-lists (T27-T30) ---"
+
+# T27/T28: `env-mode allow` with no `env-allow` is a silent clearenv().
+# It is fail-closed, but nothing anywhere recorded that it is what
+# happens, so a change to fail-open would have been invisible.
+ENVOUT_EMPTY="$(env FOO=bar BAZ=qux "${CU}" --no-seccomp \
+    --profile "$(mkconf "envallow-empty" "ro /usr" "ro /bin" "ro /lib" "ro /lib64" \
+                        "ro /etc" "env-mode allow" "landlock on")" \
+    -- /usr/bin/env 2>/dev/null)"
+if [ -z "${ENVOUT_EMPTY}" ]; then
+    pass "T27: 'env-mode allow' with an empty env-allow clears the environment"
+else
+    fail "T27: 'env-mode allow' with an empty env-allow leaked: $(printf '%s' "${ENVOUT_EMPTY}" | tr '\n' ' ' | cut -c1-120)"
+fi
+
+ENVOUT_ONE="$(env FOO=bar BAZ=qux "${CU}" --no-seccomp \
+    --profile "$(mkconf "envallow-one" "ro /usr" "ro /bin" "ro /lib" "ro /lib64" \
+                        "ro /etc" "env-mode allow" "env-allow FOO" "landlock on")" \
+    -- /usr/bin/env 2>/dev/null)"
+if printf '%s\n' "${ENVOUT_ONE}" | grep -q '^FOO=bar$' &&
+   ! printf '%s\n' "${ENVOUT_ONE}" | grep -q '^BAZ='; then
+    pass "T28: a non-empty env-allow keeps exactly what it names"
+else
+    fail "T28: env-allow FOO produced: $(printf '%s' "${ENVOUT_ONE}" | tr '\n' ' ' | cut -c1-120)"
+fi
+
+# T29: `seccomp-mode allow` with no `allow` lines is a filter that denies
+# everything. It must refuse to start rather than install it.
+run "${CU}" --profile "$(mkconf "scallow-empty" "ro /usr" "ro /bin" "ro /lib" \
+                                "ro /lib64" "ro /etc" "seccomp-mode allow" "landlock on")" \
+    -- /bin/true
+want_rc_nonzero "T29: 'seccomp-mode allow' with an empty allow-list refuses to run"
+want_out "T29: the refusal names the empty list" "seccomp allow-mode with empty list"
+
+# T30: the same profile with a real allow-list is reported as allow-list
+# mode (tools/syscall.py's generated profiles are the end-to-end half of
+# this, in aux-tools.sh).
+run "${CU}" --dry-run --profile "$(mkconf "scallow-some" "ro /usr" "seccomp-mode allow" \
+                                          "allow read" "allow write" "allow exit_group")" -- /bin/true
+want_rc "T30: 'seccomp-mode allow' with a list parses" 0
+want_out "T30: it is reported as allow-list mode" "ALLOW-LIST"
+
+echo ""
+
+# ── T36: --insecure, the degraded-enforcement escape hatch ───────────
+
+echo "--- Test group: --insecure (T36) ---"
+
+# The one flag that lets a run continue with enforcement degraded had no
+# test at all.
+run "${CU}" --help
+want_out "T36: --insecure is documented in --help" "--insecure"
+
+# On a host where preflight is clean it must change nothing: the flag
+# permits a degraded run, it does not create one.
+A_PLAIN="$("${CU}" --dry-run -- /bin/true 2>&1)"
+A_INSEC="$("${CU}" --insecure --dry-run -- /bin/true 2>&1)"
+if [ -n "${A_PLAIN}" ] && [ "${A_PLAIN}" = "${A_INSEC}" ]; then
+    pass "T36: --insecure does not change the policy when preflight is clean"
+else
+    fail "T36: --insecure changed the dry-run output on a clean host"
+fi
+
+run "${CU}" --insecure -- /bin/sh -c 'grep -E "^(NoNewPrivs|Seccomp):" /proc/self/status'
+want_out "T36: --insecure still applies no_new_privs" "NoNewPrivs:	1"
+want_out "T36: --insecure still installs the seccomp filter" "Seccomp:	2"
+
+# The degraded half needs a filesystem Landlock cannot enforce (9p, NFS,
+# CIFS or FUSE). Neither the host nor the guests have one, so it is a
+# stated skip rather than an untested claim.
+DEGRADED_MNT=""
+while read -r _dev _mnt _fstype _rest; do
+    case "${_fstype}" in
+        9p|nfs|nfs4|cifs|fuse|fuse.*) DEGRADED_MNT="${_mnt}"; break ;;
+    esac
+done < /proc/mounts
+if [ -z "${DEGRADED_MNT}" ]; then
+    skip_group 3 "T36: the degraded path needs a 9p/NFS/CIFS/FUSE mount; this host has none"
+else
+    run "${CU}" --ro "${DEGRADED_MNT}" -- /bin/true
+    want_rc_nonzero "T36: a path Landlock cannot enforce is refused without --insecure"
+    want_out "T36: the refusal names the preflight failure" "REFUSING to execute"
+    run "${CU}" --insecure --ro "${DEGRADED_MNT}" -- /bin/true
+    want_out "T36: --insecure runs it and says so" "INSECURE mode"
+fi
+
+echo ""
+
 echo "--- Test group: profile file trust (C1/C2) ---"
 
 cp "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${WORK}/ww.conf"
@@ -161,6 +324,29 @@ chmod 0644 "${WORK}/wwdir/p.conf"
 run "${CU}" --dry-run --profile "${WORK}/wwdir/p.conf" -- /bin/true
 want_rc_nonzero "trust: profile in a world-writable directory refused"
 want_out "trust: message names the directory" "profile directory"
+
+# The documented private-group exemption (HOWTO): umask 002 plus a
+# user-private group leaves everything a user creates at 0664, and
+# group-write is then no wider than owner-write because the group has
+# exactly one member. Assert the exemption in both directions here; the
+# refusal half needs a group the caller is not in and therefore lives in
+# root.d/profile-trust-root.sh.
+cp "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${WORK}/gw-private.conf"
+chmod 0664 "${WORK}/gw-private.conf"
+GW_GROUP_MEMBERS="$(getent group "$(id -g)" | cut -d: -f4)"
+if [ "$(id -gn)" = "$(id -un)" ] && [ -z "${GW_GROUP_MEMBERS}" ]; then
+    run "${CU}" --dry-run --profile "${WORK}/gw-private.conf" -- /bin/true
+    want_rc "trust: 0664 in your own private group is accepted" 0
+    mkdir -p "${WORK}/gwprivdir"
+    chmod 0775 "${WORK}/gwprivdir"
+    cp "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${WORK}/gwprivdir/p.conf"
+    chmod 0644 "${WORK}/gwprivdir/p.conf"
+    run "${CU}" --dry-run --profile "${WORK}/gwprivdir/p.conf" -- /bin/true
+    want_rc "trust: 0775 directory in your own private group is accepted" 0
+else
+    skip "trust: 0664 in your own private group (gid $(id -g) is not private)"
+    skip "trust: 0775 directory in your own private group (gid $(id -g) is not private)"
+fi
 
 # A sticky world-writable directory (/tmp) is fine: the sticky bit is what
 # stops a third party replacing the file.
@@ -394,8 +580,26 @@ want_out "M7: message names the problem" "not a private, self-owned directory"
 # ownership check); an intermediate revision of this branch moved it under
 # $HOME, which the built-in ai-agent profile grants rwx.
 AUD="/var/tmp/compartment-audit-$(id -u)"
-if [ -e "${AUD}" ]; then
-    skip "M7: default audit directory tests (${AUD} already exists)"
+# /var/tmp is world-writable and sticky, so any local user can pre-create
+# this directory — and so does any earlier --audit run. Skipping on it
+# turned ten assertions into one `skip` and took mutation M19 (audit log
+# moved into $HOME) from caught-by-nine-assertions to escaped, with one
+# mkdir. A leftover that is ours is removed; one that is not is an
+# environment failure, not a reason to stop testing.
+AUD_BLOCKED=""
+if [ -e "${AUD}" ] || [ -L "${AUD}" ]; then
+    if [ -L "${AUD}" ] || [ ! -d "${AUD}" ]; then
+        AUD_BLOCKED="${AUD} exists and is not a plain directory"
+    elif [ "$(stat -c %u "${AUD}" 2>/dev/null)" != "$(id -u)" ]; then
+        AUD_BLOCKED="${AUD} is owned by uid $(stat -c %u "${AUD}" 2>/dev/null), not by you"
+    else
+        rm -rf "${AUD}"
+        [ -e "${AUD}" ] && AUD_BLOCKED="${AUD} could not be removed"
+    fi
+fi
+if [ -n "${AUD_BLOCKED}" ]; then
+    fail "M7: the default audit directory is not testable here (${AUD_BLOCKED})"
+    skip_group 9 "M7: the remaining default-audit-directory assertions"
 else
     OUT="$("${CU}" --verbose --no-landlock --no-seccomp --audit -- /bin/true 2>&1 \
            | grep 'audit log:')"
@@ -415,9 +619,16 @@ FORGED user=root uid=0 event=NOTHING"
     : > "${NLCMD}"
     "${CU}" --no-landlock --no-seccomp --audit -- "${NLCMD}" >/dev/null 2>&1
     LOGF="$(ls "${AUD}/"*.log 2>/dev/null | head -1)"
+    # `grep -c event= == wc -l` is 0 -eq 0 on an empty file, so this
+    # passed when auditing had stopped entirely. Require at least one
+    # real record before comparing.
+    LOG_LINES=0
+    [ -n "${LOGF}" ] && LOG_LINES="$(wc -l < "${LOGF}")"
     if [ -z "${LOGF}" ]; then
         fail "M7: audit log file was not created"
-    elif [ "$(grep -c 'event=' "${LOGF}")" -eq "$(wc -l < "${LOGF}")" ] &&
+    elif [ "${LOG_LINES}" -lt 1 ]; then
+        fail "M7: the audit log is empty — nothing was recorded to forge"
+    elif [ "$(grep -c 'event=' "${LOGF}")" -eq "${LOG_LINES}" ] &&
          ! grep -q '^FORGED' "${LOGF}"; then
         pass "M7: newline in the command cannot forge a log record"
     else
@@ -524,7 +735,11 @@ want_out "M11: dump uses prefix env entries" "env-deny LD_*"
 chmod go-w "${WORK}/dumped.conf"
 A="$("${CU}" --dry-run --profile ai-agent -- /bin/true 2>&1 | grep -v 'profile')"
 B="$("${CU}" --dry-run --profile "${WORK}/dumped.conf" -- /bin/true 2>&1 | grep -v 'profile')"
-if [ "${A}" = "${B}" ]; then
+# Both sides are greps of tool output, so "" = "" satisfied this whenever
+# the tool printed nothing at all. Require a policy to have been printed.
+if ! printf '%s\n' "${A}" | grep -q 'landlock:'; then
+    fail "M11: the built-in dry-run printed no policy to compare against"
+elif [ "${A}" = "${B}" ]; then
     pass "M11: --dump-profile output reloads to the same policy"
 else
     fail "M11: dumped profile does not round-trip"
@@ -554,6 +769,13 @@ want_out "source: the audit line records where the policy came from" "source=bui
 echo ""
 
 # ── Summary ───────────────────────────────────────────────────────────
+
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total 124
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

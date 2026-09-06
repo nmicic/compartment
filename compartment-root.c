@@ -250,7 +250,8 @@ int main(int argc, char *argv[])
          * and the profile decides rootdir, username, cap-allow and the
          * seccomp policy. */
         int pr = resolve_and_load_profile(&config, config.profile, 0,
-                                          PROFILE_OWNER_ROOT);
+                                          PROFILE_OWNER_ROOT |
+                                          PROFILE_TOOL_ROOT);
         if (pr == PROFILE_ERROR) {
             fprintf(stderr, "compartment-root: profile '%s' was rejected "
                     "— refusing to run\n", config.profile);
@@ -259,7 +260,8 @@ int main(int argc, char *argv[])
         if (pr == PROFILE_NOT_FOUND) {
             fprintf(stderr, "compartment-root: unknown profile: %s\n",
                     config.profile);
-            profile_print_search_path(stderr, config.profile, PROFILE_OWNER_ROOT);
+            profile_print_search_path(stderr, config.profile,
+                                      PROFILE_OWNER_ROOT | PROFILE_TOOL_ROOT);
             return 1;
         }
     }
@@ -358,7 +360,8 @@ int main(int argc, char *argv[])
                             MAX_PATHS, CLI_WHERE, "mount-mask", optarg, 1) != 0)
                 return 1;
             break;
-        case 'L': config.audit_log_dir = optarg; config.audit = 1; break;
+        case 'L': free((void *)config.audit_log_dir);
+                  config.audit_log_dir = xstrdup(optarg); config.audit = 1; break;
         case 'l': config.loopback = 1; break;
         case 'S': config.use_seccomp = 0; break;
         case 'N': config.use_env_sanitize = 0; break;
@@ -647,6 +650,7 @@ int main(int argc, char *argv[])
                             config.blocked_syscalls[i]);
             }
         }
+        config_free_oneshot(&config);
         return 0;
     }
 

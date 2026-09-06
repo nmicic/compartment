@@ -237,11 +237,11 @@ Used by **both** tools:
 |-----------|-------|---------|
 | `block` | syscall name | `block ptrace` |
 | `allow` | syscall name (switches to allow-list) | `allow read` |
-| `seccomp-mode` | `allow` (or `allowlist`) switches to allow-list mode; **any other value, including a typo, means deny-list mode** | `seccomp-mode allow` |
+| `seccomp-mode` | `allow`/`allowlist` or `deny`/`denylist`; **any other value is a fatal parse error** | `seccomp-mode allow` |
 | `seccomp-default` | `errno`, `kill` or `log` (default `errno`) | `seccomp-default kill` |
 | `env-deny` | variable name or `PREFIX*` | `env-deny LD_*` |
 | `env-allow` | variable name or `PREFIX*` (switches to allow-list) | `env-allow PATH` |
-| `env-mode` | `allow` (or `allowlist`) switches to allow-list mode; **any other value, including a typo, means deny-list mode** | `env-mode allow` |
+| `env-mode` | `allow`/`allowlist` or `deny`/`denylist`; **any other value is a fatal parse error** | `env-mode allow` |
 | `seccomp` | `on` only | `seccomp on` |
 | `no-new-privs` | `on` only | `no-new-privs on` |
 | `env-sanitize` | `on` only | `env-sanitize on` |
@@ -280,13 +280,26 @@ isolation. See "Root-specific profile directives" below.
 
 Note the one name that differs between the two spellings: the profile
 directive is `cap-allow`, the command-line flag is `--cap-allowed`.
-Writing `cap-allowed` in a profile produces only an "unknown directive"
-warning and the capability is dropped.
+Writing `cap-allowed` in a profile is a **fatal parse error** from 1.4 —
+before that it was a warning and the run continued with the capability
+silently dropped.
 
-compartment-user silently ignores the compartment-root-only directives —
-they are recognised by the shared parser, so no "unknown directive" warning
-appears. Keep compartment-user and compartment-root policy in separate
-files.
+Since 1.4 the parser distinguishes three cases, because they are three
+different mistakes:
+
+* An **unknown directive** — a typo, or a flag spelling where a directive
+  was wanted — is a fatal parse error. A profile is policy; a line we
+  cannot read means we do not know what the policy is.
+* A directive belonging to **the other tool** is a warning that names the
+  tool (`'cap-allow' is a compartment-root directive; compartment-user
+  ignores it`) and the run continues. Sharing one file between the two is
+  a legitimate shape; doing it silently is not.
+* An **invalid value** for a directive that takes one — `seccomp-mode`,
+  `env-mode`, `net-default`, `seccomp-default`, `audit` — is a fatal
+  parse error naming the accepted values.
+
+Keeping compartment-user and compartment-root policy in separate files is
+still the recommendation; the warning tells you when you have not.
 
 ### `exec` on a file: a binary allow-list
 

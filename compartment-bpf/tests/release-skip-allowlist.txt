@@ -1,10 +1,11 @@
 # compartment-bpf — release-gate SKIP allowlist.
 # SPDX-License-Identifier: Apache-2.0
 #
-# `make check-release` scans the full `make check` transcript for the token
-# SKIP and FAILS on any line that does not match one of the extended regexes
-# below. The rule is: an unrecognised skip is a FAIL. Every accepted skip has
-# to be written down here, with a reason, where review can see it.
+# `make check-release` scans the full `make check` transcript
+# case-insensitively for the token "skip" and FAILS on any line that does
+# not match one of the extended regexes below. The rule is: an
+# unrecognised skip is a FAIL. Every accepted skip has to be written down
+# here, with a reason, where review can see it.
 #
 # Why the inversion. The gate used to grep for a DENYLIST of six known-bad
 # skip reasons (needs root / requires root / bpf not in active LSM / daemon
@@ -13,6 +14,15 @@
 #   SKIP BX-11-ld-preload-strict: spike fixtures missing (...)
 #   SKIP BX-12-abi-size-gate: bpftool map create failed (rc=255; ...)
 # passed the strict release gate on every VM, for every release.
+#
+# Why case-insensitive (1.4). The scan was `grep -a 'SKIP'`, so
+# "[check-profile-e2e] RUN_E2E=0 set; skipping" — which removes the whole
+# daemon end-to-end leg — was never even examined. The cost of the change
+# is the prose section at the end: lines that merely contain the word.
+#
+# The gate self-tests this file before using it: it runs the same scan
+# over a two-line fixture and requires that a deliberately unlisted
+# sentinel is reported. A gate that cannot fail is not a gate.
 #
 # Format: one POSIX extended regex per line; '#' comments and blank lines are
 # ignored. Matching is substring unless you anchor with ^ / $.
@@ -27,29 +37,77 @@
 ^\[negtest\] summary: PASS=[0-9]+ FAIL=[0-9]+ SKIP=[0-9]+$
 ^Summary: PASS=[0-9]+ FAIL=[0-9]+ SKIP=[0-9]+
 ^\[mesh\] [0-9]+ ENFORCED trials matched .* [0-9]+ SKIP
-^\[strict-launch\] summary: PASS=[0-9]+ FAIL=[0-9]+ SKIP=[0-9]+
-^\[bypass\] pass=[0-9]+ fail=[0-9]+ skip=[0-9]+
+^\[limitations\] [0-9]+ PASS / [0-9]+ FAIL / [0-9]+ SKIP$
+^RESULT [a-z-]+: pass=[0-9]+ fail=[0-9]+ skip=[0-9]+$
+^pin-regression: [0-9]+ passed, [0-9]+ failed, [0-9]+ skipped$
+^[[:space:]]*pass=[0-9]+ fail=[0-9]+ skip=[0-9]+$
 #
 # ---------------------------------------------------------------------------
-# 2. Optional packages the kvm bring-up scripts do not install. Installing
-#    aide and postgresql-common on the guest closes all four of these.
+# 2. PASS labels. A line whose verdict is PASS is not a skip verdict, whatever
+#    its prose says — several witnesses explain in their summary which
+#    optional sub-assertion they skipped and why (e.g. "no pinned counters;
+#    --stats rc=2; counter assertion skipped"), which is exactly the kind of
+#    detail we want them to keep printing.
 # ---------------------------------------------------------------------------
-^SKIP aide-e2e: aide not installed$
-^SKIP postgres-e2e: pg_lsclusters not present \(postgresql-common missing\)$
-^\[check-profile-e2e\] tests/profile-e2e/(aide|postgres)\.sh SKIP \(env unsupported\)$
-^SKIP[[:space:]]+T12: AIDE not present
+^PASS [A-Za-z0-9._-]+:
+^\[negtest\] PASS
+^\[PASS\]
 #
 # ---------------------------------------------------------------------------
-# 3. Documented out-of-scope classes. anon_bdev-backed filesystems are refused
+# 3. Suites that are deliberately not run standalone. Five of the seven
+#    scripts under tests/profile-e2e/ need a NONCE from the orchestrator
+#    (tests/profile-e2e.sh) and cannot run on their own; check-profile-e2e
+#    globs the directory and reports them rather than hiding them.
+# ---------------------------------------------------------------------------
+^\[check-profile-e2e\] tests/profile-e2e/[a-z-]+\.sh SKIP \(orchestrator-driven: needs tests/profile-e2e\.sh, not standalone\)$
+#
+# ---------------------------------------------------------------------------
+# 4. Documented out-of-scope classes. anon_bdev-backed filesystems are refused
 #    by the HIGH-1 loader gate on purpose (LIMITATIONS.md documents the class);
-#    nfs is out of scope for v0.
+#    nfs is out of scope for v0; the ME-24 rows are documentation cross-refs
+#    with no operation to perform. Each mesh SKIP now reaches stdout with its
+#    reason (it used to be a CSV row only), which is what lets these be
+#    written per-reason instead of as one wildcard over ten ME blocks.
 # ---------------------------------------------------------------------------
 ^\[mesh\] ME-22 (btrfs|overlay) SKIP: anon_bdev
 ^\[mesh\] ME-22 nfs SKIP: out-of-scope for v0$
-^\[mesh\] ME-2[0-9] .*SKIP: (doc-only|setup-unavail)
+^\[mesh\] SKIP: ME22-fs .* reason=refused-by-HIGH-1-loader-gate$
+^\[mesh\] SKIP: ME22-fs .* reason=out-of-scope-v0$
+^\[mesh\] SKIP: ME24-inotify .* reason=documented(-cross-ref)?$
+^\[mesh\] KNOWN-GAP: .*$
 #
 # ---------------------------------------------------------------------------
-# 4. Host fixtures that depend on the image. Noble's cloud image uses
-#    systemd-timesyncd, so /etc/chrony/chrony.conf does not exist there.
+# 5. Substrate the guest image does not provide. xfs is not installed on
+#    either guest, so ME-23's remount-ro leg has nothing to remount.
 # ---------------------------------------------------------------------------
-missing fixture: /etc/chrony/chrony\.conf
+^\[mesh\] SKIP: ME23-mount remount-ro-failed/.* reason=remount-failed$
+^\[mesh\] SKIP: ME23-mount .* reason=(xfs|tmpfs)-unavailable$
+#
+# ---------------------------------------------------------------------------
+# 6. Fixtures the guest image does not provide. Ubuntu 24.04's chrony
+#    package ships no NTS bootstrap certificates, and profiles/chronyd.conf
+#    seals two of them, so `--dry-run` on that profile reports two errors
+#    there and pin-regression T4.4 has nothing to reload. Installing chrony
+#    on the 24.04 guest makes T4.4 run and then FAIL for that reason, which
+#    is worse than a stated skip — the profile's portability is the real
+#    problem and is recorded as an open item. This line used to be a CSV row
+#    only, which is why its predecessor entry matched nothing.
+# ---------------------------------------------------------------------------
+^\[pin-regression\] SKIP T4\.4: missing fixture: /etc/chrony/chrony\.conf$
+#
+# ---------------------------------------------------------------------------
+# 7. Removed in 1.4, kept here as a record so nobody re-adds them:
+#      SKIP aide-e2e: aide not installed
+#      SKIP postgres-e2e: pg_lsclusters not present (postgresql-common missing)
+#      SKIP postgres-e2e: no postgres clusters configured
+#      SKIP T12: AIDE not present
+#    aide, postgresql-common and postgresql are in both kvm bring-up package
+#    lists now, so those four witnesses run for real. An allow-listed skip
+#    that a package would close is a package problem, not a gate problem.
+#
+#    Also removed as dead — nothing any suite in `make check` emitted
+#    matched them: '[strict-launch] summary: ...', '[bypass] pass=...' and
+#    '[mesh] ME-2[0-9] .*SKIP: (doc-only|setup-unavail)'. The chrony
+#    fixture entry was dead for a different reason — its only producer
+#    wrote a CSV row and never printed the line — and is above, anchored,
+#    now that it does.

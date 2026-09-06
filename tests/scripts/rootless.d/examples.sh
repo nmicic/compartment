@@ -26,15 +26,45 @@ SKIP=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
+
+# One skip standing in for a block of N assertions, so pass+fail+skip is
+# the same number on every machine (tests/scripts/lib/harness.sh).
+skip_group() {
+    local n="$1" reason="$2"
+    SKIP=$((SKIP + n))
+    echo "  SKIP: ${reason} (${n} assertions)"
+}
+
+# The suite declares its own assertion count, counting this check, so a
+# block that silently stops running fails instead of shrinking the total.
+harness_expect_total() {
+    local want="$1"
+    local got=$((PASS + FAIL + SKIP + 1))
+    if [ "${got}" -eq "${want}" ]; then
+        pass "suite ran all ${want} assertions"
+    else
+        fail "suite ran ${got} assertions, declared ${want} — a block was added, removed or silently skipped"
+    fi
+}
 vsay() { [ -n "${VERBOSE}" ] && echo "    $*" || true; }
 
 WORK="$(mktemp -d -t compartment-examples-XXXXXXXX)"
 SSHD_PID=""
+# The host-key group has to write inside ${HOME}/.ssh/paranoid — that is
+# the one path ssh.conf grants, and it is the policy under test — so the
+# fixture cannot live under ${WORK}. It can, however, be removed on every
+# exit path, which it was not: an abort left a directory in the user's
+# real ~/.ssh.
+EXAMPLES_KH=""
+EXAMPLES_KH_DIR=""
 cleanup() {
     [ -n "${SSHD_PID}" ] && kill "${SSHD_PID}" 2>/dev/null || true
+    [ -n "${EXAMPLES_KH}" ] && rm -f "${EXAMPLES_KH}"
+    [ -n "${EXAMPLES_KH_DIR}" ] && rmdir "${EXAMPLES_KH_DIR}" 2>/dev/null
     rm -rf "${WORK}"
+    return 0
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 echo "=== Example profile and script tests ==="
 echo ""
@@ -48,10 +78,27 @@ fi
 
 echo "--- Test group: example profiles parse ---"
 
+# A compartment-root profile parsed by compartment-user now warns, once
+# per root-only directive, that the directive belongs to the other tool —
+# which is the point of the 1.4 change and not a defect in the example.
+# Parse each profile with the tool it is written for.
 for conf in "${EXAMPLES}"/*.conf; do
     name="$(basename "${conf}")"
     ERR="${WORK}/${name}.err"
-    if "${CU}" --dry-run --profile "${conf}" -- /bin/true >/dev/null 2>"${ERR}"; then
+    if grep -qE '^[[:space:]]*rootdir[[:space:]]' "${conf}"; then
+        # compartment-root refuses a profile it does not own, so parse a
+        # root-owned copy is not possible here; --dry-run through
+        # compartment-user with the root directives ignored is still the
+        # syntax check this group is for, so filter the expected warnings.
+        "${CU}" --dry-run --profile "${conf}" -- /bin/true >/dev/null 2>"${ERR}.raw"
+        rc=$?
+        grep -vE "warning: '[a-z-]+' is a compartment-root directive" "${ERR}.raw" > "${ERR}"
+        if [ "${rc}" -eq 0 ]; then
+            pass "${name} parses"
+        else
+            fail "${name} does not parse: $(head -1 "${ERR}")"
+        fi
+    elif "${CU}" --dry-run --profile "${conf}" -- /bin/true >/dev/null 2>"${ERR}"; then
         pass "${name} parses"
     else
         fail "${name} does not parse: $(head -1 "${ERR}")"
@@ -136,8 +183,10 @@ else
 fi
 
 BAD_FLAGS=""
+FLAGS_SEEN=0
 while read -r tool flag; do
     [ -n "${flag}" ] || continue
+    FLAGS_SEEN=$((FLAGS_SEEN + 1))
     case "${tool}" in
         compartment-user) help="${WORK}/cu-help.txt" ;;
         compartment-root) help="${WORK}/cr-help.txt" ;;
@@ -147,8 +196,12 @@ while read -r tool flag; do
 done < <(grep -horE 'compartment-(user|root) --[a-z][a-z0-9-]*' \
              "${EXAMPLES}" 2>/dev/null \
          | sed -E 's/^(compartment-[a-z]+) (--.*)$/\1 \2/' | sort -u)
-if [ -z "${BAD_FLAGS}" ]; then
-    pass "every compartment-* flag named in examples/ exists in --help"
+# Zero matches meant zero loop iterations, an empty BAD_FLAGS and a pass
+# that had read nothing. Require the extractor to have found something.
+if [ "${FLAGS_SEEN}" -lt 1 ]; then
+    fail "the flag extractor found no compartment-* flag in examples/ — it has stopped matching"
+elif [ -z "${BAD_FLAGS}" ]; then
+    pass "every compartment-* flag named in examples/ exists in --help (${FLAGS_SEEN} checked)"
 else
     fail "examples/ recommend flags that do not exist:${BAD_FLAGS}"
 fi
@@ -227,7 +280,7 @@ echo "--- Test group: host-key verification against a local sshd ---"
 if ! command -v ssh >/dev/null 2>&1 || \
    ! command -v ssh-keygen >/dev/null 2>&1 || \
    [ ! -x /usr/sbin/sshd ]; then
-    skip "host-key verification (needs ssh, ssh-keygen and /usr/sbin/sshd)"
+    skip_group 3 "host-key verification (needs ssh, ssh-keygen and /usr/sbin/sshd)"
 else
     free_port() {
         if command -v python3 >/dev/null 2>&1; then
@@ -278,6 +331,12 @@ EOF
                 -p "${PORT}" nobody@127.0.0.1 true >"${out}" 2>&1
     }
 
+    # ssh.conf grants exactly one writable path in $HOME —
+    # `rw $HOME/.ssh/paranoid?` — so the fixture has to live there; that
+    # is the policy under test. What it must not do is survive an abort:
+    # the directory and the known_hosts file are registered with the EXIT
+    # trap here, and the directory is only removed when this suite
+    # created it.
     KH_DIR="${HOME}/.ssh/paranoid"
     KH_DIR_PREEXISTING=0
     [ -d "${KH_DIR}" ] && KH_DIR_PREEXISTING=1
@@ -285,6 +344,8 @@ EOF
     chmod 700 "${KH_DIR}"
     KH="${KH_DIR}/known_hosts.selftest.$$"
     ( umask 077; : > "${KH}" )
+    EXAMPLES_KH="${KH}"
+    [ "${KH_DIR_PREEXISTING}" -eq 0 ] && EXAMPLES_KH_DIR="${KH_DIR}"
 
     if start_sshd "${WORK}/hostkey_1"; then
         try_ssh host-a "${WORK}/ssh1.log" || true
@@ -315,20 +376,29 @@ EOF
                 fi
             fi
         else
-            skip "second sshd did not start"
+            skip "a changed host key is refused (second sshd did not start)"
         fi
         stop_sshd
     else
-        skip "throwaway sshd did not start: $(head -1 "${WORK}/sshd.log" 2>/dev/null)"
+        skip_group 3 "throwaway sshd did not start: $(head -1 "${WORK}/sshd.log" 2>/dev/null)"
     fi
 
     rm -f "${KH}"
-    [ "${KH_DIR_PREEXISTING}" -eq 0 ] && rmdir "${KH_DIR}" 2>/dev/null || true
+    [ "${KH_DIR_PREEXISTING}" -eq 0 ] && rmdir "${KH_DIR}" 2>/dev/null
+    EXAMPLES_KH=""
+    EXAMPLES_KH_DIR=""
 fi
 
 echo ""
 
 # ── Summary ────────────────────────────────────────────────────────
+
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total 61
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

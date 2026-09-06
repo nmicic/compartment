@@ -34,6 +34,7 @@
 
 import os
 import re
+import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -255,21 +256,82 @@ def extract_surfaces():
     return surfaces
 
 
+# Directories under tests/ that hold per-run artefacts rather than tests.
+# tests/results/ is written by run-mesh.sh, pin-regression.sh,
+# observe/run.sh and strict-launch/run.sh and is gitignored;
+# tests/mesh/build/ holds compiled stub ELFs whose string tables match the
+# very tokens this gate looks for. Scanning either means a surface whose
+# only real in-tree witness has been deleted still reads as covered,
+# because the previous run's output names it.
+CORPUS_PRUNE = {"results", "build", "__pycache__"}
+
+# Only files that contain test *logic* witness a surface. A data file that
+# merely lists names — tests/expected-links.txt names all 28 links, and
+# tests/release-skip-allowlist.txt names suites — would otherwise credit
+# every surface it mentions, which is the same defect as crediting a
+# comment: the name appears, nothing exercises it.
+CORPUS_SUFFIXES = (".sh", ".bash", ".c", ".h", ".py")
+
+
+def corpus_paths():
+    """Tracked test sources under tests/, in a deterministic order.
+
+    `git ls-files` is the authority: it is exactly the set that exists on
+    a fresh checkout, it is already sorted, and it cannot pick up a
+    gitignored artefact. The walk below is the fallback for a release
+    tarball or an exported tree, and prunes the same directories in the
+    same order — os.walk yields directories in filesystem order unless
+    the dirnames list is sorted in place, which is why an identical tree
+    produced different witness attributions on two machines."""
+    rel = os.path.relpath(TESTS_DIR, REPO)
+    try:
+        out = subprocess.run(["git", "-C", REPO, "ls-files", "-z", "--", rel],
+                             check=True, capture_output=True)
+        names = [n for n in out.stdout.decode().split("\0") if n]
+        if names:
+            keep = []
+            for n in sorted(names):
+                parts = n.split(os.sep)
+                if any(part in CORPUS_PRUNE for part in parts):
+                    continue
+                keep.append(os.path.join(REPO, n))
+            return keep
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    paths = []
+    for root, dirs, names in os.walk(TESTS_DIR):
+        dirs[:] = sorted(d for d in dirs if d not in CORPUS_PRUNE)
+        for fn in sorted(names):
+            paths.append(os.path.join(root, fn))
+    return sorted(paths)
+
+
+def has_shebang(path):
+    """An extensionless test script still counts."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(2) == b"#!"
+    except OSError:
+        return False
+
+
 def test_corpus():
     """Every test source under tests/ (scripts + C harnesses), excluding docs
     and the manifest itself, as a list of (path, raw_text, code_text) where
     code_text has comments removed."""
     files = []
-    for root, _dirs, names in os.walk(TESTS_DIR):
-        for fn in sorted(names):
-            if fn.endswith(".md") or fn == "coverage-manifest.tsv":
-                continue
-            p = os.path.join(root, fn)
-            try:
-                raw = read(p)
-            except OSError:
-                continue
-            files.append((os.path.relpath(p, REPO), raw, code_of(raw, fn)))
+    for p in corpus_paths():
+        fn = os.path.basename(p)
+        if fn.endswith(".md") or fn == "coverage-manifest.tsv":
+            continue
+        if not fn.endswith(CORPUS_SUFFIXES) and not has_shebang(p):
+            continue
+        try:
+            raw = read(p)
+        except OSError:
+            continue
+        files.append((os.path.relpath(p, REPO), raw, code_of(raw, fn)))
     return files
 
 

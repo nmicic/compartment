@@ -1,0 +1,49 @@
+# tests/bypass/expected-witnesses.txt
+#
+# The exact set of bypass witnesses run-local.sh must find. The runner
+# used to glob the list and fail only on an *empty* glob, so deleting or
+# renaming a witness silently shrank the suite and the allowlist entry
+# that swallows the tally ("N PASS / N FAIL / N SKIP over N scripts") is
+# unanchored and unbounded — a shrinking corpus was invisible at every
+# level.
+#
+# Adding a witness means adding its name here in the same commit.
+01-hardlink-unlink.sh
+02-truncate-no-open.sh
+03-mprotect-rw.sh
+04-name-to-handle.sh
+05-old-fd-write.sh
+06-splice-old-fd.sh
+07-mount-bind-decoy.sh
+08-mount-namespace.sh
+09-unlink-storm.sh
+10-detach-by-kill.sh
+11-rename-into-no-write-dir.sh
+12-deep-subtree-write.sh
+13-deep-rename-into-sealed.sh
+14-runtime-subtree-depth-cap.sh
+15-runtime-subtree-alias-invariants.sh
+16-setfacl-no-chmod.sh
+17-mount-inside-sealed-dir.sh
+18-chattr-no-chmod.sh
+19-utimes-no-chmod.sh
+20-umount-shadow.sh
+exec-domain/BX-1-bind-mount-actor.sh
+exec-domain/BX-10-hardlink-to-canonical-actor.sh
+exec-domain/BX-11-ld-preload-strict.sh
+exec-domain/BX-12-abi-size-gate.sh
+exec-domain/BX-13-candidate-pin-gate.sh
+exec-domain/BX-14-actor-self-mod.sh
+exec-domain/BX-15-prog-detach.sh
+exec-domain/BX-16-anon-bdev-refuse.sh
+exec-domain/BX-17-strict-launcher-runtime.sh
+exec-domain/BX-18-hardlink-actor-binary.sh
+exec-domain/BX-19-actor-never-exec.sh
+exec-domain/BX-2-mount-namespace.sh
+exec-domain/BX-3-hardlink-nonactor.sh
+exec-domain/BX-4-interpreter-chain.sh
+exec-domain/BX-5-setuid-actor.sh
+exec-domain/BX-6-fork-without-exec.sh
+exec-domain/BX-7-inplace-modify.sh
+exec-domain/BX-8-exec-then-fork-exec.sh
+exec-domain/BX-9-version-mismatch.sh

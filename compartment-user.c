@@ -888,7 +888,9 @@ int main(int argc, char *argv[])
             if (cfg_add_path(&cfg, CLI_WHERE, optarg, PATH_EXEC, 0) != 0)
                 return 1;
             break;
-        case 'W': cfg.workdir = optarg; break;
+        /* xstrdup, not optarg: config_free_oneshot() owns this field,
+         * and an argv pointer cannot be freed. */
+        case 'W': free((void *)cfg.workdir); cfg.workdir = xstrdup(optarg); break;
         case 'b': { /* --block */
             int nr = resolve_syscall(optarg);
             if (nr < 0) {
@@ -928,7 +930,8 @@ int main(int argc, char *argv[])
         case 'd': cfg.dry_run = 1; cfg.verbose = 1; break;
         case 'v': cfg.verbose = 1; break;
         case 'a': cfg.audit = 1; break;
-        case 'A': cfg.audit_log_dir = optarg; cfg.audit = 1; break;
+        case 'A': free((void *)cfg.audit_log_dir);
+                  cfg.audit_log_dir = xstrdup(optarg); cfg.audit = 1; break;
         case 'U': cfg.allow_insecure = 1; break;
         case 'V': return print_verify();
         case  4 : /* --net-bind */
@@ -979,10 +982,13 @@ int main(int argc, char *argv[])
         if (pr == PROFILE_NOT_FOUND) {
             if (strcmp(cfg.profile, "ai-agent") == 0) {
                 if (apply_profile_ai_agent(&cfg) != 0) return 1;
-                cfg.profile_source = "built-in";
+                /* Heap, not a literal: config_free_oneshot() frees this
+                 * field unconditionally, and a free() of .rodata is a
+                 * crash rather than a leak. */
+                cfg.profile_source = xstrdup("built-in");
             } else if (strcmp(cfg.profile, "strict") == 0) {
                 if (apply_profile_strict(&cfg) != 0) return 1;
-                cfg.profile_source = "built-in";
+                cfg.profile_source = xstrdup("built-in");
             } else {
                 fprintf(stderr, "compartment-user: unknown profile: %s\n",
                         cfg.profile);
@@ -1027,6 +1033,7 @@ int main(int argc, char *argv[])
     /* ── Dump the resolved policy as .conf and exit ─────────────── */
     if (dump) {
         dump_profile(&cfg);
+        config_free_oneshot(&cfg);
         return 0;
     }
 
@@ -1096,6 +1103,7 @@ int main(int argc, char *argv[])
                          ? defdir : "(none)"));
         }
         fprintf(stderr, "  command: %s\n", argv[optind]);
+        config_free_oneshot(&cfg);
         return 0;
     }
 
@@ -1196,5 +1204,6 @@ int main(int argc, char *argv[])
     execvp(argv[optind], &argv[optind]);
     fprintf(stderr, "compartment-user: exec %s: %s\n",
             argv[optind], strerror(errno));
+    config_free_oneshot(&cfg);
     return 127;
 }

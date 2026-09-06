@@ -202,7 +202,10 @@ and reserved) is the principled fix and is a follow-up, not part of v0.8.
   (unhooked upstream). Three factual corrections: frozen maps are already
   immune to `BPF_MAP_UPDATE_ELEM`; `bpf(BPF_LINK_DETACH)` returns
   `-EOPNOTSUPP` for an LSM link (the removal path is `unlink()` of the bpffs
-  pin); `fallocate(2)` is **not** covered by `security_file_permission()`.
+  pin); and `fallocate(2)` — which v0.8 recorded as *not* covered by
+  `security_file_permission()`, corrected in 1.4 after
+  `tests/limitations-witness.sh` measured it denied and audited on
+  6.8.0-139 and 7.0.0-31, on tmpfs and on ext4.
 - `README.md` hook table lists the v0.8 hooks explicitly and drops
   `task_free` (observe-only). `HOWTO.md` §7.1 names the hooks that actually
   implement `no-chmod` instead of two symbols that never existed.

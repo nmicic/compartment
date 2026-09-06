@@ -28,6 +28,26 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
 
+# One skip standing in for a block of N assertions, so pass+fail+skip is
+# the same number on every machine (tests/scripts/lib/harness.sh).
+skip_group() {
+    local n="$1" reason="$2"
+    SKIP=$((SKIP + n))
+    echo "  SKIP: ${reason} (${n} assertions)"
+}
+
+# The suite declares its own assertion count, counting this check, so a
+# block that silently stops running fails instead of shrinking the total.
+harness_expect_total() {
+    local want="$1"
+    local got=$((PASS + FAIL + SKIP + 1))
+    if [ "${got}" -eq "${want}" ]; then
+        pass "suite ran all ${want} assertions"
+    else
+        fail "suite ran ${got} assertions, declared ${want} — a block was added, removed or silently skipped"
+    fi
+}
+
 # ── Prerequisites ──────────────────────────────────────────────────
 
 echo "=== compartment-root root test suite ==="
@@ -44,26 +64,37 @@ if [ ! -x "${CR}" ]; then
     exit 1
 fi
 
+# busybox-static is a documented precondition, not something a test
+# suite installs. The previous version ran `apt-get install -y` on the
+# host, unprompted, and never removed the package: a test suite that
+# modifies the machine it is measuring is not a test suite.
+SUITE_TOTAL=101
+bail_skip() {
+    skip_group "${SUITE_TOTAL}" "$1"
+    echo ""
+    echo "=== Results ==="
+    echo "  PASS: ${PASS}"
+    echo "  FAIL: ${FAIL}"
+    echo "  SKIP: ${SKIP}"
+    echo ""
+    echo "SUMMARY compartment-root: pass=${PASS} fail=${FAIL} skip=${SKIP}"
+    echo "ALL TESTS PASSED"
+    exit 0
+}
+
 BUSYBOX=""
 for cand in /bin/busybox /usr/bin/busybox; do
     [ -x "$cand" ] && BUSYBOX="$cand" && break
 done
-if [ -z "${BUSYBOX}" ] && command -v apt-get >/dev/null 2>&1; then
-    echo "busybox not found — installing busybox-static"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y busybox-static >/dev/null 2>&1 || true
-    for cand in /bin/busybox /usr/bin/busybox; do
-        [ -x "$cand" ] && BUSYBOX="$cand" && break
-    done
-fi
 if [ -z "${BUSYBOX}" ]; then
-    echo "ERROR: busybox not available and could not be installed."
+    echo "busybox-static is a precondition of this suite:"
     echo "  apt-get install busybox-static"
-    exit 1
+    bail_skip "busybox-static is not installed (precondition, not installed by the suite)"
 fi
 if ldd "${BUSYBOX}" >/dev/null 2>&1; then
-    echo "ERROR: ${BUSYBOX} is dynamically linked; the rootdir must stand alone."
+    echo "${BUSYBOX} is dynamically linked; the rootdir must stand alone:"
     echo "  apt-get install busybox-static"
-    exit 1
+    bail_skip "${BUSYBOX} is dynamically linked (need busybox-static)"
 fi
 
 echo "  compartment-root: ${CR}"
@@ -289,13 +320,84 @@ echo ""
 
 echo "--- Test group: /proc and /sys masking (M6) ---"
 
+# The mask list is read from compartment-root's own --dry-run --verbose
+# output, so a path added to or removed from default_proc_masks[] is
+# scanned without editing this suite.
+MASK_LIST="$("${CR}" --dry-run --verbose -c "${JAIL}" "${CRUSER[@]}" -- /bin/true 2>&1 |
+             sed -n 's|^    \(/proc/[^ ]*\)$|\1|p')"
+MASK_COUNT="$(printf '%s\n' "${MASK_LIST}" | grep -c '^/proc/')"
+
+# The list above comes from the tool, so a path deleted from
+# default_proc_masks[] would simply stop being scanned. This is the
+# tracked half: every one of these must still be in the tool's own list,
+# and every one is scanned whether the tool names it or not. /proc/sys
+# unmasked is a container escape and /proc/sysrq-trigger unmasked is a
+# host DoS; neither may quietly leave the table.
+MASK_REQUIRED="/proc/acpi /proc/bus /proc/fs /proc/irq /proc/kallsyms
+/proc/kcore /proc/keys /proc/latency_stats /proc/modules /proc/sched_debug
+/proc/scsi /proc/sys /proc/sysrq-trigger /proc/timer_list /proc/timer_stats"
+for _r in ${MASK_REQUIRED}; do
+    if printf '%s\n' "${MASK_LIST}" | grep -qx -- "${_r}"; then
+        pass "mask table still contains ${_r}"
+    else
+        fail "mask table no longer contains ${_r}"
+    fi
+done
+MASK_LIST="$(printf '%s\n%s\n' "${MASK_LIST}" "${MASK_REQUIRED}" | tr ' ' '\n' | grep '^/proc/' | sort -u)"
+# The container-side scan takes the list as a single-line word list: a raw
+# newline inside a `for f in ...` list is a syntax error in dash/ash.
+MASK_LINE="$(printf '%s ' ${MASK_LIST})"
+
+# The scan proves the masking *mechanism*, not the byte count.  The old
+# predicate was `[ -s "$f" ]`, and procfs reports st_size == 0 for every
+# one of these but /proc/kcore, masked or not — so it could only ever have
+# detected an unmasked /proc/kcore, which the next assertion already
+# covers.  A masked directory is an empty read-only tmpfs mounted over the
+# path; a masked file is a bind of /dev/null.  Both are checked here, and
+# /proc/version — deliberately not in the mask list — is scanned alongside
+# them as a positive control, so a scanner that reports nothing is itself
+# a failure.
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
-    'for f in /proc/keys /proc/timer_list /proc/sched_debug /proc/kallsyms \
-              /proc/modules /proc/kcore /proc/sysrq-trigger; do
-       [ -s "$f" ] && echo "UNMASKED $f"
+    'dn=$(stat -Lc %d:%i /dev/null)
+     for f in '"${MASK_LINE}"' /proc/version; do
+       tag=MASKED
+       [ "$f" = /proc/version ] && tag=CONTROL
+       if [ ! -e "$f" ]; then echo "ABSENT $f"; continue; fi
+       if [ -d "$f" ]; then
+         if grep -q " $f " /proc/self/mountinfo &&
+            [ -z "$(ls -A "$f" 2>/dev/null)" ]; then
+           echo "${tag} $f"
+         else
+           echo "UN${tag} $f"
+         fi
+       elif [ "$(stat -Lc %d:%i "$f" 2>/dev/null)" = "$dn" ]; then
+         echo "${tag} $f"
+       else
+         echo "UN${tag} $f"
+       fi
      done; echo MASKSCAN'
 expect_contains "mask scan ran" "MASKSCAN"
-expect_not_contains "no unmasked /proc entry" "UNMASKED"
+# Positive control: the scanner must be able to say "not masked".  Without
+# this a scanner that silently produced no output would satisfy every
+# negative assertion below.
+expect_contains "mask scan is live (an unmasked path is reported as such)" \
+    "^UNCONTROL /proc/version$"
+expect_not_contains "no unmasked /proc entry" "^UNMASKED "
+
+if [ "${MASK_COUNT}" -ge 15 ]; then
+    pass "mask list has all ${MASK_COUNT} built-in entries"
+else
+    fail "mask list has only ${MASK_COUNT} entries (want >= 15)"
+fi
+
+# One assertion per mask, so an unmasked path names itself.
+for _m in ${MASK_LIST}; do
+    if printf '%s\n' "${RUN_OUT}" | grep -q "^ABSENT ${_m}$"; then
+        skip "/proc mask ${_m}: not present on this kernel"
+    else
+        expect_contains "/proc mask ${_m}" "^MASKED ${_m}$"
+    fi
+done
 
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'wc -c < /proc/kcore'
 expect_contains "/proc/kcore is empty" "^0$"
@@ -304,8 +406,54 @@ run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
     'grep " /sys " /proc/self/mountinfo || echo NOSYS'
 expect_contains "/sys mounted read-only" " ro,"
 
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /sys/firmware | wc -l'
-expect_contains "/sys/firmware masked (empty)" "^0$"
+# `ls DIR | wc -l` prints 0 when DIR does not exist, so an absent
+# /sys/firmware was scored as a masked one. Separate the two.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'if [ -d /sys/firmware ]; then
+       echo "FW=[$(ls -A /sys/firmware | tr "\n" " ")]"
+     else echo FW=ABSENT; fi'
+if printf '%s\n' "${RUN_OUT}" | grep -q '^FW=ABSENT$'; then
+    skip "/sys/firmware masked (this container got the empty-tmpfs /sys fallback)"
+else
+    expect_contains "/sys/firmware masked (an empty directory, not a missing one)" "^FW=\[\]$"
+fi
+
+echo ""
+
+# ── Test 5b: user-namespace credential hardening ───────────────────
+
+echo "--- Test group: user-namespace credentials (M6b) ---"
+
+# man/compartment-root.8: "The parent writes deny to /proc/<pid>/setgroups
+# before the gid map".  Nothing under tests/ used to mention setgroups at
+# all, so removing the write left every root assertion green while
+# /proc/self/setgroups flipped from deny to allow inside the container.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "setgroups=$(cat /proc/self/setgroups 2>&1)"'
+expect_contains "setgroups is denied in the user namespace" "^setgroups=deny$"
+
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "uidmap=$(tr -s " \t" " " < /proc/self/uid_map)";
+     echo "gidmap=$(tr -s " \t" " " < /proc/self/gid_map)"'
+expect_contains "uid_map is written" "^uidmap= *0 0 65536$"
+expect_contains "gid_map is written" "^gidmap= *0 0 65536$"
+
+# PR_SET_DUMPABLE(0) (man/compartment-root.8: "prevent ptrace from
+# outside").  procfs hands the files under /proc/<pid> to uid 0 of the
+# task's user namespace instead of its euid when the task is not
+# dumpable — but only the files, not the /proc/<pid> directory itself,
+# whose ownership the kernel deliberately keeps at the euid
+# (task_dump_owner()).  execve() resets dumpable, so the process that
+# still carries it is the PID 1 reaper, which never execs.  The target's
+# own status file is the built-in positive control: it must be owned by
+# the target uid, or the assertion above it would pass on any host where
+# procfs stopped reporting euid at all.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "reaper=$(stat -c %u /proc/1/status) target=$(stat -c %u /proc/$$/status)"'
+expect_contains "PR_SET_DUMPABLE(0): the reaper is not dumpable" \
+    "^reaper=0 "
+expect_contains "dumpable control: the exec'd target is owned by its own uid" \
+    " target=60000$"
 
 echo ""
 
@@ -330,14 +478,23 @@ expect_not_contains "/proc/1/root does not reach the host root" "boot"
 expect_contains "/proc/1/root is the container root or denied" "host\|Permission denied"
 
 # A directory fd opened by the caller must not survive into the container.
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /proc/self/fd | tr "\n" " "; echo' 9< /
-expect_not_contains "pre-opened host directory fd is closed" "^9$"
+# `ls | tr "\n" " "` collapses the listing to a single line, so the old
+# `grep -q "^9$"` could not match whether the fd leaked or not. Emit a
+# bracketed, space-delimited list and match " 9 " inside it.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "FDS=[ $(ls /proc/self/fd | tr "\n" " ")]"' 9< /
+expect_contains "fd listing captured (probe liveness)" "^FDS=\[ "
+expect_not_contains "pre-opened host directory fd is closed" "FDS=\[.* 9 "
 
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /host | wc -l'
 expect_contains "container root really is the jail" "^0$"
 
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'grep ^Groups /proc/self/status'
-expect_not_contains "supplementary groups cleared" "Groups:	0"
+# `expect_not_contains "Groups:\t0"` only fired when gid 0 happened to be
+# the *first* supplementary group; a container that inherited
+# `Groups: 1000 4 24` passed it.  Assert the list is empty instead.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "groups=[$(grep ^Groups /proc/self/status | cut -f2- | tr -d " \t")]"'
+expect_contains "supplementary groups cleared" "^groups=\[\]$"
 
 # A fresh pid namespace: only the reaper, the shell and its own children.
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
@@ -353,8 +510,10 @@ echo "--- Test group: container init (L4, L5) ---"
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'echo pid=$$'
 expect_contains "target runs under a PID 1 reaper" "pid=2"
 
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /proc/self/fd | tr "\n" " "; echo' 8< /etc/hostname
-expect_not_contains "inherited fd 8 closed before exec" "^8$"
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "FDS=[ $(ls /proc/self/fd | tr "\n" " ")]"' 8< /etc/hostname
+expect_contains "fd listing captured (probe liveness)" "^FDS=\[ "
+expect_not_contains "inherited fd 8 closed before exec" "FDS=\[.* 8 "
 
 # SIGTERM to compartment-root must reach the target through PID 1.
 "${CR}" -c "${JAIL}" "${CRUSER[@]}" -- /bin/sleep 30 >/dev/null 2>&1 &
@@ -390,9 +549,19 @@ echo ""
 
 echo "--- Test group: network namespace ---"
 
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /sys/class/net | tr "\n" " "; echo'
-expect_contains "fresh netns has only loopback" "lo"
-expect_not_contains "host interfaces not visible" "eth0"
+# `expect_not_contains "eth0"` passed on any host whose NIC is named
+# enp0s3 — i.e. every modern one — so dropping CLONE_NEWNET was invisible.
+# Assert the list is exactly "lo", with the host's own interface count as
+# the control that makes the assertion attributable.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "NETIF=[$(ls /sys/class/net | sort | tr "\n" " ")]"'
+expect_contains "fresh netns has only loopback" "^NETIF=\[lo \]$"
+HOST_IFCOUNT="$(ls /sys/class/net | wc -l)"
+if [ "${HOST_IFCOUNT}" -gt 1 ]; then
+    pass "control: the host has ${HOST_IFCOUNT} interfaces, so an empty netns is attributable"
+else
+    skip "control: the host itself has only one interface"
+fi
 
 # IFF_UP is bit 0 of /sys/class/net/lo/flags: 0x9 up, 0x8 down.  (ICMP is
 # not usable as a probe here — ping needs CAP_NET_RAW or a permissive
@@ -512,6 +681,13 @@ fi
 echo ""
 
 # ── Summary ────────────────────────────────────────────────────────
+
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total "${SUITE_TOTAL}"
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

@@ -332,9 +332,10 @@ In a profile the directive is spelled
 .BR cap\-allow ,
 not
 .BR cap\-allowed .
-Writing the flag spelling in a profile produces an "unknown directive"
-warning on stderr and the capability is dropped \(em the run continues
-without it, so the warning is the only signal. See
+Writing the flag spelling in a profile is a fatal parse error from 1.4:
+an unknown directive refuses the load rather than warning and continuing
+with the capability silently dropped. A directive belonging to the other
+tool is still accepted, with a warning that names the tool. See
 .B "PROFILE FORMAT"
 in
 .BR compartment\-user (1)

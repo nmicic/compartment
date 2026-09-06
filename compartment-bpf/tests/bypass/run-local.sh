@@ -49,6 +49,27 @@ if [ "$nscripts" -le 0 ]; then
 	exit 1
 fi
 
+# The glob only failed when it matched NOTHING, so deleting or renaming a
+# witness silently shrank the corpus — and the release allowlist entry for
+# the tally line is unanchored and unbounded, so it swallowed the smaller
+# number too. Compare the found set against the tracked one.
+expected="tests/bypass/expected-witnesses.txt"
+if [ ! -f "$expected" ]; then
+	echo "[bypass-local] FAIL — $expected is missing" >&2
+	exit 1
+fi
+found_list=$(mktemp /tmp/bypass-found.XXXXXX)
+want_list=$(mktemp /tmp/bypass-want.XXXXXX)
+printf '%s\n' $scripts | sed 's|^tests/bypass/||' | sort > "$found_list"
+grep -vE '^[[:space:]]*(#|$)' "$expected" | sort > "$want_list"
+if ! diff -u "$want_list" "$found_list" > /tmp/bypass-witness-diff.$$ 2>&1; then
+	echo "[bypass-local] FAIL — the witness set does not match $expected:" >&2
+	sed 's/^/  /' /tmp/bypass-witness-diff.$$ >&2
+	rm -f "$found_list" "$want_list" /tmp/bypass-witness-diff.$$
+	exit 1
+fi
+rm -f "$found_list" "$want_list" /tmp/bypass-witness-diff.$$
+
 pass=0; fail=0; skip=0; failed_list=""
 for script in $scripts; do
 	name=${script#tests/bypass/}
@@ -58,21 +79,33 @@ for script in $scripts; do
 	# BX-9 (~3s). REPO is exported so lib-bypass.sh finds the daemon/sealprobe.
 	timeout --kill-after=5s 60s bash "$script" >"$per" 2>&1 || true
 	cat "$per"
-	if grep -qE '^PASS ' "$per"; then
-		pass=$((pass + 1))
-	elif grep -qE '^SKIP ' "$per"; then
-		skip=$((skip + 1))
-	elif grep -qE '^FAIL ' "$per"; then
-		fail=$((fail + 1)); failed_list="$failed_list $name"
-	else
+	# Exactly one label per script. run-all.sh has enforced this since
+	# A-2 (2026-05-15) with an explicit comment: a multi-subtest script
+	# emitting more than one label can mask a sub-attack flipping from
+	# PASS to FAIL. This runner — the one `make check-bypass` uses —
+	# mirrored the no-label half and not the exactly-one half, so a
+	# witness printing both PASS and FAIL was counted as a PASS and the
+	# FAIL was discarded.
+	nlabels=$(grep -cE '^(PASS|FAIL|SKIP) ' "$per")
+	if [ "$nlabels" -eq 0 ]; then
 		# No label → FAIL (crash / set -e trip before bypass_pass/fail/skip).
 		echo "FAIL $name: script exited without a PASS/FAIL/SKIP label (false-green guard)"
 		fail=$((fail + 1)); failed_list="$failed_list $name(no-label)"
+	elif [ "$nlabels" -gt 1 ]; then
+		echo "FAIL $name: script emitted $nlabels PASS/FAIL/SKIP labels, expected exactly 1"
+		fail=$((fail + 1)); failed_list="$failed_list $name(${nlabels}-labels)"
+	elif grep -qE '^FAIL ' "$per"; then
+		fail=$((fail + 1)); failed_list="$failed_list $name"
+	elif grep -qE '^SKIP ' "$per"; then
+		skip=$((skip + 1))
+	else
+		pass=$((pass + 1))
 	fi
 	rm -f "$per"
 done
 
 echo "[bypass-local] $pass PASS / $fail FAIL / $skip SKIP over $nscripts scripts"
+echo "RESULT check-bypass: pass=$pass fail=$fail skip=$skip"
 if [ "$fail" -ne 0 ]; then
 	echo "[bypass-local] FAILED:$failed_list" >&2
 	exit 1

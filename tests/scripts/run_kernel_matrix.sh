@@ -65,7 +65,11 @@ if ! command -v vng >/dev/null 2>&1; then
     echo "ERROR: virtme-ng (vng) not found."
     echo "  Install: pip install virtme-ng"
     echo "       or: apt install virtme-ng"
-    exit 1
+    # A SUMMARY on every exit path, so `make test-kernels` reports a
+    # skipped suite rather than a bare exit code nothing sums.
+    echo "  SKIP: virtme-ng not installed"
+    echo "SUMMARY kernel-matrix: pass=0 fail=0 skip=1"
+    exit 77
 fi
 
 KVM_FLAG=()
@@ -99,8 +103,11 @@ run_kernel_test() {
     local test_name="$2"
     local cmd="$3"
     local expect_rc="${4:-0}"   # expected exit code (0=success, 1=expected failure)
-    # extra_args: array-safe via shift
-    shift 4 || true
+    # extra_args: array-safe. `shift 4 || true` with three arguments
+    # leaves $@ UNCHANGED in bash, which spliced the kernel name, the
+    # test name and the command itself into the vng argument list for
+    # every three-argument call — four of the eight tests per kernel.
+    if [[ $# -ge 4 ]]; then shift 4; else shift $#; fi
     local -a extra_args=("$@")
 
     TOTAL=$((TOTAL + 1))
@@ -111,9 +118,19 @@ run_kernel_test() {
                       --memory "$MEMORY" --cpus "$CPUS"
                       "${extra_args[@]}" --exec)
 
-    output=$("${vng_cmd[@]}" "$cmd" 2>&1) || rc=$?
+    # Liveness marker, the same discipline deny_probe uses. Every
+    # assertion here was rc-only, so an expect_rc=1 case passed when vng
+    # was missing, when the guest failed to boot, and when the command
+    # was never reached — the three ways this whole suite can report
+    # nothing while looking green.
+    local marker="KM_START_${TOTAL}"
+    output=$("${vng_cmd[@]}" "echo ${marker}; ${cmd}" 2>&1) || rc=$?
 
-    if [[ $rc -eq $expect_rc ]]; then
+    if ! printf '%s\n' "$output" | grep -q "${marker}"; then
+        echo "FAIL (the guest never ran the command)"
+        FAIL=$((FAIL + 1))
+        RESULTS="${RESULTS}FAIL  $kernel  $test_name  (no ${marker}: guest did not boot or vng is missing)\n"
+    elif [[ $rc -eq $expect_rc ]]; then
         echo "PASS"
         PASS=$((PASS + 1))
         RESULTS="${RESULTS}PASS  $kernel  $test_name\n"
@@ -214,6 +231,9 @@ echo ""
 echo -e "$RESULTS"
 echo "Total: $TOTAL  Pass: $PASS  Fail: $FAIL  Skip: $SKIP"
 echo ""
+# The runners sum this line; without it the suite could not be counted
+# even once it was wired in (tests/scripts/rootless.d/README.md).
+echo "SUMMARY kernel-matrix: pass=${PASS} fail=${FAIL} skip=${SKIP}"
 
 if [[ $FAIL -gt 0 ]]; then
     echo "SOME TESTS FAILED"

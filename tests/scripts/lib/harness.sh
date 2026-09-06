@@ -60,6 +60,43 @@ pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP + 1)); echo "  SKIP: $1"; }
 
+# skip_group N REASON — one skip standing in for a block of N assertions.
+#
+# A bare `skip` in front of a twenty-assertion block makes pass+fail+skip
+# depend on the machine: the same tree reported 45 assertions on the
+# developer's host and 25 in a stock 22.04 container, with `skip=1` as the
+# only trace. Counting the assertions that did not run keeps the total
+# invariant, so a drop in the total is itself a signal.
+skip_group() {
+    local n="$1" reason="$2"
+    SKIP=$((SKIP + n))
+    echo "  SKIP: ${reason} (${n} assertions)"
+}
+
+# skip_to_total N REASON — for a guard that stands in front of everything
+# the suite has left to do: skip exactly as many assertions as are still
+# owed against the declared total, so the count can never go stale.
+skip_to_total() {
+    local want="$1" reason="$2"
+    local owed=$((want - PASS - FAIL - SKIP - 1))
+    if [ "${owed}" -gt 0 ]; then
+        skip_group "${owed}" "${reason}"
+    fi
+}
+
+# harness_expect_total N — the suite declares how many assertions it
+# contains, counting this check.  A suite that silently grew or shrank
+# fails instead of quietly reporting a different number.
+harness_expect_total() {
+    local want="$1"
+    local got=$((PASS + FAIL + SKIP + 1))
+    if [ "${got}" -eq "${want}" ]; then
+        pass "suite ran all ${want} assertions"
+    else
+        fail "suite ran ${got} assertions, declared ${want} — a block was added, removed or silently skipped"
+    fi
+}
+
 # Print the summary line every suite must emit and set the exit status.
 harness_summary() {
     local name="${1:-suite}"

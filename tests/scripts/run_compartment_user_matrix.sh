@@ -327,6 +327,24 @@ expect_blocked "perf_event_open blocked"
 run_probe "$(harness_profile test-seccomp-deny.conf)" sc_io_uring_setup
 expect_blocked "io_uring_setup blocked"
 
+# ── The built-in deny-list, witnessed behaviourally ────────────────
+#
+# pidfd_getfd, mount_setattr and ioperm are container-escape blocks in
+# the *built-in* list, and until now the only thing that noticed when one
+# of them disappeared was a grep of --dump-profile text plus the
+# ai-agent.conf byte-compare. Removing pidfd_getfd from the built-in list
+# left every behavioural suite green. These run under the built-in
+# profile itself, so the assertion is about the shipped policy and not
+# about a fixture that restates it.
+run_probe ai-agent sc_pidfd_getfd
+expect_blocked "built-in deny-list: pidfd_getfd blocked"
+
+run_probe ai-agent sc_mount_setattr
+expect_blocked "built-in deny-list: mount_setattr blocked"
+
+run_probe ai-agent sc_ioperm
+expect_blocked "built-in deny-list: ioperm blocked"
+
 # Normal operations should still work (read, write, etc.)
 run_probe "$(harness_profile test-seccomp-deny.conf)" fs_read /etc/hostname
 expect_contains "fs_read still works with seccomp" "rc=0"
@@ -664,5 +682,11 @@ echo ""
 
 # ── Summary ───────────────────────────────────────────────────────
 
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total 60
 harness_summary "compartment-user-matrix" || exit 1
 exit 0

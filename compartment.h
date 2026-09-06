@@ -98,6 +98,7 @@ typedef struct {
     const char *path;
     PathMode    mode;
     int         optional;   /* trailing '?': skip silently when absent */
+    int         owned;      /* path is heap-allocated and ours to free */
 } PathRule;
 
 /* ── Mount flag rule (compartment-root) ─────────────────────────────
@@ -131,9 +132,15 @@ typedef struct {
     SeccompAction seccomp_default;   /* action for a call the filter denies */
 
     const char *env_deny[MAX_ENV_VARS];
+    /* Parallel ownership bits: an entry is heap-allocated when it came
+     * from a profile file, and a pointer into a built-in table or into
+     * argv when it did not. Without recording which is which, none of
+     * them could be freed. */
+    unsigned char env_deny_owned[MAX_ENV_VARS];
     int         env_deny_count;
 
     const char *env_allow[MAX_ENV_VARS];
+    unsigned char env_allow_owned[MAX_ENV_VARS];
     int         env_allow_count;
     int         env_allow_mode;      /* 0=deny-list, 1=allow-list */
 
@@ -738,6 +745,12 @@ static inline int cfg_add_path(Config *c, const char *where,
     }
     c->paths[c->path_count].mode     = mode;
     c->paths[c->path_count].optional = optional;
+    /* Whether this entry is ours to free. A '?' rule is always
+     * duplicated (the '?' has to be trimmed off a caller-owned string),
+     * and the `dup` argument decides for the rest — built-in tables and
+     * argv strings are not heap. Without the flag the mix could not be
+     * freed at all, which is what made detect_leaks=0 mandatory. */
+    c->paths[c->path_count].owned    = optional || dup;
     c->path_count++;
     return 0;
 }
@@ -804,6 +817,7 @@ static inline int cfg_add_env_deny(Config *c, const char *where,
 {
     if (c->env_deny_count >= MAX_ENV_VARS)
         return policy_full(where, "env-deny", name, MAX_ENV_VARS);
+    c->env_deny_owned[c->env_deny_count] = (unsigned char)(dup ? 1 : 0);
     c->env_deny[c->env_deny_count++] = dup ? xstrdup(name) : name;
     return 0;
 }
@@ -813,6 +827,7 @@ static inline int cfg_add_env_allow(Config *c, const char *where,
 {
     if (c->env_allow_count >= MAX_ENV_VARS)
         return policy_full(where, "env-allow", name, MAX_ENV_VARS);
+    c->env_allow_owned[c->env_allow_count] = (unsigned char)(dup ? 1 : 0);
     c->env_allow[c->env_allow_count++] = dup ? xstrdup(name) : name;
     c->env_allow_mode = 1;
     return 0;
@@ -1026,6 +1041,7 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
  * and who we are willing to accept it from are explicit choices. */
 #define PROFILE_SEARCH_USER  (1u << 0)  /* also search $HOME/.config/compartment */
 #define PROFILE_OWNER_ROOT   (1u << 1)  /* file and directory must be root-owned */
+#define PROFILE_TOOL_ROOT    (1u << 2)  /* the caller is compartment-root */
 
 /* Three-way result. "not found" lets the caller keep searching or fall
  * back to a built-in; "error" means the file exists but its contents are
@@ -1035,6 +1051,39 @@ static inline const char *expand_var(const char *input, char *buf, size_t bufsz)
 #define PROFILE_NOT_FOUND  1
 #define PROFILE_ERROR    (-1)
 
+
+/* ── Which tool owns which directive ─────────────────────────────
+ *
+ * Both tools share this parser, so each of them silently accepted — and
+ * ignored — every directive belonging to the other. `cap-allow` in a
+ * compartment-user profile did nothing and said nothing; so did
+ * `workdir` in a compartment-root one. A directive that is simply
+ * misspelled was a warning on stderr and the run continued with weaker
+ * policy than its author wrote.
+ *
+ * From 1.4: an unknown directive is fatal, and a directive that belongs
+ * to the *other* tool is a warning that names the tool, so the message
+ * tells the reader which of the two situations they are in. */
+static inline int directive_is_root_only(const char *d)
+{
+    static const char *const root_only[] = {
+        "rootdir", "uid", "gid", "username", "netns", "cgroup",
+        "cap-allow", "loopback", "uid-map", "gid-map", "mount-mask",
+        "rootdir-flags", NULL
+    };
+    for (int i = 0; root_only[i]; i++)
+        if (strcmp(d, root_only[i]) == 0)
+            return 1;
+    /* mount-ro / mount-rw / mount-noexec / mount-nosuid / mount-nodev */
+    return strncmp(d, "mount-", 6) == 0;
+}
+
+static inline int directive_is_user_only(const char *d)
+{
+    /* compartment-root has no working directory of its own: it pivots
+     * into the container root. */
+    return strcmp(d, "workdir") == 0;
+}
 
 /* ── Profile file trust ─────────────────────────────────────────── */
 
@@ -1258,6 +1307,26 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
         char where[PATH_MAX + 24];
         snprintf(where, sizeof(where), "%s:%d", path, lineno);
 
+        /* A directive meant for the other tool: warn, name the tool, and
+         * carry on. This is the one case where ignoring a line is right —
+         * a profile shared between the two is a legitimate shape — but it
+         * has to say so, because "compartment-user silently ignores every
+         * compartment-root directive" is how a cap-allow line reads as
+         * policy when it is not. */
+        int is_root_tool = (flags & PROFILE_TOOL_ROOT) != 0;
+        if (!is_root_tool && directive_is_root_only(directive)) {
+            fprintf(stderr, "compartment: %s:%d: warning: '%s' is a "
+                    "compartment-root directive; compartment-user ignores it\n",
+                    path, lineno, directive);
+            continue;
+        }
+        if (is_root_tool && directive_is_user_only(directive)) {
+            fprintf(stderr, "compartment: %s:%d: warning: '%s' is a "
+                    "compartment-user directive; compartment-root ignores it\n",
+                    path, lineno, directive);
+            continue;
+        }
+
         if (strcmp(directive, "ro") == 0) {
             if (cfg_add_path(cfg, where, val, PATH_RO, 1) != 0) {
                 fclose(fp); return PROFILE_ERROR;
@@ -1341,10 +1410,21 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "seccomp-mode") == 0) {
+            /* Anything that was not "allow"/"allowlist" used to select
+             * deny-list mode with no diagnostic, so a misspelled mode
+             * line silently swapped a default-deny allow-list for a
+             * default-allow deny-list. Every other value-taking
+             * directive already refuses an unknown value. */
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
                 cfg->seccomp_allow_mode = 1;
-            else
+            else if (strcmp(val, "deny") == 0 || strcmp(val, "denylist") == 0)
                 cfg->seccomp_allow_mode = 0;
+            else {
+                fprintf(stderr, "compartment: %s:%d: invalid value for "
+                        "seccomp-mode: '%s' (use allow/allowlist or "
+                        "deny/denylist)\n", path, lineno, val);
+                fclose(fp); return PROFILE_ERROR;
+            }
         } else if (strcmp(directive, "env-deny") == 0) {
             if (cfg_add_env_deny(cfg, where, val, 1) != 0) {
                 fclose(fp); return PROFILE_ERROR;
@@ -1356,9 +1436,16 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
         } else if (strcmp(directive, "env-mode") == 0) {
             if (strcmp(val, "allow") == 0 || strcmp(val, "allowlist") == 0)
                 cfg->env_allow_mode = 1;
-            else
+            else if (strcmp(val, "deny") == 0 || strcmp(val, "denylist") == 0)
                 cfg->env_allow_mode = 0;
+            else {
+                fprintf(stderr, "compartment: %s:%d: invalid value for "
+                        "env-mode: '%s' (use allow/allowlist or "
+                        "deny/denylist)\n", path, lineno, val);
+                fclose(fp); return PROFILE_ERROR;
+            }
         } else if (strcmp(directive, "workdir") == 0) {
+            free((void *)cfg->workdir);
             cfg->workdir = xstrdup(val);
         } else if (strcmp(directive, "landlock") == 0) {
             if (profile_switch(where, "landlock", "--no-landlock", val, &cfg->use_landlock) != 0) {
@@ -1382,6 +1469,7 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 fclose(fp); return PROFILE_ERROR;
             }
         } else if (strcmp(directive, "audit-log") == 0) {
+            free((void *)cfg->audit_log_dir);
             cfg->audit_log_dir = xstrdup(val);
             cfg->audit = 1;
         } else if (strcmp(directive, "inherit") == 0) {
@@ -1538,10 +1626,17 @@ static inline int load_profile_into(Config *cfg, const char *path, int depth,
                 fclose(fp); return PROFILE_ERROR;
             }
         } else {
-            /* Warn on unknown directives — typos silently weakening
-             * policy is a real risk in corporate deployments. */
-            fprintf(stderr, "compartment: %s:%d: warning: unknown directive '%s' (typo?)\n",
+            /* Fatal from 1.4. This was a warning on stderr and the run
+             * continued, so a misspelled security-relevant line — the
+             * one thing this diagnostic exists for — left the process
+             * running with weaker policy than its author wrote, and the
+             * warning scrolled past. A profile is policy: if we cannot
+             * read a line of it, we do not know what the policy is. */
+            fprintf(stderr, "compartment: %s:%d: unknown directive '%s'\n",
                     path, lineno, directive);
+            fprintf(stderr, "  a profile is policy; a line we cannot read "
+                    "means we do not know what the policy is\n");
+            fclose(fp); return PROFILE_ERROR;
         }
     }
     fclose(fp);
@@ -1640,6 +1735,85 @@ static inline int resolve_and_load_profile(Config *cfg, const char *name,
     }
 
     return PROFILE_NOT_FOUND;  /* caller falls back to a built-in */
+}
+
+/* config_free_oneshot — release the single-instance strings a Config
+ * owns outright.
+ *
+ * These are the allocations that made ASAN_OPTIONS=detect_leaks=0
+ * mandatory in CI, which in turn hid every real leak. The counted arrays
+ * hold a mix of duplicated profile values and non-heap argv/built-in
+ * pointers; the `dup` argument that used to decide is now recorded per
+ * entry (PathRule.owned, env_*_owned[]) so the mix can be freed
+ * correctly. cgroups[], cap_allowed_names[], mount_masks[] and
+ * mount_flags[] are duplicated at every call site, so they are owned
+ * unconditionally.
+ *
+ * Call it on any path that returns instead of exec'ing. After an
+ * execvp() the image is replaced and nothing runs, so it is only
+ * cosmetic there — but on --dry-run, --dump-profile, --verify and every
+ * error return it is what lets LeakSanitizer say something. */
+static inline void config_free_oneshot(Config *cfg)
+{
+    if (!cfg)
+        return;
+    for (int i = 0; i < cfg->path_count; i++) {
+        if (cfg->paths[i].owned) {
+            free((void *)cfg->paths[i].path);
+            cfg->paths[i].path = NULL;
+            cfg->paths[i].owned = 0;
+        }
+    }
+    for (int i = 0; i < cfg->env_deny_count; i++) {
+        if (cfg->env_deny_owned[i]) {
+            free((void *)cfg->env_deny[i]);
+            cfg->env_deny[i] = NULL;
+            cfg->env_deny_owned[i] = 0;
+        }
+    }
+    for (int i = 0; i < cfg->env_allow_count; i++) {
+        if (cfg->env_allow_owned[i]) {
+            free((void *)cfg->env_allow[i]);
+            cfg->env_allow[i] = NULL;
+            cfg->env_allow_owned[i] = 0;
+        }
+    }
+    for (int i = 0; i < cfg->cgroups_count; i++) {
+        free((void *)cfg->cgroups[i]);
+        cfg->cgroups[i] = NULL;
+    }
+    cfg->cgroups_count = 0;
+    for (int i = 0; i < cfg->cap_allowed_count; i++) {
+        free((void *)cfg->cap_allowed_names[i]);
+        cfg->cap_allowed_names[i] = NULL;
+    }
+    cfg->cap_allowed_count = 0;
+    for (int i = 0; i < cfg->mount_mask_count; i++) {
+        free((void *)cfg->mount_masks[i]);
+        cfg->mount_masks[i] = NULL;
+    }
+    cfg->mount_mask_count = 0;
+    for (int i = 0; i < cfg->mount_flags_count; i++) {
+        free((void *)cfg->mount_flags[i].path);
+        cfg->mount_flags[i].path = NULL;
+    }
+    cfg->mount_flags_count = 0;
+    free((void *)cfg->workdir);
+    cfg->workdir = NULL;
+    free((void *)cfg->audit_log_dir);
+    cfg->audit_log_dir = NULL;
+    free((void *)cfg->profile_source);
+    cfg->profile_source = NULL;
+    free(cfg->rootdir);
+    cfg->rootdir = NULL;
+    free(cfg->username);
+    cfg->username = NULL;
+    free(cfg->netns);
+    cfg->netns = NULL;
+    free(cfg->uid_map);
+    cfg->uid_map = NULL;
+    free(cfg->gid_map);
+    cfg->gid_map = NULL;
 }
 
 /* ── PPID chain (who launched us?) ─────────────────────────────── */

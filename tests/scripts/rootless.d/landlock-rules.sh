@@ -89,8 +89,13 @@ want_rc_nonzero() {
     fi
 }
 
+# Declared assertion count for the whole suite (see harness_expect_total).
+LANDLOCK_RULES_TOTAL=89
+
 if [ "${ABI}" -lt 1 ]; then
-    skip "Landlock not available on this kernel — no rule semantics to test"
+    skip_to_total "${LANDLOCK_RULES_TOTAL}" \
+        "Landlock not available on this kernel — no rule semantics to test"
+    harness_expect_total "${LANDLOCK_RULES_TOTAL}"
     harness_summary "landlock-rules" || exit 1
     exit 0
 fi
@@ -170,10 +175,16 @@ want_out "--verbose reports the ABI"                "ABI v${ABI}"
 # kernel rejected them with EINVAL and the tool still counted them.
 run "${CU}" --verbose "${BASE[@]}" -- /bin/true
 INSTALLED="$(printf '%s\n' "${RUN_OUT}" | sed -n 's/.*(ABI v[0-9]*, \([0-9]*\) of \([0-9]*\) path rules.*/\1 \2/p')"
-if [ "${INSTALLED% *}" = "${INSTALLED#* }" ]; then
-    pass "symlinked /lib and /lib64 install (${INSTALLED% *} of ${INSTALLED#* }) "
-else
+# On no match INSTALLED is empty and both halves of the comparison below
+# are the empty string, so the assertion passed having measured nothing.
+if [ -z "${INSTALLED}" ]; then
+    fail "no 'N of M path rules installed' line to read: $(printf '%s' "${RUN_OUT}" | tr '\n' '|' | cut -c1-160)"
+elif [ "${INSTALLED% *}" != "${INSTALLED#* }" ]; then
     fail "some rules did not install: ${INSTALLED}"
+elif [ "${INSTALLED% *}" -lt "${BASE_PATHS}" ]; then
+    fail "only ${INSTALLED% *} rules were even asked for (want >= ${BASE_PATHS})"
+else
+    pass "symlinked /lib and /lib64 install (${INSTALLED% *} of ${INSTALLED#* })"
 fi
 
 # One optional rule skipped means one fewer installed than asked for.
@@ -531,4 +542,10 @@ want_no_out "and produces no warning" "rewrite its own audit trail"
 
 echo ""
 
+# The suite declares its own assertion count. A block that stops
+# running — a `skip` standing in for twenty assertions, a group
+# guarded by a tool that is not installed — changes the total, and a
+# changed total is a failure rather than a smaller number nobody
+# compares against anything.
+harness_expect_total "${LANDLOCK_RULES_TOTAL}"
 harness_summary "landlock-rules" || exit 1

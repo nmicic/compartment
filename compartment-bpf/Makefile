@@ -7,7 +7,7 @@
 #
 # Targets:
 #   make            - build everything
-#   make vmlinux.h  - regenerate vmlinux.h from running kernel BTF
+#   make regen-vmlinux - re-dump vmlinux.h from the running kernel BTF
 #   make clean      - remove build artifacts
 # Tunables:
 #   make COMPARTMENT_MAX_DIR_ANCESTORS=32   - raise recursive subtree
@@ -67,17 +67,33 @@ check-env:
 	  test -r /usr/include/sodium.h || test -r /usr/local/include/sodium.h || { echo "error: <sodium.h> not found (apt install libsodium-dev)"; exit 1; }; \
 	fi
 
-vmlinux.h: check-env
+# check-env is .PHONY, and a .PHONY prerequisite is always out of date —
+# so vmlinux.h was re-dumped from kernel BTF on EVERY make, which
+# recompiled both BPF objects, regenerated both skeletons, relinked the
+# loader, and under sudo re-chowned the build artefacts to root. `make
+# check-mesh` after `make check-bypass` paid for a full rebuild it did
+# not need. Order-only (`|`) keeps the ordering guarantee — check-env
+# still runs first and still fails with its own diagnostic — without
+# making the target out of date.
+#
+# vmlinux.h is removed by `make clean`, so `make clean && make` re-dumps
+# it; that is the shape the guest validation uses when a tree moves
+# between kernels. `make regen-vmlinux` forces it in place.
+vmlinux.h: | check-env
 	$(BPFTOOL) btf dump file $(BTF) format c > $@.tmp
 	mv $@.tmp $@
 
-compartment.bpf.o: compartment.bpf.c compartment-abi.h vmlinux.h check-env
+regen-vmlinux:
+	rm -f vmlinux.h
+	$(MAKE) vmlinux.h
+
+compartment.bpf.o: compartment.bpf.c compartment-abi.h vmlinux.h | check-env
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 compartment.skel.h: compartment.bpf.o
 	$(BPFTOOL) gen skeleton $< name compartment_bpf > $@
 
-compartment-observe.bpf.o: compartment-observe.bpf.c vmlinux.h check-env
+compartment-observe.bpf.o: compartment-observe.bpf.c vmlinux.h | check-env
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 compartment-observe.skel.h: compartment-observe.bpf.o
@@ -89,7 +105,7 @@ compartment-bpf: compartment-bpf.c compartment-observe.c \
 		$(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f compartment-bpf compartment.bpf.o compartment.skel.h vmlinux.h.tmp
+	rm -f compartment-bpf compartment.bpf.o compartment.skel.h vmlinux.h vmlinux.h.tmp
 	rm -f compartment-observe.bpf.o compartment-observe.skel.h
 	rm -f tests/sealprobe tests/fuzz_oracle
 	rm -rf tests/mesh/build
@@ -289,6 +305,24 @@ check-actor-hook: compartment.bpf.o
 # detect-and-SKIP cleanly (rc=77) on a non-root / non-BPF developer host.
 check: check-coverage-static smoke smoke-pin check-inode-seal-witness check-bench-negtest smoke-counters smoke-telemetry smoke-actor check-parser-actor check-actor-hook check-profiles check-pin-passphrase check-profile-e2e check-mesh check-bypass check-codex-witnesses check-dir-matrix check-loader-refusal check-limit-stress check-wrapper check-strict-launch check-observe check-deny-candidate check-howto-examples
 
+# Appended as its own line rather than spliced into the 400-character
+# prerequisite list above: one target per line is reviewable, that list is
+# not. GNU make merges prerequisites declared for the same target as long
+# as only one declaration carries a recipe.
+check: check-limitations
+.PHONY: check-limitations regen-vmlinux
+
+# LIMITATIONS.md honest witnesses. Every "not enforced" row in that file
+# was prose with nothing under tests/ recording today's behaviour, so a
+# silent change in either direction was invisible — an upstream hook
+# appearing (docs go stale) or the transitive coverage that currently
+# compensates regressing (nothing says so). Root + BPF LSM; SKIPs
+# cleanly with rc=77 on a dev host, like its siblings.
+check-limitations: compartment-bpf test-tools
+	@rc=0; bash tests/limitations-witness.sh || rc=$$?; \
+	if [ "$$rc" = "77" ]; then exit 0; fi; \
+	exit $$rc
+
 # Coverage-gaps 2026-05-16 GAP-H-12: HOWTO §7.2 dir-destination
 # headliner regressed THREE V-6 cycles before this gate landed. Each
 # regression was a HOWTO.md edit only; no test asserted the example
@@ -329,14 +363,27 @@ check-strict-launch: compartment-bpf
 # the smoke VM that actually has both daemons). Set RUN_E2E=0 to opt
 # out (e.g. CI-side parallelism). Sub-script SKIP (rc=77) bubbles up
 # as a 'SKIP' line; FAIL (rc=1) hard-fails the gate fail-closed.
+#
+# The list is a glob, not two hard-coded names: five of the seven scripts
+# in that directory were reachable from nothing at all, and hard-coding
+# is how they got there. The five are orchestrator-driven (they require a
+# NONCE from tests/profile-e2e.sh and cannot run standalone), so they are
+# reported as a named skip rather than run and failed — visible in the
+# transcript, and gated by the release allowlist like every other skip.
 check-profile-e2e: compartment-bpf test-tools
 	@set -u; \
 	if [ "$${RUN_E2E:-1}" = "0" ]; then \
 	  echo "[check-profile-e2e] RUN_E2E=0 set; skipping"; \
 	  exit 0; \
 	fi; \
-	rc=0; \
-	for s in tests/profile-e2e/aide.sh tests/profile-e2e/postgres.sh; do \
+	rc=0; n=0; \
+	for s in tests/profile-e2e/*.sh; do \
+	  [ -f "$$s" ] || continue; \
+	  n=$$((n + 1)); \
+	  if grep -q 'NONCE missing from orchestrator' "$$s"; then \
+	    echo "[check-profile-e2e] $$s SKIP (orchestrator-driven: needs tests/profile-e2e.sh, not standalone)"; \
+	    continue; \
+	  fi; \
 	  echo "[check-profile-e2e] $$s"; \
 	  bash "$$s"; \
 	  srrc=$$?; \
@@ -346,6 +393,7 @@ check-profile-e2e: compartment-bpf test-tools
 	    echo "[check-profile-e2e] $$s FAIL (rc=$$srrc)"; rc=1; \
 	  fi; \
 	done; \
+	echo "[check-profile-e2e] $$n scripts considered"; \
 	exit $$rc
 
 # ED-11 (Leader-7): exercise the Argon2id unpin-passphrase sentinel
@@ -454,12 +502,13 @@ check-mesh: compartment-bpf test-tools mesh-stubs
 	@# ME11-perf row; this outer cap guards against pathological hangs
 	@# (e.g. daemon attach stuck, ringbuf consumer wedged) that would
 	@# otherwise leave CI hung indefinitely.
-	@# HIGH-8 (Review-3): ME-21 sequences directory must be root-owned;
-	@# run-mesh.sh FATALs on non-root-owned seq files as a security-by-
-	@# design check. Fix ownership here (check-mesh always runs as root).
-	@[ -d tests/mesh/sequences ] && \
-		chown -R 0:0 tests/mesh/sequences && \
-		chmod -R u=rwX,go=rX tests/mesh/sequences || true
+	@# HIGH-8 (Review-3): ME-21's sequences directory must be root-owned;
+	@# run-mesh.sh FATALs on non-root-owned seq files as a
+	@# security-by-design check. It now does that chown itself — and
+	@# restores the previous owner on exit, which the chown here never
+	@# did: a root-owned tests/mesh/sequences left behind in a checkout
+	@# makes every later `rsync` of the tree fail with "chgrp ...
+	@# Operation not permitted" on each file in it.
 	@timeout --preserve-status --kill-after=10s 120s bash tests/mesh/run-mesh.sh
 
 # HIGH-5: wrapper-aide regression gate. tests/actor-wrapper/run.sh
@@ -638,6 +687,14 @@ check-dir-matrix: compartment-bpf test-tools
 # preflight on every prerequisite, then the full check, then a scan that fails
 # if any core suite SKIPPED for an env reason that preflight should have
 # guaranteed away (missing root / BPF LSM / built daemon / sealprobe).
+# The skip scan carries its own self-test THROUGH itself rather than
+# beside it: a sentinel that no allowlist entry matches is appended to the
+# scan input, and the scan's own output has to contain it. Beside it, a
+# self-test would still pass with the real scan neutered — which is
+# exactly the mutation this guards against: replacing the scan with
+# `: > "$unknown"` made an injected, undocumented SKIP invisible and the
+# gate printed PASS. Carried through, an empty result means the scan did
+# not run, and that is a failure in itself.
 check-release: check-env
 	@echo "[check-release] strict preflight — no critical skips permitted"
 	@[ "$$(id -u)" -eq 0 ] || { echo "[check-release] FAIL: must run as root"; exit 1; }
@@ -646,17 +703,45 @@ check-release: check-env
 	@test -r /sys/kernel/btf/vmlinux || { echo "[check-release] FAIL: kernel BTF not readable"; exit 1; }
 	@command -v bpftool >/dev/null || { echo "[check-release] FAIL: bpftool missing"; exit 1; }
 	@command -v clang >/dev/null || { echo "[check-release] FAIL: clang missing"; exit 1; }
+	@[ "$${RUN_E2E:-1}" != "0" ] || { echo "[check-release] FAIL: RUN_E2E=0 removes the daemon end-to-end leg from a release run"; exit 1; }
 	@echo "[check-release] preflight OK — running full suite"
-	@log=$$(mktemp); ok=1; \
-	$(MAKE) check 2>&1 | tee "$$log" || ok=0; \
-	if [ "$$ok" -ne 1 ]; then echo "[check-release] FAIL: make check returned non-zero"; rm -f "$$log"; exit 1; fi; \
+	@# The status of a pipeline is its LAST command's, so the pre-1.4
+	@# `$(MAKE) check 2>&1 | tee "$$log" || ok=0` could never set ok=0 —
+	@# there is no `pipefail` anywhere in this Makefile and recipes run
+	@# under /bin/sh. Capturing make's own status in a file keeps the
+	@# live output a seven-minute gate needs AND gets the status right.
+	@log=$$(mktemp); rcf=$$(mktemp); \
+	{ $(MAKE) check 2>&1; echo $$? > "$$rcf"; } | tee "$$log"; \
+	rc=$$(cat "$$rcf"); rm -f "$$rcf"; \
+	if [ "$$rc" -ne 0 ]; then \
+	  echo "[check-release] FAIL: make check returned $$rc"; rm -f "$$log"; exit 1; \
+	fi; \
+	if grep -q '^FAIL ' "$$log"; then \
+	  echo "[check-release] FAIL: a suite printed a FAIL line:"; \
+	  grep -n '^FAIL ' "$$log" | sed 's/^/  /'; \
+	  rm -f "$$log"; exit 1; \
+	fi; \
+	if ! sh tests/release-totals.sh "$$log"; then \
+	  echo "[check-release] FAIL: a suite is below its tracked assertion floor (above)"; \
+	  rm -f "$$log"; exit 1; \
+	fi; \
 	if grep -nEi 'SKIP.*(needs root|requires root|bpf not in active LSM|daemon not built|sealprobe not built|bpftool not available)' "$$log"; then \
 	  echo "[check-release] FAIL: a core suite SKIPPED for an env reason preflight should have guaranteed away (above)"; \
 	  rm -f "$$log"; exit 1; \
 	fi; \
-	pats=$$(mktemp); unknown=$$(mktemp); \
+	pats=$$(mktemp); unknown=$$(mktemp); scanin=$$(mktemp); \
 	grep -vE '^[[:space:]]*(#|$$)' tests/release-skip-allowlist.txt > "$$pats"; \
-	grep -a 'SKIP' "$$log" | grep -avE -f "$$pats" > "$$unknown" || true; \
+	cat "$$log" > "$$scanin"; \
+	printf '%s\n' 'SKIP __release-gate-selftest__: deliberately not in the allowlist' >> "$$scanin"; \
+	grep -ai 'skip' "$$scanin" | grep -avEi -f "$$pats" > "$$unknown" || true; \
+	if ! grep -q '__release-gate-selftest__' "$$unknown"; then \
+	  echo "[check-release] FAIL: the gate's own skip scan did not run — its output does"; \
+	  echo "[check-release]       not contain the self-test sentinel that no allowlist entry"; \
+	  echo "[check-release]       matches. A gate that cannot fail is not a gate."; \
+	  rm -f "$$log" "$$pats" "$$unknown" "$$scanin"; exit 1; \
+	fi; \
+	grep -v '__release-gate-selftest__' "$$unknown" > "$$scanin"; \
+	mv "$$scanin" "$$unknown"; \
 	if [ -s "$$unknown" ]; then \
 	  echo "[check-release] FAIL: unrecognised SKIP line(s). Every skip must match a documented"; \
 	  echo "[check-release]       entry in tests/release-skip-allowlist.txt — an unknown skip is a FAIL,"; \
