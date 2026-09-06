@@ -733,6 +733,10 @@ confines a *session*; it does not create a uid boundary, and it does not
 protect against a root process that was never in the session. That second
 adversary is what the seal profile is for, and both halves are needed.
 
+The complete list of what this deployment does **not** protect against is
+§8 below. It is one list, deliberately, so that it can be read in full
+before the first login rather than assembled from the profile comments.
+
 ### 1. The account
 
 ```bash
@@ -866,6 +870,16 @@ account maintenance: the account database is sealed shut, so `passwd(1)` and
 mount on or under a sealed path, so the mask fails — and a failed mask
 refuses the login.
 
+Consider adding `--self-protect` to that `--pin` line. Without it, anything
+outside the session holding `CAP_BPF` owns the seals (§8, item 11); with it,
+every map fd and the whole pin tree are behind the loader's own binary
+identity. It is off by default because it changes the upgrade ceremony — a
+rebuilt or upgraded loader is a different inode and cannot `--unpin` what
+this one pinned unless it was named with `--authorize-loader` at pin time.
+Read `compartment-bpf/HOWTO.md` §3.6 for that ceremony and the
+self-protection section of `compartment-bpf/LIMITATIONS.md` for what the
+flag still does not close, before turning it on.
+
 ### 6. Recommended one-way sysctls
 
 ```bash
@@ -907,22 +921,218 @@ rm /etc/compartment/shell-replacement.conf
 usermod -s /bin/shells/bash radmin       # or ln -sf /bin/shells/bash /bin/bash
 ```
 
-### 8. Residual risks
+### 8. What limited root does not protect against
 
-Copied from the design notes, because they are the reason this is a
-defence-in-depth layer and not a boundary.
+This is the whole list, in one place, so that anyone building a restricted
+maintenance shell on top of this deployment can judge the fit without
+reading the design notes. It is the reason this is a defence-in-depth layer
+and not a boundary. Everything below was measured on kernel 6.8.0-139
+(Landlock ABI 4) and on 7.0.0-31 (Landlock ABI 8).
 
-| # | What is still open | Why |
-|---|---|---|
-| 1 | New privileged unix sockets appear with distribution updates and the mask list will not know about them | Landlock has no right covering `connect(2)` to a pathname unix socket, and seccomp cannot filter `connect`'s address family — it is behind a pointer. Re-run `find /run -type s` after an upgrade |
-| 2 | sshd forwarding | sshd is outside the session by design; closed by configuration plus the `sshd_config` seal, not by enforcement |
-| 3 | `internal-sftp` | never execs a shell, so the wrapper is not on the path |
-| 4 | Signals out of the domain below Landlock ABI v6 | no scope primitive before Linux 6.12; a denial-of-service surface, and the reason the seal profile must be pinned rather than run as a daemon |
-| 5 | A process holding `CAP_BPF` owns the seals | it can unlink the pin tree, delete the unpin sentinel and take the legacy unpin path, or rewrite the task-storage marker map. This deployment makes `CAP_BPF` the only way in; it does not defend `CAP_BPF` itself |
-| 6 | An fd received over `SCM_RIGHTS` from an unconfined process is not re-checked | Landlock has no hook for it |
-| 7 | `memfd` + `fexecve` runs code the policy never named | Landlock has no mmap hook and an anonymous file has no path. The code still runs inside the same domain, filter and capability set |
-| 8 | uid 0 is uid 0 | no uid boundary is created; the Landlock allow-list is the only thing between the account and the filesystem, and DAC contributes nothing. Read policy matters as much as write policy — `ro /etc` means the account can read `/etc/shadow` |
-| 9 | The account cannot run `compartment-root`, `sandbox.sh` HARD mode, or this project's own root test suite | `CAP_SYS_ADMIN` is dropped. A CI runner must not be a limited root |
+**1. uid 0 is still uid 0.** Nothing here creates a uid boundary. The
+account *is* uid 0, it keeps `CAP_DAC_OVERRIDE`, and DAC therefore
+contributes nothing: the Landlock allow-list is the only thing between the
+account and the filesystem. That makes **read** policy exactly as
+load-bearing as write policy, which is the trap most easily walked into —
+`ro /etc` is a comfortable-looking rule that hands over `/etc/shadow`,
+every private key stored under `/etc`, and whatever else lives there. Name
+the directories the account actually needs to read, the way the
+`ro /sys/class`, `ro /sys/devices` lines in the shipped profile do, rather
+than granting a tree and hoping.
+
+**2. The `mask` list is an enumeration, not a boundary.** Landlock has no
+access right covering `connect(2)` to a unix socket named by a path —
+measured: under a domain that returned `EACCES` for `open()` on the socket
+path, `connect()` to that same path still succeeded — and seccomp cannot
+take up the slack, because that call's address family sits behind a pointer
+a filter cannot dereference. So every privileged socket has to be named
+individually, and a distribution that adds one adds a hole with no warning.
+Re-run `find /run -type s` after every distribution upgrade and compare it
+against the `mask` lines. Two things would end this, and neither is in
+1.4.0: an **allow-list form of `mask`** — a tmpfs over `/run` with the
+handful of paths an administrative session needs bound back — which needs a
+survey of what such a session actually touches under `/run` before it can
+ship; and a **BPF socket ACL**, which would let a policy allow a socket for
+one operation instead of removing it from the namespace. Until one lands,
+treat the list as something to re-check, not as a wall.
+
+**3. A mask neutralises a write; it does not refuse one.** A mask over
+anything that is not a directory is a bind of `/dev/null`, and Landlock
+keys its rules on inodes, so the cover inherits the profile's
+`rw /dev/null`: the open succeeds and the bytes go nowhere. Remounting the
+bind read-only changes nothing either — the kernel's read-only-filesystem
+check covers regular files, directories and symlinks, never device nodes.
+Nothing leaks and nothing reaches the target, but the caller is told it
+succeeded. **Use `mask` for read and connect surfaces, and a Landlock rule
+for write surfaces**, where the open is refused outright. In the shipped
+profile that is why `/proc/kcore`, `/dev/mem`, `/dev/kmem`, `/dev/port`,
+`/sys/kernel/debug` and `/sys/kernel/tracing` are masked — all read
+surfaces — while `/proc/sysrq-trigger` deliberately is not: `ro /proc`
+already refuses that open, and a mask would have downgraded a refused
+reboot trigger into an accepted one.
+
+**4. A path cannot be both sealed and masked.** compartment-bpf refuses a
+new mount on or under a sealed path, so the mask fails; and because masks
+fail closed, a failed mask refuses the login. `/boot` is sealed and
+deliberately not masked for this reason. Nothing in either tool catches the
+conflict at load time — it surfaces at the next login — which is why the
+two profiles have to be reviewed together.
+
+**5. Below Landlock ABI v6 the session can signal processes outside its
+domain.** There are no scoped rules before Linux 6.12, so on a 6.8 kernel
+the confined account can signal anything its uid allows, which as uid 0 is
+everything. It is a denial-of-service surface rather than an escape, and it
+is the reason **`--pin` is mandatory** for the seal profile: a
+`compartment-bpf` daemon is a process, a same-uid session can kill it, and
+killing it takes enforcement with it. `--pin` leaves nothing to kill — the
+links live in the bpffs pin tree, which no rule in `limited-root.conf`
+grants. A `scope signal` directive would close this on kernels that have
+the primitive (verified: a scoped ruleset makes `kill(1, 0)` return `EPERM`
+on ABI 8, while on ABI 4 the extra ruleset attribute makes
+`landlock_create_ruleset` fail `E2BIG`), and it was deliberately left out of
+1.4.0 — a half-tested signal scope in an administrative shell is a good way
+to break job control on the one kernel that supports it.
+
+**6. sshd routes around the confinement two ways, and only configuration
+closes them.** sshd is outside the session by design — it is what *creates*
+the session — so anything it does on the account's behalf never enters the
+domain:
+
+* **stream-local forwarding.** `ssh -L /tmp/s:/run/systemd/private radmin@host`
+  makes *sshd* open the socket the profile masks, and the account then
+  talks to PID 1 through the forwarded fd;
+* **`internal-sftp`**, which runs in-process in the sshd child and never
+  execs a shell, so the wrapper is not on the path at all.
+
+Both are closed by these lines and by nothing else — there is nothing to
+implement, only something not to get wrong:
+
+```
+# /etc/ssh/sshd_config.d/50-limited-root.conf
+Match User radmin
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    PermitTunnel no
+    X11Forwarding no
+    PermitOpen none
+    PermitListen none
+```
+
+```
+# and keep the EXTERNAL sftp subsystem, which OpenSSH runs through the
+# login shell — never internal-sftp
+Subsystem sftp /usr/lib/openssh/sftp-server
+```
+
+Both validation guests shipped the permissive forwarding default, so this
+is a step the operator takes and not one the distribution takes for them.
+The seal on `sshd_config` in the auth-path profile is what keeps the
+setting from being edited back; configuration on its own would be a control
+the adversary can write to.
+
+**7. An `actor=` identity is forgeable from outside the session.** A seal
+written `actor=NAME` decides who may write by resolving the caller's
+`current->mm->exe_file`, and a process holding `CAP_SYS_RESOURCE` can point
+that at another binary with `PR_SET_MM_EXE_FILE`. *Inside* the session this
+is already closed: `cap-drop CAP_SYS_RESOURCE` is in the profile, and the
+capability check runs before the mapping check, so the call returns `EPERM`
+regardless of state (measured on both kernels). *Outside* it, an unconfined
+root holding that capability can take on an actor identity its own binary
+does not earn. compartment-bpf has the hook that stops it — `comp_task_prctl`
+denies the whole `PR_SET_MM` family — but it is armed only under a
+strict-launch policy, and the shipped auth-path profile uses plain
+`actor=`. Three ways to close it, cheapest first:
+
+1. **Do not put `actor=` on the path at all.** A seal with no actor is shut
+   to everybody, forgery included. That is what the shipped auth-path
+   profile already does for the account database, `sshd_config`, PAM and
+   `ld.so.preload` — every path where the honest answer to "who may write
+   this while the policy is loaded?" is "nobody". Prefer it wherever it
+   fits; the residual only applies to the seals that must name a writer.
+2. **A directive that arms the `PR_SET_MM` denial on its own** — not in
+   1.4.0. The hook exists and the gate is the missing half: there is no way
+   today to switch it on without adopting the whole strict-launch
+   deployment.
+3. **`actor-strict` plus a statically linked launcher**
+   (`compartment-bpf/HOWTO.md` §2.3.x). This is the answer that ships
+   today, and it is the largest change: the seal carries `strict-launch`,
+   the identity moves from `mm->exe_file` to an in-kernel launch marker set
+   at a committed exec of the declared launcher, and the launcher must be
+   static and sealed `full` in the same profile. Whether this deployment
+   should carry one is a decision to take once, together with the
+   strict-launch work, rather than separately in each profile.
+
+**8. Two things a Landlock domain cannot see.** An fd received over
+`SCM_RIGHTS` from an unconfined process is not re-checked — there is no
+hook, so a descriptor passed into the session carries whatever access it
+was opened with. (The `compartment-bpf` seals are not fooled the same way:
+`comp_file_permission` resolves the caller from `current->mm->exe_file`,
+not from whoever opened the fd.) And `memfd` + `fexecve` runs code the
+policy never named, because an anonymous file has no path for a rule to
+match and Landlock has no mmap hook. That second one is bounded: the code
+still runs inside the same Landlock domain, the same seccomp filter and the
+same capability bounding set as everything else in the session.
+
+**9. Service management is not available, on purpose.** The masks over
+`/run/systemd/private` and `/run/dbus/system_bus_socket` are exactly what
+make `systemctl`, `systemd-run` and every other bus client report
+`Failed to connect to bus: Connection refused` inside the session. That is
+the intended result — each of those is a way to ask an unconfined daemon to
+do what the session may not — but it is a real cost and it should be priced
+before deploying: this account cannot restart a unit, reload a daemon or
+launch a transient one, and on systemd ≥ 257 the varlink interface to PID 1
+is masked for the same reason. Reading is unaffected where it does not go
+through PID 1 — `ro /var/log` keeps the log files readable. If the
+account's job genuinely needs service management, the answer is not to drop
+the masks, which gives back the entire surface, but one of the two
+directions in item 2: a **broker** that accepts a fixed, audited set of
+unit operations on the account's behalf, or the **BPF socket ACL**, which
+could allow one socket for one operation. Neither is in 1.4.0.
+
+**10. The account cannot run this project's own privileged tools.**
+`cap-drop CAP_SYS_ADMIN` costs `mount`, `umount`, `setns`, `unshare`,
+`pivot_root` and `nsenter`, and with them `compartment-root`, `sandbox.sh`
+HARD mode and `sudo make test-root`. Worth recording loudly, because the
+failure looks like a broken build rather than a policy decision: **a CI
+runner must not be a limited root.**
+
+**11. Anything holding `CAP_BPF` outside the session owns the seals, unless
+self-protection is on.** This deployment makes `CAP_BPF` the only way to
+reach the auth-path seals — `cap-drop CAP_BPF` takes it from the session,
+seccomp blocks `bpf`, and no rule grants `/sys/fs/bpf` — but on its own it
+does nothing to defend `CAP_BPF` itself. A uid-0 process that was never in
+the session (cron, a unit, an sshd session for an account whose shell is
+not the wrapper) and that holds the capability can unlink the pin tree,
+delete `/run/compartment-bpf/unpin-sentinel` and take the legacy
+no-passphrase unpin path, or rewrite the seal maps outright — freezing does
+not stop that, because `bpf_map_freeze()` gates the syscall path and not the
+program path. The answer ships in the same release and is opt-in: pin with
+`--pin --self-protect`, which puts every map fd and the whole pin tree
+behind the loader's own binary identity. **The two controls compose and
+neither replaces the other**: this profile takes `CAP_BPF` away from the
+account, self-protection answers everyone else. Read
+`compartment-bpf/HOWTO.md` §3.6 for the upgrade ceremony it imposes and the
+self-protection section of `compartment-bpf/LIMITATIONS.md` for the six
+things it still does not close — turning the flag on without reading the
+upgrade rule first is how a pin tree ends up stranded until a reboot.
+
+**12. Some of what looks closed here is the host's doing, not this
+deployment's.** Both validation guests boot with
+`/sys/kernel/security/lockdown` at `integrity`, which pre-closes
+`/dev/mem`, unsigned module loading and `kexec` at the kernel level. A
+stock host does not. Do not read those results as properties of the
+profile: `lockdown=integrity` is worth setting and it is a separate
+decision. In the same class, `kernel.yama.ptrace_scope` is **not** one-way
+below 3 — root lowered it from 2 back to 1 during validation — so Yama is
+advisory here and the `CAP_SYS_PTRACE` drop is the real closure.
+
+**13. One kernel divergence, recorded so it is not mistaken for flake.**
+`/proc/1/environ` and `/proc/1/ns/*` are readable from the confined session
+on 7.0.0-31 and denied on 6.8.0-139. The namespace fds are inert without
+`setns`, which the `CAP_SYS_ADMIN` drop and the seccomp block both remove.
+`/proc/1/root` is refused on both kernels, by Landlock's own
+`ptrace_access_check` rather than by the `/proc` rule — with and without
+`ro /proc`, while `/proc/self/root` opens.
 
 
 ---

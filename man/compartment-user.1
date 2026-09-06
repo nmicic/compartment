@@ -794,6 +794,43 @@ enforcement failure is logged to syslog.
 .TP
 .B 127
 Command not found or not executable under Landlock restrictions.
+.SH LIMITATIONS
+.PP
+.B \-\-cap\-drop
+and
+.B \-\-mask
+exist for the case where the confined subject is uid 0, and that case has
+limits worth reading in full before deploying one. The confinement is
+per-task kernel state on a session: it says nothing about a root process
+that was never in the session, and it creates no uid boundary \(em the
+account still is uid 0, so a
+.B ro
+rule on
+.I /etc
+grants it
+.IR /etc/shadow ,
+and read policy is as load-bearing as write policy.
+A
+.B \-\-mask
+list is an enumeration of the privileged sockets Landlock cannot govern, not
+a boundary; a mask over a non-directory neutralises a write rather than
+refusing one; sshd forwarding and
+.B internal-sftp
+route around a login-shell confinement and are closed by
+.BR sshd_config (5)
+rather than by enforcement; and anything holding
+.B CAP_BPF
+outside the session owns the
+.B compartment-bpf
+seals unless the policy was pinned with
+.BR \-\-self\-protect .
+.PP
+The complete list, with the closure for each, is
+.B HOWTO.md
+\(lqLimited root over SSH\(rq, section 8. What the companion kernel-side
+control does and does not close is
+.B compartment-bpf/LIMITATIONS.md
+under \(lqSelf-protection\(rq.
 .SH FILES
 .TP
 .I ~/.config/compartment/*.conf

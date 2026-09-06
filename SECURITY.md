@@ -75,20 +75,59 @@ documented limitations, including:
 - The uid/gid map defaults to the identity map, so the user namespace
   provides a capability boundary but no uid isolation unless `uid-map` /
   `gid-map` are set (see HOWTO.md)
-- The limited-root deployment (HOWTO.md, "Limited root over SSH") confines a
-  *session*, not a uid. It does not create a uid boundary — the Landlock
-  allow-list is the only thing between the account and the filesystem, so
-  `ro /etc` means the account can read `/etc/shadow` — and it does not
-  constrain a root process that was never in the session. Its known-open
-  edges, all documented in that section: the mount-mask list is an
-  enumeration of privileged unix sockets and a distribution that adds one
-  adds a hole, because Landlock has no access right covering `connect(2)` to
-  a pathname unix socket and seccomp cannot filter that call's address
-  family; sshd forwarding and `internal-sftp` route around a login-shell
-  confinement and are closed by `sshd_config` plus a seal rather than by
-  enforcement; below Landlock ABI v6 the session can signal processes outside
-  its domain, which is why the seal profile must be pinned rather than run as
-  a daemon; and anything holding `CAP_BPF` owns the seals outright
+- **The limited-root deployment confines a *session*, not a uid.** Everything
+  `examples/limited-root.conf` installs is per-task kernel state on the login,
+  so it says nothing about a uid-0 process that was never in the session —
+  that is what the auth-path seal profile is for — and it creates no uid
+  boundary at all. The complete list of what it does not protect against is
+  HOWTO.md, "Limited root over SSH" §8, which is the authoritative copy;
+  condensed, it is:
+  - uid 0 is still uid 0. The Landlock allow-list is the only thing between
+    the account and the filesystem and DAC contributes nothing, so read policy
+    is as load-bearing as write policy: `ro /etc` hands over `/etc/shadow`
+  - the `mask` list is an enumeration of privileged unix sockets, and a
+    distribution that adds one adds a hole. Landlock has no access right
+    covering `connect(2)` to a pathname socket and seccomp cannot filter that
+    call's address family (it is behind a pointer). The two real fixes — an
+    allow-list `mask` (tmpfs over `/run`, needed paths bound back) and a BPF
+    socket ACL — are both future work
+  - a mask **neutralises** a write rather than refusing one: a non-directory
+    mask is a `/dev/null` bind that inherits the profile's `rw /dev/null`, and
+    a read-only remount does not cover device nodes. Mask read and connect
+    surfaces; use a Landlock rule for write surfaces
+  - a path cannot be both sealed and masked — the mask fails, and a failed
+    mask refuses the login
+  - below Landlock ABI v6 the session can signal processes outside its domain.
+    A denial-of-service surface, not an escape, and the reason the seal
+    profile must be loaded with `--pin` rather than run as a killable daemon
+  - sshd stream-local forwarding and `internal-sftp` route around a
+    login-shell confinement. Closed by a `Match User` block in `sshd_config`
+    plus keeping the external `Subsystem sftp`, and by the seal that stops the
+    setting being edited back — that is, by configuration and a seal, not by
+    enforcement
+  - an `actor=` identity is forgeable by an unconfined `CAP_SYS_RESOURCE` root
+    (`PR_SET_MM_EXE_FILE`); it is closed inside the session by the capability
+    drop. Outside it, close it with a no-actor seal where the path needs no
+    writer, a future directive that arms the `PR_SET_MM` denial on its own, or
+    `actor-strict` plus a static launcher
+  - fds received over `SCM_RIGHTS` are not re-checked (no hook), and
+    `memfd` + `fexecve` runs unnamed code — bounded, because it runs inside
+    the same domain, filter and capability set
+  - service management is unavailable while systemd's private socket and the
+    system bus are masked. That is the point of the masks, and it is a real
+    cost; a broker or the BPF socket ACL are the directions that would give it
+    back safely
+  - the account cannot run `compartment-root`, `sandbox.sh` HARD mode or this
+    project's root suites, because `CAP_SYS_ADMIN` is dropped. A CI runner
+    must not be a limited root
+  - anything holding `CAP_BPF` outside the session owns the seals unless the
+    policy was pinned with `--pin --self-protect`. The two controls compose
+    and neither replaces the other
+  - `lockdown=integrity` on the validation guests pre-closes `/dev/mem`,
+    unsigned module loading and `kexec`; a stock host does not. Yama's
+    `ptrace_scope` is not one-way below 3. And `/proc/1/environ` and
+    `/proc/1/ns/*` are readable on 7.0 while denied on 6.8 — a kernel
+    divergence, recorded so it is not mistaken for flake
 - `compartment-root --netns NAME` joins the target namespace in the parent,
   before `clone()`, and drops `CLONE_NEWNET` so the container inherits it.
   One consequence: a network namespace owned by the initial user namespace
