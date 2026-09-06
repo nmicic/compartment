@@ -362,6 +362,43 @@ expect_contains "/sys/firmware masked (empty)" "^0$"
 
 echo ""
 
+# ── Test 5b: user-namespace credential hardening ───────────────────
+
+echo "--- Test group: user-namespace credentials (M6b) ---"
+
+# man/compartment-root.8: "The parent writes deny to /proc/<pid>/setgroups
+# before the gid map".  Nothing under tests/ used to mention setgroups at
+# all, so removing the write left every root assertion green while
+# /proc/self/setgroups flipped from deny to allow inside the container.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "setgroups=$(cat /proc/self/setgroups 2>&1)"'
+expect_contains "setgroups is denied in the user namespace" "^setgroups=deny$"
+
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "uidmap=$(tr -s " \t" " " < /proc/self/uid_map)";
+     echo "gidmap=$(tr -s " \t" " " < /proc/self/gid_map)"'
+expect_contains "uid_map is written" "^uidmap= *0 0 65536$"
+expect_contains "gid_map is written" "^gidmap= *0 0 65536$"
+
+# PR_SET_DUMPABLE(0) (man/compartment-root.8: "prevent ptrace from
+# outside").  procfs hands the files under /proc/<pid> to uid 0 of the
+# task's user namespace instead of its euid when the task is not
+# dumpable — but only the files, not the /proc/<pid> directory itself,
+# whose ownership the kernel deliberately keeps at the euid
+# (task_dump_owner()).  execve() resets dumpable, so the process that
+# still carries it is the PID 1 reaper, which never execs.  The target's
+# own status file is the built-in positive control: it must be owned by
+# the target uid, or the assertion above it would pass on any host where
+# procfs stopped reporting euid at all.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "reaper=$(stat -c %u /proc/1/status) target=$(stat -c %u /proc/$$/status)"'
+expect_contains "PR_SET_DUMPABLE(0): the reaper is not dumpable" \
+    "^reaper=0 "
+expect_contains "dumpable control: the exec'd target is owned by its own uid" \
+    " target=60000$"
+
+echo ""
+
 # ── Test 6: namespace isolation and escape attempts ────────────────
 
 echo "--- Test group: namespace isolation ---"
@@ -389,8 +426,12 @@ expect_not_contains "pre-opened host directory fd is closed" "^9$"
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'ls /host | wc -l'
 expect_contains "container root really is the jail" "^0$"
 
-run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c 'grep ^Groups /proc/self/status'
-expect_not_contains "supplementary groups cleared" "Groups:	0"
+# `expect_not_contains "Groups:\t0"` only fired when gid 0 happened to be
+# the *first* supplementary group; a container that inherited
+# `Groups: 1000 4 24` passed it.  Assert the list is empty instead.
+run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+    'echo "groups=[$(grep ^Groups /proc/self/status | cut -f2- | tr -d " \t")]"'
+expect_contains "supplementary groups cleared" "^groups=\[\]$"
 
 # A fresh pid namespace: only the reaper, the shell and its own children.
 run_cr -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
