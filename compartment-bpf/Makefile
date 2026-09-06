@@ -197,7 +197,7 @@ check-actor-hook: compartment.bpf.o
 	@grep -q 'ACTION_DENY_STRICT_LAUNCH_MISSING' compartment-abi.h || { echo "error: ACTION_DENY_STRICT_LAUNCH_MISSING missing in compartment-abi.h (ABI v0.4)"; exit 1; }
 	@grep -Eq '_Static_assert\(sizeof\(struct launcher_actor\) == 24' compartment-abi.h || { echo "error: launcher_actor size assertion missing or drifted from 24 in compartment-abi.h (ABI v0.4)"; exit 1; }
 	@grep -Eq '_Static_assert\(sizeof\(struct actor_marker\) == 32' compartment-abi.h || { echo "error: actor_marker size assertion missing or drifted from 32 in compartment-abi.h (ABI v0.4)"; exit 1; }
-	@grep -q 'COMPARTMENT_ABI_VERSION 0x0007' compartment-abi.h || { echo "error: COMPARTMENT_ABI_VERSION did not bump to 0x0007 in compartment-abi.h"; exit 1; }
+	@grep -q 'COMPARTMENT_ABI_VERSION 0x0008' compartment-abi.h || { echo "error: COMPARTMENT_ABI_VERSION did not bump to 0x0008 in compartment-abi.h"; exit 1; }
 	@# v0.5/v0.6 dir-destination gates: catch a drift that drops the
 	@# action codes, recursive ancestor helper, or exact ABI version map.
 	@grep -q 'ACTION_DENY_WRITE_PARENT_DIR' compartment-abi.h || { echo "error: ACTION_DENY_WRITE_PARENT_DIR missing in compartment-abi.h (ABI v0.5)"; exit 1; }
@@ -209,7 +209,7 @@ check-actor-hook: compartment.bpf.o
 	@grep -q 'ACTION_DENY_PRCTL_SET_MM' compartment-abi.h || { echo "error: ACTION_DENY_PRCTL_SET_MM missing in compartment-abi.h (ABI v0.7)"; exit 1; }
 	@grep -q 'ACTION_DENY_PTRACE_ACCESS' compartment-abi.h || { echo "error: ACTION_DENY_PTRACE_ACCESS missing in compartment-abi.h (ABI v0.7)"; exit 1; }
 	@grep -q 'ACTION_DENY_PTRACE_TRACEME' compartment-abi.h || { echo "error: ACTION_DENY_PTRACE_TRACEME missing in compartment-abi.h (ABI v0.7)"; exit 1; }
-	@grep -q 'comp_bprm_check_security' compartment.bpf.c || { echo "error: comp_bprm_check_security missing in compartment.bpf.c (ABI v0.4)"; exit 1; }
+	@grep -q 'comp_bprm_committed_creds' compartment.bpf.c || { echo "error: comp_bprm_committed_creds missing in compartment.bpf.c (ABI v0.8: marker hook moved off bprm_check_security)"; exit 1; }
 	@grep -q 'comp_task_alloc' compartment.bpf.c || { echo "error: comp_task_alloc missing in compartment.bpf.c (ABI v0.4)"; exit 1; }
 	@grep -q 'strict_launch_check_or_deny' compartment.bpf.c || { echo "error: strict_launch_check_or_deny missing in compartment.bpf.c (ABI v0.4)"; exit 1; }
 	@grep -q 'parse_actor_strict_decl' compartment-bpf.c || { echo "error: parse_actor_strict_decl missing in compartment-bpf.c (ABI v0.4)"; exit 1; }
@@ -223,6 +223,14 @@ check-actor-hook: compartment.bpf.o
 	@grep -q 'comp_task_prctl' compartment.bpf.c || { echo "error: comp_task_prctl missing in compartment.bpf.c (ABI v0.4 SPEC §6.3)"; exit 1; }
 	@grep -q 'comp_ptrace_access_check' compartment.bpf.c || { echo "error: comp_ptrace_access_check missing in compartment.bpf.c (ABI v0.4 SPEC §6.3)"; exit 1; }
 	@grep -q 'comp_ptrace_traceme' compartment.bpf.c || { echo "error: comp_ptrace_traceme missing in compartment.bpf.c (ABI v0.4 SPEC §6.3)"; exit 1; }
+	@# v0.8 gates: metadata + mount coverage hooks and the DENY_MOUNT code.
+	@grep -q 'ACTION_DENY_MOUNT' compartment-abi.h || { echo "error: ACTION_DENY_MOUNT missing in compartment-abi.h (ABI v0.8)"; exit 1; }
+	@grep -q 'case ACTION_DENY_MOUNT' compartment-bpf.c || { echo "error: action_name() lacks ACTION_DENY_MOUNT in compartment-bpf.c (ABI v0.8)"; exit 1; }
+	@for h in comp_inode_set_acl comp_inode_remove_acl comp_file_ioctl comp_sb_mount comp_move_mount; do \
+		grep -q "$$h" compartment.bpf.c || { echo "error: v0.8 hook $$h missing in compartment.bpf.c"; exit 1; }; \
+		grep -q "PIN_LINK($$h)" compartment-bpf.c || { echo "error: v0.8 hook $$h not pinned in compartment-bpf.c pin_links()"; exit 1; }; \
+		grep -q "\"$$h\"" compartment-bpf.c || { echo "error: v0.8 hook $$h missing from KNOWN_LINK_NAMES in compartment-bpf.c"; exit 1; }; \
+	done
 	@for m in launcher_to_actor policy_state_map actor_marker_map \
 	          marker_set_total marker_copy_fork_total \
 	          marker_stale_generation_total marker_clear_foreign_exec_total \

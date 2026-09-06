@@ -103,7 +103,7 @@ PROFILE="$TMP/strict.conf"
     printf 'actor-strict slm = %s launcher=%s\n' "$ACTOR_ABS" "$LAUNCHER_ABS"
     if [ -n "$SLM_TRACEME_ABS" ]; then
         # V-7 P1-B (SL-8c): register the LSM-direct helper as a second
-        # launcher of the same actor. comp_bprm_check_security sets
+        # launcher of the same actor. comp_bprm_committed_creds sets
         # marker.state=1 on slm-traceme exec; the helper then calls
         # ptrace(PTRACE_TRACEME) with NO seccomp filter in the path, so
         # the syscall reaches comp_ptrace_traceme. Distinct from the
@@ -297,7 +297,7 @@ run_witness "SL-4-fork-write" 0 \
 # SL-5 foreign-helper chain break: launcher → actor → exec slm-foreign.
 # Counter: marker_set_total + marker_clear_foreign_exec_total. The
 # foreign exec replaces the marked task; the actor's subsequent exec
-# of slm-foreign trips bprm_check_security's foreign-exec branch.
+# of slm-foreign trips bprm_committed_creds's foreign-exec branch.
 run_witness "SL-5-exec-foreign-helper" 0 \
     "$LAUNCHER_ABS exec $FOREIGN_ABS" \
     "" "" marker_set_total=1 marker_clear_foreign_exec_total=1
@@ -469,7 +469,7 @@ fi
 # wrapper seccomp filter denies ptrace before the LSM hook fires; that
 # leaves comp_ptrace_traceme unwitnessed. SL-8c bypasses the seccomp
 # layer by exec'ing a static helper that is itself a registered
-# strict-launch launcher. bprm_check_security sets actor_marker on the
+# strict-launch launcher. bprm_committed_creds sets actor_marker on the
 # helper; the helper then calls ptrace(PTRACE_TRACEME) directly with no
 # seccomp filter installed, so the syscall reaches the LSM hook. We
 # require BOTH a counter delta AND an audit-line emission so a regression

@@ -2270,12 +2270,14 @@ echo "[mesh] ME-22 fs variations: $ME22_PASS PASS / $ME22_FAIL FAIL"
 
 # --- ME-23 §3.23 mount/remount/bind-mount scenarios ---
 #
-# compartment-bpf hooks NO mount LSM paths (sb_mount, sb_remount,
-# move_mount). The seal is keyed by (dev,ino); mount changes alter
-# which inode a path resolves to. Witness the four classes:
+# v0.8: compartment-bpf hooks sb_mount + move_mount (a new mount ON a
+# sealed inode or INSIDE a sealed subtree is denied, ACTION_DENY_MOUNT);
+# sb_remount / sb_umount / sb_pivotroot are still unhooked. The seal is
+# keyed by (dev,ino); mount changes alter which inode a path resolves to.
+# Witness the four classes:
 #
 #   Tier 1 (mandatory, three bind scenarios):
-#     (a) bind OVER sealed path → GAP (writes via path hit unsealed inode)
+#     (a) bind OVER sealed path → DENY (v0.8 sb_mount; pre-v0.8 KNOWN-GAP)
 #     (b) bind FROM sealed path → seal-follows-inode (writes via alias DENY)
 #     (c) bind sealed DIR      → seal-follows-inode for parent-dir ops
 #
@@ -2285,8 +2287,9 @@ echo "[mesh] ME-22 fs variations: $ME22_PASS PASS / $ME22_FAIL FAIL"
 #     (e) unmount of FS containing sealed inodes → orphan map entries;
 #         subsequent path access returns ENOENT (kernel-level, before LSM)
 #
-# Mount-over-sealed-mount-point: deferred to a future dedicated run (same
-# GAP class as (a); the bind-mount-OVER witness already documents it).
+# Mount on the ROOT of a nested mount that already sits inside a sealed
+# tree: still a gap (the BPF d_parent walk stops at a mount root, so the
+# sealed ancestor is never seen). Deferred; LIMITATIONS.md carries the row.
 ME23_PASS=0; ME23_FAIL=0
 ME23_MOUNTS=()
 me23_record() {
@@ -2319,28 +2322,34 @@ me23_record() {
 
 mkdir -p "$WORK/me23"
 
-# (a) Bind OVER sealed path — GAP witness.
-# Source: a fresh unsealed file with known content. Target: ME19_SECRET
-# (sealed `full actor=a1`). After bind, ME19_SECRET path resolves to
-# the unsealed source inode → outsider writes ALLOW (GAP).
+# (a) Bind OVER sealed path — DENY witness (v0.8, ENFORCED).
+# Pre-v0.8 this row was KNOWN-GAP: the bind succeeded and outsider writes
+# via the path hit the unsealed source inode. v0.8 attaches lsm/sb_mount +
+# lsm/move_mount: attaching a mount ON a sealed inode is denied with
+# ACTION_DENY_MOUNT. Expected now: the bind FAILS and the path still
+# resolves to the sealed inode (outsider write DENY). A bind that succeeds
+# is a regression and is recorded as actual=ALLOW against expected=DENY.
+# Control first: the same bind onto an UNSEALED file must work, otherwise
+# this host cannot bind-mount at all and the row is SKIP, not PASS.
 echo "xUNSEALEDx" > "$WORK/me23/over-src"
-if mount --bind "$WORK/me23/over-src" "$ME19_SECRET" 2>/dev/null; then
-	# Outsider write via path → unsealed inode → ALLOW (documented GAP).
-	stub=$(caller_path b1)
-	actual=$(run_trial "$stub" write "$ME19_SECRET")
-	me23_record bind-OVER-sealed-path-GAP b1 write "$ME19_SECRET" ALLOW "$actual" \
-		"GAP-bind-over-redirects-to-unsealed-inode" KNOWN-GAP
-	# Restore: umount immediately so subsequent tests see the original
-	# sealed inode. This mount is intentionally NOT tracked in
-	# ME23_MOUNTS — we umount inline and never need cleanup-trap to
-	# re-umount it. Don't use the bash ${array[@]/pat} substring-replace
-	# pattern to "remove" elements; it leaves empty strings behind that
-	# pollute the final cleanup loop (reviewer Leader-15-rev-HIGH-1).
-	umount "$ME19_SECRET" 2>/dev/null || true
-else
-	printf 'ME23-mount,bind-OVER-sealed-path-GAP-b1,%s,bind,setup,n/a,bind-failed,SKIP\n' \
+: > "$WORK/me23/over-ctl"
+if ! mount --bind "$WORK/me23/over-src" "$WORK/me23/over-ctl" 2>/dev/null; then
+	printf 'ME23-mount,bind-OVER-sealed-path-b1,%s,bind,setup,n/a,control-bind-failed,SKIP\n' \
 		"$ME19_SECRET" >> "$CSV"
 	SKIP=$((SKIP+1))
+else
+	umount "$WORK/me23/over-ctl" 2>/dev/null || true
+	if mount --bind "$WORK/me23/over-src" "$ME19_SECRET" 2>/dev/null; then
+		# Restore immediately so later rows see the sealed inode again.
+		umount "$ME19_SECRET" 2>/dev/null || true
+		me23_record bind-OVER-sealed-path b1 mount "$ME19_SECRET" DENY ALLOW \
+			"sb_mount-must-deny-mount-over-sealed-inode"
+	else
+		stub=$(caller_path b1)
+		actual=$(run_trial "$stub" write "$ME19_SECRET")
+		me23_record bind-OVER-sealed-path b1 write "$ME19_SECRET" DENY "$actual" \
+			"mount-over-sealed-inode-denied-path-still-sealed"
+	fi
 fi
 
 # (b) Bind FROM sealed path — seal follows inode.
@@ -2918,7 +2927,7 @@ TOTAL=$((PASS+FAIL+ERR+KNOWN_GAP+SKIP))
 	echo ""
 	echo "[mesh] classification fingerprint:"
 	echo "       ENFORCED:     $PASS PASS, $FAIL FAIL"
-	echo "       KNOWN-GAP:    $KNOWN_GAP (bind-OVER, ME-20 substrate=unknown)"
+	echo "       KNOWN-GAP:    $KNOWN_GAP (ME-20 substrate=unknown)"
 	echo "       OUT-OF-SCOPE: $SKIP SKIP (btrfs/overlay anon_bdev refused by HIGH-1 loader gate,"
 	echo "                         nfs out-of-scope, ME-24 doc-only, setup-unavail)"
 	echo "       TOTAL:        $TOTAL"

@@ -27,6 +27,15 @@ and unknown flags are fatal at load time. `oracle.conf` is the
 minimal worked example; the per-daemon profiles under `profiles/`
 are richer examples.
 
+`no-chmod` covers every inode-metadata write path the kernel exposes:
+`chmod`/`chown` (`inode_setattr`), xattrs, POSIX ACLs
+(`inode_set_acl` / `inode_remove_acl` — a separate hook since Linux 6.2,
+covered from v0.8), inode-flag ioctls such as `chattr +i/+a`
+(`file_ioctl`, v0.8) and explicit timestamp changes (`touch -d`,
+`utimensat`; v0.8). Truncation remains write-class (`no-write`). Any
+seal flag also refuses new mounts on or under the sealed path
+(`sb_mount` / `move_mount`, v0.8) so the path cannot be shadowed.
+
 The loader resolves paths once at load time via
 `open(O_PATH | O_NOFOLLOW)` + `fstat`, then keys the seal by
 `(dev, ino)`. A symlink at the leaf is refused with a clear message;
@@ -112,10 +121,12 @@ forgeable.
 
 ### 2.3 Hook-side semantics (ED-4 / ED-6)
 
-At each of the 21 LSM hooks `compartment.bpf.c` attaches (the 16
-file/inode/path hooks of v0.3 plus `task_alloc`, `task_prctl`,
-`ptrace_access_check`, `ptrace_traceme`, and the sleepable
-`bprm_check_security` added by v0.4 strict-launch),
+At each of the 26 LSM hooks `compartment.bpf.c` attaches (the 16
+file/inode/path hooks of v0.3; the five v0.4 strict-launch hooks
+`bprm_committed_creds`, `task_alloc`, `task_prctl`,
+`ptrace_access_check`, `ptrace_traceme`; and the five v0.8
+metadata/mount hooks `inode_set_acl`, `inode_remove_acl`,
+`file_ioctl`, `sb_mount`, `move_mount`),
 after the
 existing seal+flag check passes the kernel runs an actor match
 against `current->mm->exe_file`'s `(dev, ino)`. On mismatch the
@@ -173,8 +184,10 @@ The `strict-launch` flag on a seal turns on the in-kernel marker
 check. A protected file operation on such a seal requires:
 
 1. existing actor= inode check (v0.3 binding) — and
-2. a valid task-storage marker (`bprm_check_security` sets one when
-   the task exec'd the sealed launcher), and
+2. a valid task-storage marker (`bprm_committed_creds` sets one once an
+   exec of the sealed launcher has *committed*; v0.8 moved this off
+   `bprm_check_security`, which runs before the point of no return and
+   left a marker behind when the exec failed afterwards), and
 3. the marker's target inode equals the current task's exe inode, and
 4. the marker's actor_slot matches the seal's strict_actor_slot, and
 5. the marker's policy_generation equals the loaded generation.
@@ -533,7 +546,7 @@ ABI v0.4) the strict-launch-marker counters:
 |--------------------------------------|-----------------------------------------------------------------------------------------------|
 | `strict_launch_missing_total`        | file-op denies emitted by `strict_launch_check_or_deny` (any failure mode)                    |
 | `strict_launch_allowed_total`        | file-op operations passed by `strict_launch_check_or_deny` (positive observability)           |
-| `marker_set_total`                   | tasks marker'd by `bprm_check_security` on sealed-launcher exec                              |
+| `marker_set_total`                   | tasks marker'd by `bprm_committed_creds` on a committed sealed-launcher exec                 |
 | `marker_clear_foreign_exec_total`    | tasks whose marker was cleared on a foreign exec (chain break — visibility signal)            |
 | `marker_copy_fork_total`             | child tasks that inherited a parent marker via `task_alloc` (G6 Outcome B)                    |
 | `marker_stale_generation_total`      | denies whose root cause was generation mismatch (always 0 in v0.4 fresh-load-only; see §3a)  |

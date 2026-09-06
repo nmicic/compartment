@@ -1541,6 +1541,7 @@ static const char *action_name(__u32 a)
 	case ACTION_DENY_PRCTL_SET_MM:          return "DENY_PRCTL_SET_MM";
 	case ACTION_DENY_PTRACE_ACCESS:         return "DENY_PTRACE_ACCESS";
 	case ACTION_DENY_PTRACE_TRACEME:        return "DENY_PTRACE_TRACEME";
+	case ACTION_DENY_MOUNT:                 return "DENY_MOUNT";
 	default: return "?";
 	}
 }
@@ -2963,8 +2964,8 @@ static int pin_links(struct compartment_bpf *skel)
 	// KNOWN_LINK_NAMES is declared later in the file; if the PIN_LINK
 	// invocation count below grows, bump the literal here in lockstep.
 	char pinned[32][PATH_MAX];
-	_Static_assert(sizeof(pinned) / PATH_MAX >= 21,
-		       "pinned[] must hold all PIN_LINK invocations (currently 21: 16 v0.3 + 5 v0.4)");
+	_Static_assert(sizeof(pinned) / PATH_MAX >= 26,
+		       "pinned[] must hold all PIN_LINK invocations (currently 26: 16 v0.3 + 5 v0.4 + 5 v0.8)");
 	int pinned_count = 0;
 
 	if (ensure_bpffs("/sys/fs/bpf") < 0 ||
@@ -3002,11 +3003,17 @@ static int pin_links(struct compartment_bpf *skel)
 	PIN_LINK(comp_inode_setxattr);
 	PIN_LINK(comp_inode_removexattr);
 	/* v0.4 strict-launch-marker hooks */
-	PIN_LINK(comp_bprm_check_security);
+	PIN_LINK(comp_bprm_committed_creds);  /* v0.8: was comp_bprm_check_security */
 	PIN_LINK(comp_task_alloc);
 	PIN_LINK(comp_task_prctl);
 	PIN_LINK(comp_ptrace_access_check);
 	PIN_LINK(comp_ptrace_traceme);
+	/* v0.8 metadata + mount coverage */
+	PIN_LINK(comp_inode_set_acl);
+	PIN_LINK(comp_inode_remove_acl);
+	PIN_LINK(comp_file_ioctl);
+	PIN_LINK(comp_sb_mount);
+	PIN_LINK(comp_move_mount);
 
 #undef PIN_LINK
 
@@ -3040,11 +3047,21 @@ static const char *const KNOWN_LINK_NAMES[] = {
 	"comp_inode_setxattr",
 	"comp_inode_removexattr",
 	/* v0.4: strict-launch-marker hooks */
+	"comp_bprm_committed_creds",
+	/* Legacy v0.4..v0.7 name for the marker hook. Never pinned by a v0.8+
+	 * loader; kept so `--unpin` can sweep a pin tree left by an older
+	 * loader instead of refusing it as an unknown object. */
 	"comp_bprm_check_security",
 	"comp_task_alloc",
 	"comp_task_prctl",
 	"comp_ptrace_access_check",
 	"comp_ptrace_traceme",
+	/* v0.8: metadata + mount coverage */
+	"comp_inode_set_acl",
+	"comp_inode_remove_acl",
+	"comp_file_ioctl",
+	"comp_sb_mount",
+	"comp_move_mount",
 };
 static const size_t N_KNOWN_LINK_NAMES =
 	sizeof(KNOWN_LINK_NAMES) / sizeof(KNOWN_LINK_NAMES[0]);

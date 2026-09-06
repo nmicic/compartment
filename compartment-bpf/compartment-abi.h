@@ -143,11 +143,47 @@
 //    sealed file op” from “global PR_SET_MM deny” and ptrace hardening
 //    denies without parsing comments or inferring from counters.
 
+// ABI v0.8 — metadata/mount coverage + post-commit strict-launch marker.
+//  * No struct layout change: audit_event, seal_value, launcher_actor,
+//    actor_marker and policy_state are unchanged on the wire.
+//  * New action code:
+//    - ACTION_DENY_MOUNT = 14. Emitted by the sb_mount / move_mount hooks
+//      when a new mount would be attached ON a sealed inode or anywhere
+//      INSIDE a sealed subtree (path-shadowing class; the pre-v0.8
+//      LIMITATIONS rows "bind-mount-OVER sealed path" and
+//      "Mount-inside-sealed-subtree bypass"). dev/ino carry the sealed
+//      inode (or covering sealed directory) that fired.
+//  * New hooks (compartment.bpf.c), no new maps:
+//    - inode_set_acl / inode_remove_acl: since Linux 6.2 POSIX ACL writes
+//      go through vfs_set_acl()/vfs_remove_acl(), which have their own LSM
+//      hooks and never reach inode_setxattr/inode_removexattr. A `no-chmod`
+//      seal did not stop `setfacl` on the project's >= 6.6 floor. Both
+//      hooks enforce SEAL_NO_CHMOD with the existing DENY_CHMOD /
+//      DENY_CHMOD_PARENT_DIR codes.
+//    - file_ioctl: FS_IOC_SETFLAGS / FS_IOC32_SETFLAGS / FS_IOC_FSSETXATTR /
+//      FS_IOC_SETVERSION (chattr, project ids) mutate inode metadata via
+//      ->fileattr_set with no inode_setattr or xattr hook; gated under
+//      SEAL_NO_CHMOD (same two codes).
+//    - sb_mount / move_mount: see ACTION_DENY_MOUNT.
+//  * Strict-launch marker mutation moved from bprm_check_security to
+//    bprm_committed_creds. The check hook fires before the exec point of
+//    no return; an exec that fails after it returns to the caller's OLD
+//    image carrying a freshly written marker. committed_creds runs only
+//    once the new image is installed. Pin link name changes
+//    comp_bprm_check_security -> comp_bprm_committed_creds; the loader
+//    keeps the legacy name in its --unpin sweep table so a v0.4..v0.7
+//    pin tree can still be torn down.
+//  * inode_setattr: explicit timestamp writes (utimensat / touch -d) on a
+//    directly sealed inode are now chmod-class, matching the v0.5
+//    parent-dir rule. Truncation stays write-class.
+//  * The version bump makes a v0.7 audit consumer fail loud on code 14
+//    instead of printing "action=?".
+
 #ifndef COMPARTMENT_ABI_H
 #define COMPARTMENT_ABI_H
 
-// Encoded as 8-bit major + 8-bit minor: 0x0007 == v0.7.
-#define COMPARTMENT_ABI_VERSION 0x0007
+// Encoded as 8-bit major + 8-bit minor: 0x0008 == v0.8.
+#define COMPARTMENT_ABI_VERSION 0x0008
 
 // Recursive subtree enforcement walks ancestor dentries up to this many
 // levels. The default is intentionally conservative for verifier/load-time
@@ -216,6 +252,12 @@ struct inode_key {
 #define ACTION_DENY_PRCTL_SET_MM      11
 #define ACTION_DENY_PTRACE_ACCESS     12
 #define ACTION_DENY_PTRACE_TRACEME    13
+// v0.8: mount-shadowing deny. Emitted by comp_sb_mount / comp_move_mount
+// when a mount would be attached on a sealed inode (dev/ino = that inode)
+// or inside a sealed subtree (dev/ino = the covering sealed directory).
+// Uniform-deny seals emit this code; actor-bound seals emit
+// ACTION_DENY_ACTOR_MISMATCH on a non-actor caller as everywhere else.
+#define ACTION_DENY_MOUNT             14
 
 // Per-constant value-drift asserts. The struct-size assert on
 // audit_event catches layout drift but not value drift on SEAL_*/ACTION_*;
@@ -239,6 +281,7 @@ _Static_assert(ACTION_DENY_CHMOD_PARENT_DIR  == 10, "ACTION_DENY_CHMOD_PARENT_DI
 _Static_assert(ACTION_DENY_PRCTL_SET_MM   == 11, "ACTION_DENY_PRCTL_SET_MM value drift (v0.7)");
 _Static_assert(ACTION_DENY_PTRACE_ACCESS  == 12, "ACTION_DENY_PTRACE_ACCESS value drift (v0.7)");
 _Static_assert(ACTION_DENY_PTRACE_TRACEME == 13, "ACTION_DENY_PTRACE_TRACEME value drift (v0.7)");
+_Static_assert(ACTION_DENY_MOUNT          == 14, "ACTION_DENY_MOUNT value drift (v0.8)");
 
 // ABI v0.3 layout (gcc-verified sizeof on LP64, natural alignment):
 //   off  0: __u32 version       — MUST be at offset 0; per the

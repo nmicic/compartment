@@ -3,6 +3,91 @@
 All notable changes to compartment-bpf are documented here.
 Format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
+## [v0.8] — 2026-09-05
+
+Security review pass over the BPF enforcement surface: four coverage gaps
+closed, one strict-launch design flaw fixed. No struct layout change.
+
+### ABI bump 0x0007 → 0x0008
+
+- **New action code** `ACTION_DENY_MOUNT = 14` with a value-drift
+  `_Static_assert`; `action_name()` prints `DENY_MOUNT`.
+- The bump makes a v0.7 audit consumer reject v0.8 events loud instead of
+  printing `action=?` for code 14.
+
+### Closed: `no-chmod` bypass via POSIX ACLs (`inode_set_acl` / `inode_remove_acl`)
+
+- Since Linux 6.2, `setxattr(2)`/`removexattr(2)` on `system.posix_acl_*` are
+  routed to `vfs_set_acl()`/`vfs_remove_acl()`, which call
+  `security_inode_set_acl()`/`security_inode_remove_acl()` and never the
+  xattr hooks. On the project's ≥ 6.6 floor `setfacl -m/-x/-b` rewrote the
+  effective permission bits of a `no-chmod` sealed file while `chmod` was
+  denied. Two new programs mirror the xattr pair (per-inode `SEAL_NO_CHMOD`
+  + recursive parent-dir rule). Witness: `tests/bypass/16-setfacl-no-chmod.sh`.
+
+### Closed: mount shadowing of sealed paths (`sb_mount` / `move_mount`)
+
+- A new mount whose mountpoint is a sealed inode, or lies inside a
+  recursively sealed subtree, is denied with `ACTION_DENY_MOUNT`. Covers
+  `mount --bind`, `mount --move` / `MS_MOVE`, `move_mount(2)`,
+  `fsmount`+`move_mount` and fresh filesystem mounts. `MS_REMOUNT` and
+  propagation-only changes attach nothing and pass. Actor-bound seals keep
+  their allowlist (an actor may mount inside its own tree). Bind-mounting
+  *from* a sealed path elsewhere stays allowed — the alias shares dentries,
+  so every seal still applies through it.
+- Retires the LIMITATIONS rows "bind-mount-OVER sealed path" and
+  "Mount-inside-sealed-subtree bypass"; a residual row lists what is still
+  open (umount of a sealed-inode-hosting filesystem, `pivot_root`, mounts on
+  the root of a pre-existing nested mount).
+- `tests/bypass/07-mount-bind-decoy.sh` now asserts the deny (it used to
+  document the gap); new `tests/bypass/17-mount-inside-sealed-dir.sh`; mesh
+  §3.23 row (a) flips from KNOWN-GAP to ENFORCED.
+
+### Closed: inode-flag ioctls and timestamp forgery under `no-chmod`
+
+- New `file_ioctl` program gates `FS_IOC_SETFLAGS` / `FS_IOC32_SETFLAGS` /
+  `FS_IOC_FSSETXATTR` / `FS_IOC_SETVERSION` (`chattr +i/+a`, project ids) on
+  `no-chmod` seals; every other ioctl returns after a few compares. Compat
+  (32-bit) callers on kernels ≥ 6.8 use `file_ioctl_compat`, which is not
+  hooked — see LIMITATIONS. Witness: `tests/bypass/18-chattr-no-chmod.sh`.
+- `inode_setattr` per-inode rule: `ATTR_ATIME|ATTR_MTIME` without
+  `ATTR_SIZE` (`utimensat`, `touch -d`) is now chmod-class, matching the
+  v0.5 parent-dir rule. Truncation stays write-class (regression-guarded).
+  Witness: `tests/bypass/19-utimes-no-chmod.sh`.
+
+### Fixed: strict-launch marker written before the exec point of no return
+
+- The marker was set in `bprm_check_security`, which fires from
+  `search_binary_handler()` before `begin_new_exec()`. An exec of the sealed
+  launcher that failed afterwards (`dup_fd` ENOMEM under a memcg limit with a
+  `CLONE_FILES` sibling alive, `exec_mmap`, `de_thread`) returned to the
+  caller's old image with a valid marker whose target matched its exe — a
+  task already running the actor under `LD_PRELOAD` could satisfy every
+  strict-launch condition. Marker set/keep/clear now lives in
+  `bprm_committed_creds`, which runs only for a committed image; an
+  unresolvable exec target drops any existing marker (fail closed).
+- Pin link name: `comp_bprm_check_security` → `comp_bprm_committed_creds`.
+  `--unpin` still sweeps the legacy name, so a v0.4..v0.7 pin tree can be
+  torn down before re-pinning. The hook is attached non-sleepable (`lsm/`),
+  like `task_alloc`, so it does not depend on the kernel's sleepable-hook
+  allowlist.
+
+### Loader
+
+- `pin_links()` pins 26 links (16 v0.3 + 5 v0.4 + 5 v0.8); `KNOWN_LINK_NAMES`
+  extended; `make check-actor-hook` gains grep gates for every v0.8 hook, its
+  `PIN_LINK`, and its unpin-table entry.
+
+### Verification status
+
+- Compiled and skeleton-generated against a 6.18 kernel BTF; every hooked
+  `security_*` wrapper and parameter list confirmed present. Kernel-side
+  verifier acceptance and the new bypass witnesses need the BPF-LSM VM
+  (`make smoke`, `tests/bypass/run-all.sh`, `tests/mesh/run-mesh.sh`,
+  `tests/strict-launch/run.sh`).
+
+---
+
 ## [v0.7.3] — 2026-06-11
 
 No ABI change (`0x0007` unchanged). Usability, a non-root validation fix,

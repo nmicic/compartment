@@ -23,11 +23,16 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `file_mprotect` | witnessed |  |
 | `inode_setxattr` | witnessed |  |
 | `inode_removexattr` | witnessed |  |
-| `bprm_check_security` | witnessed |  |
+| `bprm_committed_creds` | witnessed |  |
 | `task_alloc` | exempt | Fork marker-copy hook; no op token. Witnessed indirectly by marker_copy_fork_total (strict-launch/run.sh + stability/counter-longevity.sh). |
 | `task_prctl` | witnessed |  |
 | `ptrace_access_check` | witnessed |  |
 | `ptrace_traceme` | witnessed |  |
+| `inode_set_acl` | witnessed |  |
+| `inode_remove_acl` | witnessed |  |
+| `file_ioctl` | witnessed |  |
+| `sb_mount` | witnessed |  |
+| `move_mount` | witnessed |  |
 ## observe-hook
 
 | surface | status | note |
@@ -57,6 +62,7 @@ Status key: `witnessed` = referenced by a test under tests/; `exempt` = accepted
 | `DENY_PRCTL_SET_MM` | witnessed |  |
 | `DENY_PTRACE_ACCESS` | witnessed |  |
 | `DENY_PTRACE_TRACEME` | witnessed |  |
+| `DENY_MOUNT` | witnessed |  |
 | `DENY_UNLINK` | witnessed |  |
 | `DENY_RENAME` | witnessed |  |
 | `DENY_CREATE` | witnessed |  |
