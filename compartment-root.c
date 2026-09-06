@@ -581,6 +581,22 @@ int main(int argc, char *argv[])
     int flags = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC |
                 CLONE_NEWNET | CLONE_NEWUSER | CLONE_NEWCGROUP | SIGCHLD;
 
+    /* --netns / `netns NAME`: join the target namespace here, in the parent,
+     * and let the child inherit it instead of getting a fresh one.
+     *
+     * The child could not do this itself.  setns(2) needs CAP_SYS_ADMIN in
+     * the user namespace that *owns* the target network namespace, and the
+     * child is in a brand-new user namespace that owns nothing — so every
+     * --netns run failed with EPERM.  The parent is real root in the initial
+     * user namespace, where that capability is real. */
+    if (config.netns) {
+        join_netns(config.netns);
+        flags &= ~CLONE_NEWNET;
+        if (config.verbose)
+            fprintf(stderr, "compartment-root: joined netns %s "
+                    "(container inherits it)\n", config.netns);
+    }
+
     const int STACK_SIZE = 1024 * 1024;
     char *child_stack = malloc(STACK_SIZE);
     if (!child_stack) {
@@ -708,9 +724,8 @@ static int child_func(void *arg)
         exit(EXIT_FAILURE);
     }
 
-    /* 2. Join existing network namespace if specified */
-    if (config->netns)
-        join_netns(config->netns);
+    /* 2. The network namespace, when one was named, was joined by the
+     *    parent before clone() and inherited here — see main(). */
 
     /* 3. pivot_root — stronger than chroot (old root fully unmounted)
      *
