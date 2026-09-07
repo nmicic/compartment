@@ -359,11 +359,12 @@ directory is therefore an allow-list of binaries:
 landlock on
 exec /usr/bin/exampled
 exec /usr/bin/psql
-ro   /usr/lib          # libraries: read is enough, see below
+rw   /usr/lib          # libraries: read is enough, and `rw` has no
+                       # execute right — see fact 2 and fact 3
 rw   /srv/exampled/data
 ```
 
-Four facts decide whether this works for you, all verified against the
+Five facts decide whether this works for you, all verified against the
 running kernel rather than inferred:
 
 1. **The dynamic loader must be listed too.** `execve(2)` opens the ELF
@@ -378,12 +379,86 @@ running kernel rather than inferred:
    execute on everything beneath it.
 3. **`ro` on a directory grants execute.** No directory containing binaries
    may appear as `ro` in an allow-list policy, or the allow-list is a
-   no-op. This is the single easiest way to get it wrong.
+   no-op. This is the single easiest way to get it wrong, and the library
+   directory is where it happens: `/usr/lib` is not only libraries, and on
+   Debian and Ubuntu it carries `/usr/lib/klibc/bin/`, a directory of
+   ordinary executables. `ro /usr/lib` in an allow-list makes every one of
+   them an `execve` target. Use `rw` there — fact 2.
 4. **The rule keys on the file, not on the name.** A busybox-style
    multi-call binary cannot be split into applets: allowing `/bin/sh`
    allows every applet, because they are all the same inode. Likewise a
    shell builtin is not an `execve` at all, so listing a shell in the
    allow-list gives away far more than the shell.
+5. **Listing the loader turns the allow-list into a hardening layer, not
+   an exec-target boundary.** This is facts 1 and 2 taken together, and
+   it is the fact to read before relying on any of the others. Once the
+   loader carries the execute right it can be invoked as a program in its
+   own right, with an ELF as its argument:
+
+   ```
+   $ /srv/exampled/data/payload            # named by no exec rule
+   sh: /srv/exampled/data/payload: Permission denied
+   $ /lib64/ld-linux-x86-64.so.2 /srv/exampled/data/payload
+   PAYLOAD_RAN
+   ```
+
+   There is no `execve(2)` of `payload` in the second command and so no
+   execute check on it. The loader opens it `O_RDONLY` and maps it
+   `PROT_EXEC` — the same absence of an mmap hook that lets a shared
+   library load on read access alone (fact 2). **A compatible loadable
+   ELF the sandbox can read is one the sandbox can run**, whether or not
+   an `exec` rule names it. What "compatible" costs an attacker is a
+   matching architecture and a loader that will accept the file; the
+   witnesses in the test suites use one payload each and prove that much,
+   not a universal law about every file on disk.
+
+   `rw` grants read, so a data directory, `$HOME` or `/tmp` is somewhere
+   the sandbox can write an ELF and then start it; and any unlisted
+   system binary left readable is one it can start without writing
+   anything. Measured on 6.8.0-139 (Landlock ABI v4) and 7.0.0-31 (ABI
+   v8), rootless and inside a `compartment-root` container alike: the
+   direct `execve` is refused with `EACCES` and the loader runs the very
+   same file. The allow-list stops a binary from being *named* on an
+   `execve`; it does not stop that binary from being started.
+
+   Two shapes close the direct-loader bypass:
+
+   * **Static-link the allowed binaries and do not list the loader.** An
+     unlisted loader cannot be executed either, so there is nothing to
+     invoke as an interpreter and a dynamically linked payload cannot
+     start at all.
+   * **Grant no location that is both readable and writable, and leave no
+     readable ELF you did not intend to allow.** `rw` implies read in
+     this profile language, so one `rw` on a data directory gives the
+     writing half straight back.
+
+   A third measure closes **one half** of the bypass — the writable
+   payload — and is worth applying either way: **put the writable areas
+   on a `noexec` mount** (`mount-noexec` in a compartment-root profile).
+   The loader maps its target `PROT_EXEC`, and the kernel refuses that
+   mapping on a `MNT_NOEXEC` mount, so an ELF written there fails by both
+   routes: the direct `execve` with `Permission denied`, and the loader
+   route with `failed to map segment from shared object`.
+
+   It is half a mitigation and not a third complete one: it does nothing
+   about a readable unlisted ELF on any exec-capable mount, which is
+   still startable through the loader, and which is why `mount-noexec
+   /tmp` alone does not rescue a profile that also grants `rw` on an
+   exec-capable data directory.
+
+   **Closing the bypass buys an exec-target boundary, not a
+   code-execution boundary.** What an `exec` allow-list can bound, at
+   best, is which files can be started by name. An allowed program that
+   is compromised at run time can still interpret a script, JIT, `dlopen`
+   a shared object or plainly `mmap(PROT_EXEC)` bytes it fetched itself,
+   and none of that is an `execve` or an `open` for execute — Landlock
+   hooks `open`, not `mmap`. Treat the allow-list as one layer of
+   containment for a program you already trust to be what it says it is,
+   not as a claim about what code the sandbox can run.
+
+   A kernel-side exec confinement that checks the program actually being
+   started, rather than the file handed to `execve`, and therefore does
+   not need the loader listed at all, is designed and not shipped.
 
 The allow-list is a property of the whole sandbox and not of a caller: it
 cannot express "the supervisor may run psql but the request handler may
@@ -1401,6 +1476,17 @@ deliberately **not** recursive: `/proc`, `/dev` and `/sys` are separate
 mounts on top of the container root and have to stay writable. It is also
 applied last, because those mount points must be created in a writable
 tree first.
+
+That non-recursion is the reason a `rw` library rule needs a `mount-ro`
+next to it and not just a read-only root. `rootdir-flags ro` changes the
+rootdir mount and nothing stacked on it, so a writable submount under a
+directory a `rw` rule grants stays writable, and the write right of that
+rule is a real write grant. `mount-ro /usr/lib` remounts the subtree and
+its submounts read-only, which is what makes it inert;
+`examples/restricted-root.conf` pairs the two, and
+`root.d/compartment-root-landlock.sh` measures both directions — a write
+into a submount under a `rw` rule succeeds with `rootdir-flags ro` alone
+and fails `EROFS` once `mount-ro` names the directory.
 
 **`rootdir-flags noexec` disables the container.** Nothing inside the
 container root can then be executed, including the target command. It is

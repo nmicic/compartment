@@ -198,6 +198,14 @@ after
 .IR /proc ", " /dev ", " /sys
 and the pivot point have been created in the tree, and deliberately not
 recursively \(em those three are separate mounts and stay writable.
+So does every other submount: this directive changes the rootdir mount and
+nothing stacked on top of it, so a writable submount under a path a
+Landlock
+.B rw
+rule grants stays writable.
+.B mount\-ro
+is the recursive form; use it on any subtree that has to be read-only all
+the way down.
 .B noexec
 on the container root prevents executing
 .I anything
@@ -288,6 +296,20 @@ read access, because
 opens them read-only and Landlock has no mmap hook.
 The grant keys on the file, so a busybox-style multi-call binary cannot be
 split into applets.
+Grant the library directory with
+.B \-\-rw
+rather than
+.BR \-\-ro :
+.B \-\-ro
+on a directory grants execute on every file beneath it, and a distribution
+leaves executables under
+.I /usr/lib
+(on Debian and Ubuntu,
+.IR /usr/lib/klibc/bin/ ).
+Listing the loader is also the way out of the allow-list, which makes the
+allow-list a hardening layer rather than an exec-target boundary; see
+.B LIMITATIONS
+below before relying on one.
 Repeatable.
 .PP
 A trailing
@@ -621,6 +643,127 @@ Configuration error, namespace creation failure, or privilege drop failure
 .TP
 .BI 128+ n
 The command was killed by signal \fIn\fR.
+.SH LIMITATIONS
+.PP
+An
+.B \-\-exec
+allow-list that lists the dynamic loader is a hardening layer, not an
+exec-target boundary \(em including for uid 0 inside the container.
+Listing the loader is required for any dynamically linked policy, and it is
+also the way around the allow-list: once the loader carries the execute
+right,
+.I "ld-linux-x86-64.so.2 /path/to/readable.elf"
+starts that file with no
+.BR execve (2)
+of it and therefore no execute check on it.
+The loader opens the target
+.B O_RDONLY
+and maps it
+.BR PROT_EXEC ,
+and Landlock has no mmap hook \(em the same mechanism that lets a shared
+library load on read access alone.
+A compatible loadable ELF the container can read is one the container can
+run.
+Because
+.B \-\-rw
+grants read, any location that is both readable and writable \(em a service
+data directory, the container
+.I /tmp
+\(em is somewhere the container can write an ELF and then start it, and any
+readable unlisted binary in the rootdir can be started without writing
+anything.
+Measured on 6.8.0\-139 (Landlock ABI v4) and 7.0.0\-31 (ABI v8) inside a
+real container: the direct
+.BR execve (2)
+is refused with
+.BR EACCES ,
+and the loader runs the very same file.
+.PP
+Two shapes close the direct-loader bypass.
+Static-link the allowed binaries and do not list the loader \(em an unlisted
+loader cannot be executed either, so a dynamically linked payload cannot
+start at all.
+Or grant no location that is both readable and writable, and leave no
+readable ELF that was not meant to be allowed.
+.PP
+.B mount\-noexec
+over the writable areas closes the writable-payload half of the bypass, and
+only that half; it is worth applying whether or not the loader is listed.
+The loader maps the target
+.BR PROT_EXEC ,
+and the kernel refuses that mapping on a
+.B MNT_NOEXEC
+mount.
+Measured on both kernels inside a container \(em an ELF written into a
+.BR mount\-noexec " " /tmp
+fails with \(lqfailed to map segment from shared object\(rq by either route,
+while the same policy's exec-capable
+.B rw
+data directory still runs it.
+It does nothing about the other half: a readable unlisted ELF on any
+exec-capable mount is still startable through the loader.
+.PP
+A recursive
+.B \-\-ro
+directory rule undoes the allow-list on its own, loader or no loader:
+.B \-\-ro
+grants execute on every file beneath the directory, so
+.B \-\-ro
+.I /usr/lib
+makes
+.I /usr/lib/klibc/bin/true
+an
+.BR execve (2)
+target that no
+.B \-\-exec
+rule names.
+Grant library and read-only-data directories with
+.B \-\-rw
+instead: it is read plus write and carries no execute right.
+What makes that write right inert is a
+.B mount\-ro
+directive on each of those directories, which remounts the subtree
+read-only through
+.BR mount_setattr (2)
+with
+.B AT_RECURSIVE
+and so covers its submounts.
+.B "rootdir\-flags ... ro"
+alone does not: it is applied non-recursively, on purpose, so that
+.IR /proc ", " /dev " and " /sys
+stay usable, and a writable submount under the granted directory would
+remain writable.
+.I examples/restricted\-root.conf
+pairs the two.
+.PP
+Closing the bypass buys an exec-target boundary and not a code-execution
+boundary.
+What the allow-list can bound at best is which files may be started by name.
+An allowed program that is compromised at run time can still interpret a
+script, JIT, call
+.BR dlopen (3)
+or plainly
+.B mmap
+its own bytes
+.BR PROT_EXEC ;
+none of that is an
+.BR execve (2)
+or an open for execute, and Landlock hooks
+.BR open ,
+not
+.BR mmap .
+.PP
+A kernel-side exec confinement that checks the program actually being
+started, and so does not need the loader listed, is designed and not
+shipped.
+.PP
+The other limits of an allow-list built this way \(em that it is a property
+of the sandbox rather than of a caller, and that it keys on the inode \(em
+are under
+.B \-\-exec
+above, and in
+.B SECURITY.md
+under \(lqKnown limitations\(rq.
 .SH FILES
 .TP
 .I /etc/compartment/*.conf

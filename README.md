@@ -305,8 +305,8 @@ compartment-user, so keep the two kinds in separate files.
 | `audit on` / `audit-log DIR` | both | Audit trail |
 | `inherit NAME` | both | Load another profile first, then apply these rules on top |
 | `rootdir DIR` | compartment-root | The container root. Must be root-owned and not group- or world-writable |
-| `rootdir-flags LIST` | compartment-root | Extra mount flags for the rootdir bind: `ro`, `noexec` (`nosuid` and `nodev` are always applied) |
-| `mount-ro PATH` | compartment-root | Bind PATH onto itself inside the new root and remount it read-only |
+| `rootdir-flags LIST` | compartment-root | Extra mount flags for the rootdir bind: `ro`, `noexec` (`nosuid` and `nodev` are always applied). Applied **non-recursively** — submounts, `/proc`, `/dev` and `/sys` included, keep their own flags |
+| `mount-ro PATH` | compartment-root | Bind PATH onto itself inside the new root and remount it read-only, recursively where the kernel has `mount_setattr(2)`. This is what makes the write right of a `rw` library rule inert |
 | `mount-noexec` / `mount-nosuid` / `mount-nodev PATH` | compartment-root | The same, for the other three flags (repeatable) |
 | `uid` / `gid` / `username` | compartment-root | The service user to drop to |
 | `uid-map` / `gid-map` | compartment-root | `<container-start> <host-start> <count>`; default is the identity map |
@@ -320,18 +320,27 @@ regular file, and a rule on a file carries only the file-level rights. So
 landlock on
 exec /usr/bin/exampled
 exec /usr/bin/psql
-ro   /usr/lib
+rw   /usr/lib     # libraries need read; `rw` carries no execute right
 ```
 
-means "these two binaries may be executed and nothing else", because no
-directory in the policy carries execute. Two things to know before relying
-on it: the dynamic loader has to be listed as well (`execve(2)` opens the
-ELF interpreter with `FMODE_EXEC`, so Landlock checks execute on it), while
-shared libraries do *not* (`ld.so` opens them read-only, and Landlock has no
-mmap hook — `ro`/`rw` on the library directory is enough); and the rule keys
-on the file, so a busybox-style multi-call binary cannot be split into
-applets. `ro` grants execute too, which is why no directory holding binaries
-may appear as `ro` in an allow-list policy.
+means "these two files may be the target of an `execve(2)` and nothing
+else", because no directory in the policy carries execute. Three things to
+know before relying on it. The dynamic loader has to be listed as well
+(`execve(2)` opens the ELF interpreter with `FMODE_EXEC`, so Landlock checks
+execute on it), while shared libraries do *not* (`ld.so` opens them
+read-only, and Landlock has no mmap hook — read on the library directory is
+enough). The rule keys on the file, so a busybox-style multi-call binary
+cannot be split into applets. And `ro` on a directory grants execute on
+every file beneath it, which is why the library directory above is `rw` and
+why no directory holding binaries may appear as `ro` in an allow-list
+policy — `ro /usr/lib` would make `/usr/lib/klibc/bin/true` an `execve`
+target that no `exec` rule names.
+
+Once the loader is listed the allow-list is a hardening layer rather than an
+exec-target boundary, because the loader will start a compatible loadable
+ELF for anyone who can read it. SECURITY.md and `HOWTO.md` fact 5 give the
+full statement and the two shapes that close that bypass; neither shape
+turns the allow-list into a code-execution boundary.
 
 **Landlock network rules are TCP-only and allow-list-only.** `net-bind` and
 `net-connect` map onto `LANDLOCK_RULE_NET_PORT`, which covers `bind(2)` and
@@ -383,9 +392,10 @@ mount-mask /proc/keys
 # Landlock inside the container (opt-in), mount hardening, TCP ports
 landlock on
 exec /usr/bin/myapp
-ro   /usr/lib
+rw   /usr/lib
 rw   /srv/data
 rootdir-flags ro
+mount-ro /usr/lib
 mount-noexec /tmp
 net-connect 5432
 net-default deny

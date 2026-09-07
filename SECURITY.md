@@ -59,7 +59,7 @@ documented limitations, including:
   namespace, uid/gid mapping, cgroup path confinement and policy reporting
   — 101 assertions in 1.4.0, all passing on Ubuntu 24.04
   (kernel 6.8.0, gcc 13.3) and Ubuntu 26.04 (kernel 7.0.0, gcc 15.2).
-  `tests/scripts/root.d/compartment-root-landlock.sh` adds 56 more for
+  `tests/scripts/root.d/compartment-root-landlock.sh` adds 67 more for
   Landlock inside the container, the `exec` binary allow-list, the mount
   hardening, `rootdir` ownership, the `--netns` join and devpts/`/dev/shm`;
   `tests/scripts/root.d/limited-root.sh` adds 67 for the limited-root
@@ -176,6 +176,53 @@ documented limitations, including:
   binaries — `execve(2)` opens the ELF interpreter with `FMODE_EXEC` —
   while shared libraries need only read access, because `ld.so` opens them
   read-only and Landlock has no mmap hook
+- **An `exec` allow-list that lists the loader is a hardening layer, not an
+  exec-target boundary.** Listing the dynamic loader is required for any
+  dynamically linked policy (above), and it is also the way out of the
+  allow-list: `/lib64/ld-linux-x86-64.so.2 /path/to/readable.elf` starts
+  that file with no `execve(2)` of it and therefore no execute check on it.
+  The loader opens the target `O_RDONLY` and maps it `PROT_EXEC`, and
+  Landlock has no mmap hook — the same mechanism that lets a shared library
+  load on read access alone. A compatible loadable ELF the sandbox can read
+  is one it can run. Since `rw` grants read, any location that is both
+  readable and writable — a data directory, `$HOME`, `/tmp` — is somewhere
+  the sandbox can write an ELF and then start it, and any readable unlisted
+  system binary can be started without writing anything. Measured on
+  6.8.0-139 (ABI v4) and 7.0.0-31 (ABI v8), rootless and inside a
+  `compartment-root` container: the direct `execve` returns `EACCES` and the
+  loader runs the same file. Two shapes close the direct-loader bypass —
+  static-link the allowed binaries and do not list the loader (an unlisted
+  loader cannot be executed either, and a dynamically linked payload then
+  cannot start at all), or grant no location that is both readable and
+  writable and leave no readable ELF you did not intend to allow. A `noexec`
+  mount over the writable areas (`mount-noexec` in a compartment-root
+  profile) closes the writable-payload half of the bypass and only that
+  half, measured on both kernels — the loader maps its target `PROT_EXEC`
+  and the kernel refuses that on `MNT_NOEXEC` — while a readable unlisted
+  ELF elsewhere is untouched by it. Closing the bypass buys an exec-target
+  boundary and never a code-execution boundary: an allowed program that is
+  compromised can still interpret a script, JIT, `dlopen` or
+  `mmap(PROT_EXEC)` code of its own, none of which is an `execve` or an
+  `open` for execute. A kernel-side exec confinement that checks the program
+  actually being started, and so does not need the loader listed, is
+  designed and not shipped. `HOWTO.md`, "`exec` on a file: a binary
+  allow-list", fact 5, is the full statement;
+  `rootless.d/landlock-rules.sh` and `root.d/compartment-root-landlock.sh`
+  re-measure it on every run
+- **`ro` on a directory grants execute on every file beneath it.** A
+  directory rule is not a data grant: `ro /usr/lib` in an `exec` allow-list
+  makes `/usr/lib/klibc/bin/true` — and every other executable a
+  distribution leaves under `/usr/lib` — an `execve` target that no `exec`
+  rule names. `examples/restricted-root.conf` grants the library and
+  read-only-data directories with `rw` for exactly this reason: `rw` is read
+  plus write and carries no execute right. What makes that write right inert
+  is a `mount-ro` directive on each of those directories: `rootdir-flags ro`
+  is applied **non-recursively**, on purpose, so that `/proc`, `/dev` and
+  `/sys` stay usable, and a writable submount under a `rw` rule would
+  otherwise stay writable. `mount-ro` remounts the subtree read-only through
+  `mount_setattr(2)` with `AT_RECURSIVE` and covers the submounts too.
+  `HOWTO.md` facts 2 and 3 state the rule; both Landlock suites witness it,
+  and the root suite witnesses the recursion difference in both directions
 - **A Landlock rule for a path that does not exist grants nothing.** That is
   now a fatal error rather than a silent no-op; a trailing `?` on the path
   marks a rule optional. `--verbose` reports the number of rules actually

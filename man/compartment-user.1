@@ -186,6 +186,10 @@ The grant keys on the file, so a busybox-style multi-call binary cannot be
 split into applets, and a shell builtin is not an
 .BR execve (2)
 at all.
+Listing the loader is also the way out of the allow-list, which makes the
+allow-list a hardening layer rather than an exec-target boundary; see
+.B LIMITATIONS
+below before relying on one.
 .TP
 .BI \-\-workdir " PATH"
 Set working directory. It is added as a path rule in its own right \(em
@@ -795,6 +799,92 @@ enforcement failure is logged to syslog.
 .B 127
 Command not found or not executable under Landlock restrictions.
 .SH LIMITATIONS
+.PP
+An
+.B \-\-exec
+allow-list that lists the dynamic loader is a hardening layer, not an
+exec-target boundary.
+Listing the loader is required for any dynamically linked policy, and it is
+also the way around the allow-list: once the loader carries the execute
+right,
+.I "ld-linux-x86-64.so.2 /path/to/readable.elf"
+starts that file with no
+.BR execve (2)
+of it and therefore no execute check on it.
+The loader opens the target
+.B O_RDONLY
+and maps it
+.BR PROT_EXEC ,
+and Landlock has no mmap hook \(em the same mechanism that lets a shared
+library load on read access alone.
+A compatible loadable ELF the sandbox can read is one the sandbox can run.
+Because
+.B \-\-rw
+grants read, any location that is both readable and writable \(em a data
+directory,
+.IR $HOME ,
+.I /tmp
+\(em is somewhere the sandbox can write an ELF and then start it, and any
+readable unlisted system binary can be started without writing anything.
+Measured on 6.8.0\-139 (Landlock ABI v4) and 7.0.0\-31 (ABI v8): the direct
+.BR execve (2)
+is refused with
+.BR EACCES ,
+and the loader runs the very same file.
+.PP
+Two shapes close the direct-loader bypass.
+Static-link the allowed binaries and do not list the loader \(em an unlisted
+loader cannot be executed either, so a dynamically linked payload cannot
+start at all.
+Or grant no location that is both readable and writable, and leave no
+readable ELF that was not meant to be allowed.
+A
+.B noexec
+mount over the writable areas closes the writable-payload half of the
+bypass, and only that half \(em the loader maps its target
+.B PROT_EXEC
+and the kernel refuses that on a
+.B MNT_NOEXEC
+mount \(em while a readable unlisted ELF elsewhere is untouched by it.
+.PP
+A recursive
+.B \-\-ro
+directory rule undoes the allow-list on its own, loader or no loader:
+.B \-\-ro
+grants execute on every file beneath the directory, so
+.B \-\-ro
+.I /usr/lib
+makes
+.I /usr/lib/klibc/bin/true
+an
+.BR execve (2)
+target that no
+.B \-\-exec
+rule names.
+Grant library and read-only-data directories with
+.B \-\-rw
+instead: it is read plus write and carries no execute right.
+.PP
+Closing the bypass buys an exec-target boundary and not a code-execution
+boundary.
+What the allow-list can bound at best is which files may be started by name.
+An allowed program that is compromised at run time can still interpret a
+script, JIT, call
+.BR dlopen (3)
+or plainly
+.B mmap
+its own bytes
+.BR PROT_EXEC ;
+none of that is an
+.BR execve (2)
+or an open for execute, and Landlock hooks
+.BR open ,
+not
+.BR mmap .
+.PP
+A kernel-side exec confinement that checks the program actually being
+started, and so does not need the loader listed, is designed and not
+shipped.
 .PP
 .B \-\-cap\-drop
 and
