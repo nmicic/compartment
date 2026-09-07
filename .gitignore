@@ -2,12 +2,18 @@
 compartment-user
 compartment-root
 tests/probes/deny_probe
+tests/probes/fd_reader-static
 
 # Build artifacts
 *.o
 *.d
 *.a
 *.so
+# ...but the test discovery directories are not build artifacts: "*.d" above
+# matches the directory names tests/scripts/root.d and tests/scripts/rootless.d,
+# and git will not descend into an excluded directory, so every suite dropped
+# into them would be silently untracked. Re-include the directories themselves.
+!tests/scripts/*.d/
 
 # Generated headers (config.py output)
 config.h

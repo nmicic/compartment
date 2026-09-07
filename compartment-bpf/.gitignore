@@ -6,11 +6,13 @@ original/
 /compartment-bpf
 /compartment.bpf.o
 /compartment.skel.h
+/compartment-observe.bpf.o
+/compartment-observe.skel.h
 /vmlinux.h
 /vmlinux.h.tmp
 
 # Test instrument binaries / output (built by `make test-tools`, `make bench`)
-test/sealprobe
+tests/sealprobe
 tests/fuzz_oracle
 tests/matrix-results-*.csv
 tests/bypass-results-*.txt
@@ -19,6 +21,11 @@ tests/fuzz-summary-*.json
 tests/bench-results-*.csv
 tests/stress-summary-*.txt
 tests/results/
+
+# actor-wrapper harness binaries (built by `make check-wrapper`, which
+# runs as root — so they land root-owned in the checkout and every later
+# rsync of the tree fails trying to replace them).
+tests/actor-wrapper/build/
 
 # Phase 2 mesh stub binaries (built by `make mesh-stubs` / `make check-mesh`).
 # Sources live under tests/mesh/stubs/ (tracked); compiled stubs are

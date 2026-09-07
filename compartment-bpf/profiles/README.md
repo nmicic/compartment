@@ -122,8 +122,9 @@ positive control via LSM, and 0 unexpected DENY events.
 sudo bash tests/aggregate-smoke.sh
 ```
 
-Loads `profiles/all-daemons.conf` (concatenation of all 10 profiles —
-48 seal directives) and asserts every daemon stays operational
+Loads `profiles/all-daemons.conf` (concatenation of the 16 per-daemon
+profiles it names in its own header — 111 seal directives) and asserts
+every daemon stays operational
 *simultaneously*. This is the production-like run.
 
 Output: `tests/aggregate-smoke-results-<TS>.csv`.
@@ -137,10 +138,12 @@ only the `seal` directive — there is no `include`).
 
 Reference runs from RUN 20260430-profiles-top10:
 
-- `tests/profile-smoke-results-20260430T044525Z.csv` — 10/10 PASS
-  per-profile, 0/10 unexpected denies, 10/10 binaries ETXTBSY-locked.
-- `tests/aggregate-smoke-results-20260430T044629Z.csv` — 10/10 PASS
-  under aggregate enforcement, 0 unexpected denies.
+- per-profile: 10/10 PASS, 0/10 unexpected denies, 10/10 binaries
+  ETXTBSY-locked.
+- aggregate: 10/10 PASS under aggregate enforcement, 0 unexpected denies.
+
+The result CSVs are per-run artefacts under `tests/` and are not
+committed — re-run the two scripts above to regenerate them.
 
 One recurring lesson from these profiles: when sealing a systemd unit's
 `.conf`, also seal the parallel `/usr/lib/systemd/<x>.conf.d/` vendor
@@ -168,6 +171,29 @@ The actor= clause is parser-checked at load time
 strict mode requires every actor binary to be `full`-sealed at its
 declared path). See HOWTO.md §2 for the syntax reference and worked
 examples.
+
+## Auth-path profile (the kernel half of limited root over SSH)
+
+- **`profiles/limited-root-authpath.conf`** — not a daemon profile and
+  deliberately **not** part of `all-daemons.conf`. It is the inode half of
+  the deployment `HOWTO.md` "Limited root over SSH" describes: the session
+  half lives in the core repo as `examples/limited-root.conf` and binds the
+  confined *session* with Landlock, seccomp and a capability bounding set,
+  while this file binds the *inodes* on the login path — sshd and its
+  config, PAM, `/etc/ld.so.preload`, the shells, `passwd`/`shadow`/`sudoers`
+  — so a uid-0 process that was never in the session (cron, a unit, a
+  package hook) cannot edit the confinement out from under itself. Neither
+  half is sufficient alone; the profile's own header says which adversary
+  each one answers.
+
+  Load it with `--pin`, never as a daemon: a daemon can be signalled by any
+  same-uid process, and below Landlock ABI v6 the confined session can send
+  that signal. Against an account that has had `CAP_BPF` dropped — which is
+  exactly what `limited-root.conf` does — the ED-11 passphrase is the wall
+  in front of `--unpin`. Adding `--self-protect` to the same `--pin` closes
+  the `CAP_BPF` path as well; read HOWTO.md §3.6 for the upgrade rule that
+  comes with it. Witnessed end to end by
+  `tests/scripts/root.d/limited-root.sh` (group 6) in the core repo.
 
 ## Limits
 

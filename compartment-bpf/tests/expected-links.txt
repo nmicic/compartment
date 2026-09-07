@@ -1,0 +1,63 @@
+# tests/expected-links.txt
+#
+# The exact set of BPF links `compartment-bpf --pin` must leave under
+# /sys/fs/bpf/compartment/links, one name per line.
+#
+# smoke-pin returned rc=0 for every one of six mutations that disabled an
+# enforcement program (inode_set_acl, file_ioctl_compat, sb_mount,
+# move_mount, sb_umount, bprm_committed_creds): the loader starts cleanly
+# with one fewer link, the pin path never counted them, and nothing else
+# in the pin layer looked. The CHANGELOG's "28 links attached" had no
+# gate at all.
+#
+# comp_file_ioctl_compat is conditional: on a kernel without
+# security_file_ioctl_compat() the program is not autoloaded and the pin
+# is skipped, which is correct — compat ioctls route through
+# security_file_ioctl() there. It is marked below and the assertion keys
+# it off the loader's own "[probe] file_ioctl_compat hook: present|absent"
+# line, so the check is exact on both 6.8 and 7.0 rather than a count
+# with a tolerance.
+#
+# comp_inode_setattr is pinned under that canonical name whichever of the
+# two kernel-signature wrappers is live.
+#
+# comp_bpf_map carries the marker `self-protect`: it is autoloaded ONLY when
+# --pin --self-protect was asked for, and only then on a kernel whose vmlinux
+# BTF has bpf_lsm_bpf_map with the 2-argument shape (true on 6.8 and 7.0 alike
+# — verified FUNC_PROTO vlen=2 on both). A default `--pin` pins 28 links, the
+# same set v0.8 pinned; `--pin --self-protect` pins 29. --self-protect refuses
+# to run at all on a kernel without the hook rather than pretend the maps are
+# protected. The assertion keys off the loader's own
+# "[probe] bpf_map hook: ... (self-protection ARMED)" line, so it is exact in
+# both modes rather than a count with a tolerance.
+#
+# Adding or removing a hook means changing this file in the same commit.
+comp_bpf_map	self-protect
+comp_bprm_committed_creds
+comp_file_ioctl
+comp_file_ioctl_compat	conditional
+comp_file_mprotect
+comp_file_open
+comp_file_permission
+comp_file_truncate
+comp_inode_create
+comp_inode_link
+comp_inode_mkdir
+comp_inode_mknod
+comp_inode_remove_acl
+comp_inode_removexattr
+comp_inode_rename
+comp_inode_rmdir
+comp_inode_set_acl
+comp_inode_setattr
+comp_inode_setxattr
+comp_inode_symlink
+comp_inode_unlink
+comp_mmap_file
+comp_move_mount
+comp_ptrace_access_check
+comp_ptrace_traceme
+comp_sb_mount
+comp_sb_umount
+comp_task_alloc
+comp_task_prctl

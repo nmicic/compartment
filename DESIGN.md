@@ -28,21 +28,25 @@ compartment.h           <- shared code (static inline, zero deps)
   |-- Audit logging (PPID chain, file-per-day, O_CLOEXEC)
   |-- Environment sanitization (deny-list + allow-list)
   |-- Variable expansion ($HOME, $USER)
-  |-- Syscall name->number table (135 entries, __NR_* macros, portable)
+  |-- Syscall name->number table (__NR_* macros, portable)
   |-- Capability name->number table (41 entries)
   |-- seccomp BPF builder (raw, no libseccomp)
+  |-- Built-in seccomp deny-list (one table, used by both tools)
+  |-- Landlock ruleset builder (path rules, TCP port rules, ABI gating)
   +-- Common Config fields and types
 
 compartment-user.c      <- includes compartment.h
-  |-- Landlock enforcement
   |-- Shell-replacement mode (argv[0] detection)
   |-- AI-agent built-in profiles
   +-- main() with rootless CLI
 
 compartment-root.c      <- includes compartment.h
   |-- Namespace creation (clone flags)
-  |-- pivot_root + /dev + /proc setup
-  |-- UID/GID mapping
+  |-- pivot_root, then /proc + /sys + /dev + devpts + shm, then detach
+  |-- rootdir ownership validation and mount-flag hardening
+  |-- /proc mask table
+  |-- Container init (PID 1 reaper: signal forwarding + orphan reaping)
+  |-- UID/GID mapping (identity by default; uid-map/gid-map to shift)
   |-- Capability drop + preserve (raw prctl + capset, no libcap)
   |-- Cgroup assignment
   |-- Network namespace (join or create)
@@ -57,6 +61,60 @@ cc -o compartment-root compartment-root.c          # zero deps
 
 The header is `#include`d directly — no separate compilation unit, no
 linking, no build system complexity.
+
+## Trust boundaries
+
+Three of the tools in this repository confine a uid-0 subject, and they do
+it against three different adversaries. Which one a control answers is the
+first thing to establish about it, because the failure mode of confusing
+them is believing a boundary exists where none does.
+
+**The confined session.** Everything `compartment-user` installs — a
+Landlock domain, a seccomp filter, a capability bounding set, a private
+mount namespace, `no_new_privs` — is per-task kernel state established at
+the `execve` that enters the sandbox. It is inherited by every descendant,
+it can only be narrowed, and there is no API to release any of it. Against
+a process *inside* the session this is a genuine boundary. Against anything
+else it is silent: it is a property of the task, not of the filesystem, so
+it constrains only the side it is on. That is why it says nothing about a
+uid-0 process that was never in the session, and why it creates no uid
+boundary at all — the account is still uid 0, and DAC contributes nothing
+to a subject holding `CAP_DAC_OVERRIDE`.
+
+**Unconfined root.** A uid-0 process outside the session — cron, a systemd
+unit, a package hook, an sshd session for an account whose shell is not the
+wrapper — is not in any domain and cannot be reached by one. The only
+control that binds it is one that binds the *object* instead of the
+subject: a `compartment-bpf` seal, which keys on `(dev, ino)` and is
+enforced by the kernel on every caller regardless of uid or capability.
+This is why the limited-root deployment ships as two profiles that have to
+be deployed together — `examples/limited-root.conf` binds the session,
+`compartment-bpf/profiles/limited-root-authpath.conf` binds the inodes on
+the login path — and why neither half is sufficient. `/etc/ld.so.preload`
+is the clearest case: a Landlock rule protects it from the session, but the
+file is read by the dynamic loader in unconfined processes, sshd included,
+so only a seal covers the other side.
+
+**`CAP_BPF`.** The seals are themselves kernel state, and the capability
+that manages BPF manages them. A holder can obtain an fd to any of the
+tool's maps and rewrite it from program context — `bpf_map_freeze()` gates
+the syscall path only — or unlink the bpffs pin tree, or unmount the
+filesystem holding it. So `CAP_BPF` sits underneath both of the layers
+above, and it is answered from two directions that do not substitute for
+each other: a limited-root profile drops the capability from the confined
+session, which makes `CAP_BPF` the only route to the seals; and
+`compartment-bpf --pin --self-protect` puts the maps and the pin tree
+behind the loader's own binary identity, which answers everybody else.
+Under it all sits the boot chain, which nothing enforced from inside a
+running kernel can defend: bpffs is not persistent and the BPF LSM is in
+the chain only because `lsm=` on the kernel command line put it there.
+Secure Boot and a locked bootloader are a separate layer and a separate
+decision.
+
+What each layer does *not* cover is documented where an operator will meet
+it: `HOWTO.md`, "Limited root over SSH" §8 for the session side, and the
+self-protection section of `compartment-bpf/LIMITATIONS.md` for the kernel
+side.
 
 ## Unification History
 
@@ -96,7 +154,7 @@ Wired `audit_log_open()` + `audit_log()`. Log opened before `clone()`
 ### Bonus: Portable syscall table
 
 Replaced architecture-split table (35 hardcoded entries for x86_64 +
-aarch64 separately) with 135-entry table using `__NR_*` macros from
+aarch64 separately) with a 200+ entry table using `__NR_*` macros from
 `<sys/syscall.h>`. Single table, portable across architectures
 (x86_64, aarch64, riscv64, s390x, ppc64le, loongarch64).
 
@@ -120,11 +178,11 @@ External review + automated testing uncovered these bugs:
 | 10 | **Medium** | compartment.h | `expand_var()` returned truncated path on buffer overflow — could create broader policy than intended | Returns NULL on truncation; caller aborts with error message |
 | 11 | **Low** | compartment-root | Missing `CLONE_NEWCGROUP` — container could see host cgroup hierarchy | Added to clone flags (Linux 4.6+, with fallback define) |
 | 12 | **High** | compartment-root | `cap-allow` only dropped bounding set — after `setuid()`, service user had zero effective caps despite profile | Added `PR_SET_KEEPCAPS` + raw `capset()` + `PR_CAP_AMBIENT_RAISE` |
-| 13 | **Medium** | compartment-user | Shell-replacement mode fail-open — ignored `prctl`/Landlock/seccomp failures | Made fail-closed: abort with rc=126 if any enforcement fails |
+| 13 | **Medium** | compartment-user | Shell-replacement mode ignored `prctl`/Landlock/seccomp failures silently | Kept fail-open by design (a login shell must never be blocked) but made it visible: each failure is counted and reported to syslog at `LOG_WARNING` with uid, pid and ppid |
 | 14 | **Medium** | compartment-user | `workdir` directive only implied `rw` in built-in ai-agent profile, not file-loaded profiles | Auto-add `rw` for `workdir` after all profile loading |
 | 15 | **High** | compartment-root | `join_netns()` path traversal — `netns_name` containing `/` could open arbitrary files instead of `/var/run/netns/<name>` | Reject any `netns_name` that contains `/` |
 | 16 | **High** | compartment-root | `assign_to_cgroups()` path traversal — cgroup paths with `..` components could write PID to arbitrary files | Reject relative paths and paths containing `..` components |
-| 17 | **High** | compartment-user | Shell-replacement `COMPARTMENT_SHELL_DIR` path traversal — env var could point outside intended directory | Reject non-absolute paths and paths containing `..` components |
+| 17 | **High** | compartment-user | Shell-replacement `COMPARTMENT_SHELL_DIR` path traversal — env var could point outside intended directory | Reject non-absolute paths and paths containing `..` components (extended later — see fix 53) |
 | 18 | **Medium** | sandbox.sh | Predictable proxy socket path in world-writable `/tmp` — race window for socket hijack | Move socket into a private `mktemp -d` directory (mode 700) |
 | 19 | **Medium** | sandbox.sh | `slirp4netns` success not verified — SOFT mode proceeded with broken networking on slirp failure | Poll for `tap0` interface appearance; abort if it does not appear |
 | 20 | **High** | compartment.h | Profile `uid`/`gid` parsed with `strtoul(val, NULL, 10)` — no error/range check; value `4294967296` silently truncates to UID 0 (root) | Added endptr/errno/range validation matching CLI parser |
@@ -157,10 +215,36 @@ External review + automated testing uncovered these bugs:
 | 47 | **Medium** | sandbox.sh | SOFT mode: background processes survived sandbox teardown — reparented to host PID 1 | Added `unshare --pid --fork` in SOFT mode nsenter to kill all descendants on exit |
 | 48 | **Info** | sandbox.sh | `SHELL_STASH` discoverable via `/proc/self/mountinfo` | Documented as known limitation — real security boundary is Landlock + seccomp, not path hiding |
 
+### Profile trust review
+
+A second review concentrated on everything upstream of enforcement: where
+the policy comes from and how the parser behaves when it goes wrong.
+
+| # | Severity | Component | Issue | Fix |
+|---|----------|-----------|-------|-----|
+| 49 | **Critical** | compartment.h | `$HOME/.config/compartment/<name>.conf` was searched before `/etc/compartment/`, and the built-in `ai-agent` profile grants RWX on `$HOME` — a sandboxed agent could write its own next-run profile and disable every mechanism for all later runs | System profiles first; `$HOME` only for compartment-user, only behind the new `--user-profiles` flag, never in shell-replacement mode, and never reachable through `inherit` from a `/etc` profile |
+| 50 | **Critical** | compartment.h | Profile files were read with no ownership or mode check, so `compartment-root` (uid 0) took `rootdir`, `username`, `cap-allow` and the seccomp policy from a `$HOME`-relative file | Validate every profile on the fd it is read from: regular file, owned by root or the caller's real uid (root only for compartment-root), no group/other write, containing directory the same. Symlinks stay usable; the target's directory is checked too |
+| 51 | **High** | compartment.h | A profile rejected mid-file kept its already-parsed rules, and the caller then layered a built-in on top and reported the result as `(built-in)` | Parse into a scratch `Config`, commit only on success, and give the loader a three-way result so "not found" and "found but invalid" are distinguishable. Invalid is always fatal, `--dry-run` included |
+| 52 | **High** | compartment.h | `landlock`/`seccomp`/`no-new-privs`/`env-sanitize` could be turned **off** from a profile — a complete escape for anyone who can write one | One-way switches: `off` in a profile is a fatal parse error. Only `--no-landlock`, `--no-seccomp` and `--no-env-sanitize` on the command line can disable enforcement; `no_new_privs` is now genuinely always on |
+| 53 | **Medium** | compartment-user | `COMPARTMENT_SHELL_DIR` chose which binary the replaced shell runs, defeating the `hardened` target's randomised `REAL_SHELL_DIR` | Honoured only when the directory and the shell binary are owned by root or the caller and are not group/other-writable; otherwise a warning and a fall back to the compile-time path. The sandbox is applied before the exec either way |
+| 54 | **High** | compartment.h | Inline `#` comments were swallowed into the value: `ro /usr  # libs` installed no rule and `env-deny LD_PRELOAD  # x` stripped nothing | A `#` beginning a whitespace-separated token starts a comment; values are right-trimmed; a `#` inside a token stays literal |
+| 55 | **High** | compartment.h | `block` entries past `MAX_BLOCKED_SC` (64) were dropped silently, deleting `pidfd_getfd`, `mount_setattr`, `ioperm` and `iopl` from the shipped policy | Limit raised to 256 (519 BPF instructions at the limit); every append goes through a helper that names the overflowing entry and refuses to run |
+| 56 | **Medium** | compartment-user | `$HOME` was used unvalidated as an RWX Landlock root, so `HOME=/` granted `rwx /` | Must be absolute, not `/`, and an existing directory owned by the caller's real uid |
+| 57 | **Medium** | compartment.h | Audit directory unvalidated: `O_NOFOLLOW` covered only the final component, an existing 0777 directory was accepted, and the default lived under world-writable `/var/tmp` | Default is now `/var/lib/compartment/audit/<uid>` when an admin provisioned it (root-owned parent, per-uid dir 0700), else `/var/tmp/compartment-audit-<uid>` created 0700 and **fail-closed** if squatted, and `/var/log/compartment` for root — none of them inside a path the built-in profiles grant for writing, so the confined process cannot rewrite its own trail. The directory is validated on its own fd and opened `O_DIRECTORY` + `O_NOFOLLOW`, the day file created with `openat`, and control characters scrubbed from every logged field |
+| 58 | **Medium** | compartment-user | Environment deny-list missed `GLIBC_TUNABLES`, most of the `LD_*` family, `PYTHON*`, `PROMPT_COMMAND`, `IFS`, `ZDOTDIR`, `GIT_SSH_COMMAND`, `PAGER`/`EDITOR` and more | Entries may end in `*` for a prefix match; the built-in uses `LD_*`, `DYLD_*`, `BASH_FUNC_*`, `PYTHON*`, `PERL5*` and `GIT_CONFIG_*`. Model-provider API keys stay deliberately untouched |
+| 59 | **High** | compartment-root | `--profile=FILE` and `-pFILE` silently discarded the entire policy: a hand-rolled pre-scan matched only the exact tokens `--profile` and `-p`, and getopt's own case was a no-op | Two `getopt_long` passes over the same optstring — the first resolves `-p/--profile`, the second applies everything else |
+| 60 | **Low** | compartment-user | Shell-replacement mode skipped `preflight_check()`, the ambient-capability clear, `PR_SET_DUMPABLE(0)` and `close_range()` | Hardening factored into `apply_hardening()` and called from both paths; preflight runs advisory so it still cannot block a login |
+| 61 | **Low** | compartment.h | Every `strdup()` return was unchecked — a rule could silently become `NULL` | `xstrdup()` fails loudly; a sandboxing tool must not run a partially materialised policy |
+
+`--dump-profile NAME` was added alongside these: it serialises the
+resolved policy back to `.conf` syntax, so `examples/ai-agent.conf` and
+the HOWTO are generated from the binary rather than transcribed by hand.
+
 ### seccomp Return Action: EPERM vs KILL
 
 The BPF deny-list returns `SECCOMP_RET_ERRNO | EPERM` rather than
-`SECCOMP_RET_KILL_PROCESS`. This is deliberate:
+`SECCOMP_RET_KILL_PROCESS` **by default**; `seccomp-default kill|log`
+overrides it per policy. The default is deliberate:
 
 - **EPERM** lets well-behaved applications handle blocked syscalls
   gracefully (retry, fallback, log). Most runtimes (Node.js, Python,
@@ -177,22 +261,181 @@ blocks everything not explicitly permitted. For the default deny-list
 use case (AI agents, development tools), EPERM provides the right
 balance of safety and usability.
 
+`seccomp-default` exists because that argument is much weaker for an
+*allow-list*. An allow-list that is one syscall short does not degrade
+gracefully: the observed failure was a `SIGSEGV` from `ld.so` after `mmap`
+returned EPERM, which is both harder to diagnose than a `SIGSYS` and, in a
+security tool, an outcome that looks like a crash rather than a denial.
+`seccomp-default kill` turns those into `SECCOMP_RET_KILL_PROCESS`;
+`seccomp-default log` permits and records, which is the shape you want while
+working out what a policy needs. The default stays `errno` because changing
+it would alter the behaviour of every existing profile.
+
 ### Testing
 
-52 automated tests across 4 suites:
+`make test-integration` runs every unprivileged suite; `sudo make test-root`
+runs the root-only ones. Both print the assertion totals they measured —
+counts are deliberately not repeated here, because the three places that
+used to repeat them each quoted a different, wrong figure.
 
-- **Compartment-user matrix** (46 tests): Landlock ro/rw paths, seccomp
-  deny-list (ptrace, unshare, process_vm_*, userfaultfd, perf_event_open,
-  io_uring), environment sanitization (deny-list + preserve), combined
-  profiles, built-in profiles (ai-agent, strict + inheritance), --dry-run,
-  --verify, shell-replacement mode
-- **Child inheritance** (6 tests): seccomp survives fork/exec via /bin/sh
-  and /bin/bash, Landlock inherited by children, env sanitization inherited,
-  grandchild (depth-2) inherits seccomp
-- **Sandbox.sh** (skipped in containers): HARD/SOFT network modes, proxy bridge
-- **Claude CLI smoke** (4 tests): `claude --version` + `claude --print` under
-  full sandbox, audit logging captures PPID chain, --dry-run policy display
+- **Compartment-user matrix** (`run_compartment_user_matrix.sh`): Landlock
+  ro/rw paths, seccomp deny-list (ptrace, unshare, process_vm_*,
+  userfaultfd, perf_event_open, io_uring), environment sanitization
+  (deny-list + preserve), combined profiles, built-in profiles (ai-agent,
+  strict + inheritance), --dry-run, --verify, shell-replacement mode, FD
+  inheritance, and self-tests of the harness's own assertion helpers
+- **Child inheritance** (`run_child_inheritance_tests.sh`): seccomp survives
+  fork/exec via /bin/sh and /bin/bash, Landlock inherited by children, env
+  sanitization inherited, grandchild (depth-2) inherits seccomp
+- **Discovered suites**: every executable `tests/scripts/rootless.d/*.sh`
+  runs as its own suite, and every `tests/scripts/root.d/*.sh` under
+  `sudo make test-root`. Adding a test means adding a file, not editing a
+  runner. `core-matrix-extra.sh` covers the x32-ABI bypass, W^X in both
+  directions, exact seccomp errnos, profile parser limits and inherit
+  depth, --dry-run/--verify shape, and env sanitization as observed by the
+  exec'd process
+- **Sandbox.sh** (skipped without user namespaces): HARD/SOFT network
+  modes, proxy bridge
+- **External CLI smoke** (`run_claude_smoke.sh`): a third-party CLI under
+  full sandbox, audit logging captures the PPID chain, --dry-run policy
+  display. Skipped when that CLI is missing or unauthenticated, or with
+  `--no-external`
 
 Tests use `deny_probe`, a purpose-built binary with subcommands for each
-operation (fs_read, fs_write, sc_ptrace_traceme, env_get, spawn_sh, etc.)
-that reports machine-parseable results.
+operation (fs_read, fs_write, sc_ptrace_traceme, sc_ptrace_x32, env_get,
+env_dump, fd_list, spawn_sh, etc.) that reports machine-parseable results.
+It prints `PROBE_START op=<op> pid=<n>` before anything else: without a
+positive "the probe ran" marker, an assertion cannot distinguish a blocked
+operation from a probe the sandbox refused to exec, and six assertions
+used to pass on exactly that ambiguity.
+
+Everything above is rootless. compartment-root needs real root, so it has
+its own suites under `tests/scripts/root.d/`, which the rootless targets do
+not run:
+
+```bash
+sudo make test-root
+```
+
+`root.d/compartment-root.sh` exercises a real container: start-up with a
+plain-directory rootdir, the `/dev` device nodes, the default seccomp
+filter, the privilege drop and `no-new-privs`, `/proc` and `/sys` masking,
+namespace isolation and escape attempts (host mounts, `/proc/1/root`, a
+pre-opened directory fd, a setuid-root binary), the PID 1 reaper and signal
+handling, the network namespace, uid/gid mapping, cgroup path confinement,
+and what `--dry-run` and `--audit` report.
+`root.d/compartment-root-landlock.sh` covers Landlock inside the
+container, the `exec` binary allow-list, `rootdir-flags` and the
+`mount-*` hardening, `rootdir` ownership, the `--netns` join, and the
+private `devpts` and `/dev/shm`. `root.d/profile-trust-root.sh` covers
+profile trust under root, and `root.d/00-discovery-smoke.sh` proves the
+runner actually discovers what is in the directory. All of them build
+their own scratch trees under `mktemp -d` and remove everything they
+created on exit, including on failure. Green on kernel 6.8 (Ubuntu 24.04, gcc 13.3) and kernel 7.0
+(Ubuntu 26.04, gcc 15.2); the runner prints the assertion totals it
+measured rather than a number kept in this file.
+
+CI (`.github/workflows/ci.yml`) runs the build, the full rootless suite,
+the root suites under `sudo`, an ASan+UBSan build over the rootless suite,
+shellcheck, and file-mode checks, on ubuntu-22.04 and ubuntu-24.04.
+
+### Mount order in compartment-root
+
+`compartment-root` as shipped in 1.3.3 could not start with a
+plain-directory `rootdir`: it detached the old root immediately after
+`pivot_root` and then tried to `mount("proc", ...)`, which the kernel
+refused with `EPERM` ("VFS: Mount too revealing"). `mount_too_revealing()`
+only allows a fresh `proc`/`sysfs` mount inside a user namespace when a
+fully visible mount of the same filesystem already exists in the current
+mount namespace, and detaching `/.pivot_old` removed the last one.
+
+The order is therefore: `pivot_root` → mount `/proc` → mount read-only
+`/sys` → tmpfs `/dev` plus bind-mounts of the old root's device nodes, a
+private `devpts` and a tmpfs `/dev/shm` → `/proc` masks →
+`umount2("/.pivot_old", MNT_DETACH)` → the `mount-*` flag passes →
+`rootdir-flags ro`. Keeping the old root attached across the first steps is
+also what makes the device nodes reachable at all: `mknod(2)` checks
+`CAP_MKNOD` against the initial user namespace and always fails in a
+`CLONE_NEWUSER` child.
+
+The two tails matter as much as the head. `mount-ro` and friends have to
+run *after* the detach, because they bind paths inside the new root onto
+themselves and there is nothing to remount until then. `rootdir-flags ro`
+has to run last of all and non-recursively: every mount point above had to
+be created in a writable tree, and a recursive read-only pass would sweep
+`/proc`, `/dev` and `/sys` in with the root filesystem.
+
+### Landlock in compartment-root
+
+The ruleset is applied at step 8b — after all the mounts, before
+`drop_capabilities()`. Both halves of that are load-bearing. After the
+mounts, so the paths in the policy resolve to what the target will actually
+see rather than to whatever the host had at the same path. Before the
+capability drop, because `landlock_restrict_self(2)` requires either
+`no_new_privs` or `CAP_SYS_ADMIN`, and the child still holds the latter in
+its own user namespace at that point; `no_new_privs` is not set until step
+15, after the privilege drop, for reasons of its own. The ruleset survives
+`setuid` and is inherited by everything the container execs.
+
+Landlock is off by default here and on by default in compartment-user. That
+asymmetry is deliberate: compartment-user has always had it, and a
+compartment-root profile written before this release names paths that were
+previously inert. Turning it on silently would confine containers that were
+never tested confined. A policy with path rules and no `landlock on` gets a
+warning instead.
+
+### Why `exec` on a file is a real allow-list
+
+`LANDLOCK_ACCESS_FS_EXECUTE` is a path-subtree right, so Landlock cannot
+express "beneath `/usr/bin`, only these three". But a `path_beneath` rule
+may name a regular file, and a rule on a file carries only file-level
+rights — so granting execute on individual files and on no directory does
+produce "only these binaries run here". Verified on 6.8 and 7.0.
+
+Two kernel details decide whether such a policy works, and both were checked
+against the running kernel rather than inferred from the documentation:
+
+* The **ELF interpreter needs its own execute grant.** Landlock's
+  `file_open` hook maps `FMODE_EXEC` to `LANDLOCK_ACCESS_FS_EXECUTE`, and
+  `execve(2)` opens the interpreter with that flag. A policy that grants
+  execute on `/usr/bin/foo` but not on `/lib64/ld-linux-x86-64.so.2` fails
+  with `EACCES` at exec time.
+* **Shared libraries do not.** `ld.so` opens a `.so` read-only and maps it
+  `PROT_EXEC`; Landlock has no mmap or mprotect hook for this, so read
+  access to the library directory is sufficient. Confirmed by running a
+  dynamically linked binary with `rw` (read + write, no execute) on the
+  library directory.
+
+The limits are worth stating in the same breath. The policy belongs to the
+sandbox and not to a caller, so "root included, but only when launched by
+sshd" is unreachable. It keys on the inode, so a busybox rootdir is
+all-or-nothing. And a shell builtin is not an `execve`, so a shell in the
+allow-list gives away far more than the shell.
+
+### Landlock network rules
+
+`net-bind`/`net-connect` build `struct landlock_net_port_attr` with
+`LANDLOCK_RULE_NET_PORT`. Three traps are handled explicitly:
+
+1. **The port is in host byte order.** Every other port field in this
+   project is network order; this one is not.
+2. **`handled_access_net` denies what it handles.** Setting it with no
+   matching rule refuses all TCP bind and connect, the same trap the
+   filesystem side already guards for an empty ruleset. It is therefore set
+   only when the ABI is ≥ 4 *and* the policy names something — and only for
+   the access types the policy names, so `net-connect 443` does not also
+   forbid every `bind()`.
+3. **`LANDLOCK_RULE_NET_PORT` is an enumerator, not a macro.** `#ifndef`
+   can never see it, so the value is spelled out and used unconditionally,
+   along with a locally declared `struct landlock_net_port_attr` and a
+   locally declared ruleset attribute — the same approach compartment-root
+   already takes for `struct mount_attr`.
+
+The ABI table the code gates on, verified rather than assumed:
+1 = 5.13, 2 = 5.19 (REFER), 3 = 6.2 (TRUNCATE), 4 = 6.7 (TCP bind/connect),
+5 = 6.10 (IOCTL_DEV), 6 = 6.12 (scoping). The previous code gated
+`LANDLOCK_ACCESS_FS_IOCTL_DEV` on ABI ≥ 4, which is wrong by one release;
+it was invisible only because Ubuntu 24.04's `linux-libc-dev` 6.8 does not
+define that constant at all, so the `#ifdef` around it was always false and
+the right was silently unhandled. Adding the fallback `#define` without
+fixing the gate would have made every ABI-4 kernel refuse the ruleset.

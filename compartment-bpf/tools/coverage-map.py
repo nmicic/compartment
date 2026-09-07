@@ -34,6 +34,7 @@
 
 import os
 import re
+import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -49,30 +50,161 @@ def read(path):
         return f.read()
 
 
-def hook_tokens(name, observe):
-    """Acceptable witness token regexes for an LSM hook. A hook is rarely
-    referenced by its exact kernel hook name; witnesses drive the *operation*
-    it guards (e.g. inode_setxattr is exercised as the op `setxattr` in the
-    mesh matrix) or, for observe, the BPF program name `ao_<hook>`."""
-    toks = [r'\b' + re.escape(name) + r'\b']
+# ---------------------------------------------------------------------------
+# What counts as a witness
+# ---------------------------------------------------------------------------
+#
+# Until 2026-09 a hook was credited if its *bare op suffix* appeared anywhere
+# in the concatenated tests/ corpus, comments included. `file_open` was
+# therefore "witnessed" by the word `open` — which occurs in 52 test files —
+# and `create`, `link`, `unlink`, `truncate`, `permission`, `setxattr` and
+# friends behaved the same way. A hook could be deleted from the enforcement
+# path entirely and this gate would stay green. The rule now is:
+#
+#   A hook is witnessed by a test file F when
+#     (a) F names the hook EXACTLY (comments count — that is F's claim about
+#         what it exercises) AND F contains, OUTSIDE COMMENTS, a token for
+#         the operation that hook guards; or
+#     (b) F contains, outside comments, the hook's BPF program name
+#         (comp_<x> / ao_<x>), which is unique to the hook and needs no
+#         separate claim.
+#
+#   An action or counter is witnessed when its exact name appears OUTSIDE
+#   COMMENTS in some test file.
+#
+# So a comment that merely mentions a hook no longer witnesses it, and a bare
+# op token in an unrelated file no longer witnesses it either. Both halves
+# are asserted by `--selftest`.
+#
+# Op tokens that are not simply the hook name minus an inode_/file_ prefix.
+# Deliberately tiny and explicit — each row is a reviewable claim that a test
+# performing X exercises hook Y, and the co-occurrence rule still requires the
+# test file to name the hook.
+HOOK_OP_ALIASES = {
+    "mmap_file":           [r'\bmmap\b'],
+    "bprm_check_security": [r'\bexec\b', r'\bexecve\b'],
+    "task_prctl":          [r'\bprctl\b'],
+    "ptrace_access_check": [r'\bptrace\b'],
+    "ptrace_traceme":      [r'\bptrace\b', r'\btraceme\b'],
+}
+
+
+def strip_c_comments(text):
+    """Remove /* */ and // comments, respecting string/char literals."""
+    out = []
+    i, n, state = 0, len(text), None
+    while i < n:
+        c = text[i]
+        if state is None:
+            if c == '/' and i + 1 < n and text[i + 1] == '*':
+                j = text.find('*/', i + 2)
+                i = n if j < 0 else j + 2
+                out.append(' ')
+                continue
+            if c == '/' and i + 1 < n and text[i + 1] == '/':
+                j = text.find('\n', i)
+                i = n if j < 0 else j
+                continue
+            if c in ('"', "'"):
+                state = c
+            out.append(c)
+            i += 1
+            continue
+        if c == '\\' and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == state:
+            state = None
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+def strip_sh_comments(text):
+    """Remove `#`-to-end-of-line comments from shell/conf/python-ish text.
+    Quote-aware per line, and only treats `#` as a comment when it starts a
+    word (so $#, ${#x} and colour codes survive)."""
+    res = []
+    for line in text.split('\n'):
+        out = []
+        sq = dq = False
+        i, n = 0, len(line)
+        while i < n:
+            c = line[i]
+            if c == '\\' and not sq and i + 1 < n:
+                out.append(line[i:i + 2])
+                i += 2
+                continue
+            if c == "'" and not dq:
+                sq = not sq
+            elif c == '"' and not sq:
+                dq = not dq
+            elif c == '#' and not sq and not dq:
+                if i == 0 or line[i - 1] in ' \t;&|(':
+                    break
+            out.append(c)
+            i += 1
+        res.append(''.join(out))
+    return '\n'.join(res)
+
+
+def code_of(text, filename):
+    if filename.endswith(('.c', '.h')):
+        return strip_c_comments(text)
+    return strip_sh_comments(text)
+
+
+def bpf_prog_names(source):
+    """hook -> [BPF program name, ...] parsed from SEC("lsm/<hook>") followed
+    by int BPF_PROG(<name>, ...). Authoritative, so no hand-kept table."""
+    names = {}
+    for m in re.finditer(
+            r'SEC\("lsm(?:\.s)?/([a-z_]+)"\)\s*\nint\s+BPF_PROG\(\s*([A-Za-z_][A-Za-z0-9_]*)',
+            source):
+        names.setdefault(m.group(1), []).append(m.group(2))
+    return names
+
+
+def hook_tokens(name, observe, prog_names=()):
+    """(name_regex, [op-token regexes], [program-name regexes]).
+
+    name_regex is matched against the RAW file (the claim); op tokens and
+    program names are matched against the comment-stripped file (the code)."""
+    name_re = r'\b' + re.escape(name) + r'\b'
+    progs = [r'\b' + re.escape(pn) + r'\b' for pn in prog_names]
+    if observe:
+        # Observe hooks are witnessed ONLY by their BPF program name
+        # (ao_*). Every one of them shares a kernel hook name with an
+        # enforce hook, so accepting the shared op token would credit the
+        # observe surface to a test that never starts `compartment-bpf
+        # observe` — which is what used to happen. tests/observe/run.sh T0
+        # greps `bpftool prog show` for exactly these program names, so the
+        # honest witness is available and the weak one is not needed.
+        # Keep the historical ao_<hook> spelling too, in case the source
+        # spells a program differently from its hook.
+        progs.append(r'\bao_' + re.escape(name) + r'\b')
+        return name_re, [], progs
+    ops = [name_re]
     # op suffix for fs hooks (inode_setxattr -> setxattr, file_truncate ->
     # truncate). Only for fs-ish prefixes; task_/mmap_ suffixes are too
-    # generic ("alloc"/"free"/"file") to be a reliable proxy.
+    # generic ("alloc"/"free"/"file") to be a reliable proxy on their own.
     for pfx in ("inode_", "file_"):
         if name.startswith(pfx):
-            toks.append(r'\b' + re.escape(name[len(pfx):]) + r'\b')
-    # observe program spelling — observe-hook surfaces only, so the enforce
-    # task_alloc hook is not falsely credited by an observe ao_task_alloc ref.
-    if observe:
-        toks.append(r'\bao_' + re.escape(name) + r'\b')
-    return toks
+            ops.append(r'\b' + re.escape(name[len(pfx):]) + r'\b')
+    ops += HOOK_OP_ALIASES.get(name, [])
+    return name_re, ops, progs
 
 
 def extract_surfaces():
-    """Return ordered list of (kind, name, [token_regex, ...]) tuples."""
+    """Return ordered list of (kind, name, matcher) tuples.
+
+    matcher is ("hook", name_re, op_res, prog_res) for LSM hooks and
+    ("token", [regex, ...]) for actions and counters."""
     surfaces = []
 
     bpf = read(BPF)
+    bpf_progs = bpf_prog_names(bpf)
     # Enforce LSM hooks. SEC("lsm/foo") and SEC("lsm.s/foo"). Dedupe (the
     # dual inode_setattr wrapper emits the same hook name twice).
     hooks = []
@@ -80,15 +212,18 @@ def extract_surfaces():
         if m.group(1) not in hooks:
             hooks.append(m.group(1))
     for h in hooks:
-        surfaces.append(("enforce-hook", h, hook_tokens(h, observe=False)))
+        name_re, ops, progs = hook_tokens(h, False, bpf_progs.get(h, []))
+        surfaces.append(("enforce-hook", h, ("hook", name_re, ops, progs)))
 
     obs = read(OBSERVE_BPF)
+    obs_progs = bpf_prog_names(obs)
     ohooks = []
     for m in re.finditer(r'SEC\("lsm(?:\.s)?/([a-z_]+)"\)', obs):
         if m.group(1) not in ohooks:
             ohooks.append(m.group(1))
     for h in ohooks:
-        surfaces.append(("observe-hook", h, hook_tokens(h, observe=True)))
+        name_re, ops, progs = hook_tokens(h, True, obs_progs.get(h, []))
+        surfaces.append(("observe-hook", h, ("hook", name_re, ops, progs)))
 
     abi = read(ABI)
     # Deny actions. ACTION_DENY_X enum constants. The audit stream emits the
@@ -99,7 +234,7 @@ def extract_surfaces():
             actions.append(m.group(1))
     for a in actions:
         # token matches "ACTION_DENY_X" or audit-line "DENY_X"
-        surfaces.append(("action", a, [r'\b' + re.escape(a) + r'\b']))
+        surfaces.append(("action", a, ("token", [r'\b' + re.escape(a) + r'\b'])))
 
     # Enforce counters: the map *definitions* only ( "} name_total SEC" ),
     # which excludes comment-only mentions of hypothetical counters.
@@ -108,7 +243,7 @@ def extract_surfaces():
         if m.group(1) not in counters:
             counters.append(m.group(1))
     for c in counters:
-        surfaces.append(("counter", c, [r'\b' + re.escape(c) + r'\b']))
+        surfaces.append(("counter", c, ("token", [r'\b' + re.escape(c) + r'\b'])))
 
     # Observe counters: #define C_X <n>, excluding the C_MAX sentinel.
     ocounters = []
@@ -116,25 +251,110 @@ def extract_surfaces():
         if m.group(1) != "C_MAX" and m.group(1) not in ocounters:
             ocounters.append(m.group(1))
     for c in ocounters:
-        surfaces.append(("observe-counter", c, [r'\b' + re.escape(c) + r'\b']))
+        surfaces.append(("observe-counter", c, ("token", [r'\b' + re.escape(c) + r'\b'])))
 
     return surfaces
 
 
+# Directories under tests/ that hold per-run artefacts rather than tests.
+# tests/results/ is written by run-mesh.sh, pin-regression.sh,
+# observe/run.sh and strict-launch/run.sh and is gitignored;
+# tests/mesh/build/ holds compiled stub ELFs whose string tables match the
+# very tokens this gate looks for. Scanning either means a surface whose
+# only real in-tree witness has been deleted still reads as covered,
+# because the previous run's output names it.
+CORPUS_PRUNE = {"results", "build", "__pycache__"}
+
+# Only files that contain test *logic* witness a surface. A data file that
+# merely lists names — tests/expected-links.txt names all 28 links, and
+# tests/release-skip-allowlist.txt names suites — would otherwise credit
+# every surface it mentions, which is the same defect as crediting a
+# comment: the name appears, nothing exercises it.
+CORPUS_SUFFIXES = (".sh", ".bash", ".c", ".h", ".py")
+
+
+def corpus_paths():
+    """Tracked test sources under tests/, in a deterministic order.
+
+    `git ls-files` is the authority: it is exactly the set that exists on
+    a fresh checkout, it is already sorted, and it cannot pick up a
+    gitignored artefact. The walk below is the fallback for a release
+    tarball or an exported tree, and prunes the same directories in the
+    same order — os.walk yields directories in filesystem order unless
+    the dirnames list is sorted in place, which is why an identical tree
+    produced different witness attributions on two machines."""
+    rel = os.path.relpath(TESTS_DIR, REPO)
+    try:
+        out = subprocess.run(["git", "-C", REPO, "ls-files", "-z", "--", rel],
+                             check=True, capture_output=True)
+        names = [n for n in out.stdout.decode().split("\0") if n]
+        if names:
+            keep = []
+            for n in sorted(names):
+                parts = n.split(os.sep)
+                if any(part in CORPUS_PRUNE for part in parts):
+                    continue
+                keep.append(os.path.join(REPO, n))
+            return keep
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    paths = []
+    for root, dirs, names in os.walk(TESTS_DIR):
+        dirs[:] = sorted(d for d in dirs if d not in CORPUS_PRUNE)
+        for fn in sorted(names):
+            paths.append(os.path.join(root, fn))
+    return sorted(paths)
+
+
+def has_shebang(path):
+    """An extensionless test script still counts."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(2) == b"#!"
+    except OSError:
+        return False
+
+
 def test_corpus():
-    """All test sources under tests/ (scripts + C harness), excluding docs
-    and the manifest itself. Returns concatenated text."""
-    blobs = []
-    for root, _dirs, files in os.walk(TESTS_DIR):
-        for fn in files:
-            if fn.endswith(".md") or fn == "coverage-manifest.tsv":
+    """Every test source under tests/ (scripts + C harnesses), excluding docs
+    and the manifest itself, as a list of (path, raw_text, code_text) where
+    code_text has comments removed."""
+    files = []
+    for p in corpus_paths():
+        fn = os.path.basename(p)
+        if fn.endswith(".md") or fn == "coverage-manifest.tsv":
+            continue
+        if not fn.endswith(CORPUS_SUFFIXES) and not has_shebang(p):
+            continue
+        try:
+            raw = read(p)
+        except OSError:
+            continue
+        files.append((os.path.relpath(p, REPO), raw, code_of(raw, fn)))
+    return files
+
+
+def witness_of(matcher, files):
+    """Return the relative path of the first file that witnesses this surface,
+    or None. See the rule block at the top of this file."""
+    if matcher[0] == "hook":
+        _kind, name_re, op_res, prog_res = matcher
+        for path, raw, code in files:
+            for pr in prog_res:
+                if re.search(pr, code):
+                    return path
+            if not re.search(name_re, raw):
                 continue
-            p = os.path.join(root, fn)
-            try:
-                blobs.append(read(p))
-            except OSError:
-                pass
-    return "\n".join(blobs)
+            for orx in op_res:
+                if re.search(orx, code):
+                    return path
+        return None
+    for path, _raw, code in files:
+        for t in matcher[1]:
+            if re.search(t, code):
+                return path
+    return None
 
 
 def load_manifest():
@@ -159,25 +379,94 @@ def load_manifest():
     return exemptions
 
 
+SELFTEST_CASES = [
+    # (label, kind, hook/surface name, [(filename, text), ...], expected)
+    ("C-5 regression: bare op token, file never names the hook",
+     "enforce-hook", "inode_setxattr",
+     [("t.sh", 'sealprobe setxattr "$T"\n')], False),
+    ("comment-only mention of the hook is NOT a witness",
+     "enforce-hook", "inode_setxattr",
+     [("t.sh", '# exercises inode_setxattr via the mesh matrix\ntrue\n')], False),
+    ("hook named (in a comment) AND its op driven in code IS a witness",
+     "enforce-hook", "inode_setxattr",
+     [("t.sh", '# exercises inode_setxattr\nsealprobe setxattr "$T"\n')], True),
+    ("BPF program name in code alone IS a witness",
+     "enforce-hook", "inode_setxattr",
+     [("t.sh", 'bpftool prog show | grep comp_inode_setxattr\n')], True),
+    ("C comment-only mention is NOT a witness",
+     "enforce-hook", "file_truncate",
+     [("t.c", '/* drives file_truncate */\nint main(void){return 0;}\n')], False),
+    ("C comment claim + real call IS a witness",
+     "enforce-hook", "file_truncate",
+     [("t.c", '/* drives file_truncate */\nint f(void){return truncate(p,0);}\n')], True),
+    ("op token inside a C comment does not count as code",
+     "enforce-hook", "file_truncate",
+     [("t.c", '/* file_truncate: we would call truncate here */\nint m(void){return 0;}\n')], False),
+    ("observe hook is NOT witnessed by the shared op token",
+     "observe-hook", "inode_create",
+     [("t.sh", '# drives inode_create\nsealprobe create-in "$D"\n')], False),
+    ("observe hook IS witnessed by its ao_* program name in code",
+     "observe-hook", "inode_create",
+     [("t.sh", 'bpftool prog show | grep ao_inode_create\n')], True),
+    ("action mentioned only in a comment is NOT a witness",
+     "action", "DENY_WRITE",
+     [("t.sh", '# expect DENY_WRITE in the audit stream\ntrue\n')], False),
+    ("action grepped in code IS a witness",
+     "action", "DENY_WRITE",
+     [("t.sh", 'grep -q "DENY_WRITE" "$audit"\n')], True),
+]
+
+
+def selftest():
+    """Assert the witness rule itself. The gate is only as good as this
+    definition, and the definition is the thing that silently rotted before
+    (a comment mentioning a hook, or the word `open` in an unrelated file,
+    used to count as coverage)."""
+    surfaces = {(k, n): m for k, n, m in extract_surfaces()}
+    failures = 0
+    for label, kind, name, blobs, expected in SELFTEST_CASES:
+        matcher = surfaces.get((kind, name))
+        if matcher is None:
+            print("  FAIL  %s — surface %s/%s not found in source" % (label, kind, name))
+            failures += 1
+            continue
+        files = [(fn, text, code_of(text, fn)) for fn, text in blobs]
+        got = witness_of(matcher, files) is not None
+        if got == expected:
+            print("  PASS  %s -> %s" % (label, "witnessed" if got else "UNWITNESSED"))
+        else:
+            print("  FAIL  %s -> %s (expected %s)"
+                  % (label, "witnessed" if got else "UNWITNESSED",
+                     "witnessed" if expected else "UNWITNESSED"))
+            failures += 1
+    print("== coverage-map selftest: %d/%d cases passed =="
+          % (len(SELFTEST_CASES) - failures, len(SELFTEST_CASES)))
+    return 1 if failures else 0
+
+
 def main():
     write_matrix = None
     args = sys.argv[1:]
+    if "--selftest" in args:
+        return selftest()
     if "--write-matrix" in args:
         i = args.index("--write-matrix")
         write_matrix = args[i + 1]
 
     surfaces = extract_surfaces()
-    corpus = test_corpus()
+    files = test_corpus()
     exemptions = load_manifest()
 
-    covered, gap = [], []
-    for kind, name, toks in surfaces:
-        if any(re.search(t, corpus) for t in toks):
+    covered, gap, evidence = [], [], {}
+    for kind, name, matcher in surfaces:
+        w = witness_of(matcher, files)
+        if w is not None:
             covered.append((kind, name))
+            evidence[(kind, name)] = w
         else:
             gap.append((kind, name))
 
-    surface_keys = {(k, n) for (k, n, _t) in surfaces}
+    surface_keys = {(k, n) for (k, n, _m) in surfaces}
     covered_keys = set(covered)
 
     errors = []
@@ -228,7 +517,8 @@ def main():
             print("  [%-11s] %-16s %s" % (tag, kind, name))
 
     if write_matrix:
-        write_matrix_file(write_matrix, surfaces, covered_keys, exemptions)
+        write_matrix_file(write_matrix, surfaces, covered_keys, exemptions,
+                          evidence)
         print("\nwrote coverage matrix -> %s" % write_matrix)
 
     if errors:
@@ -241,22 +531,28 @@ def main():
     return 0
 
 
-def write_matrix_file(path, surfaces, covered_keys, exemptions):
+def write_matrix_file(path, surfaces, covered_keys, exemptions, evidence=None):
     lines = []
     lines.append("# compartment-bpf coverage matrix (generated)\n")
     lines.append("Generated by `tools/coverage-map.py --write-matrix`. "
                  "Do not edit by hand.\n")
     lines.append("\nStatus key: `witnessed` = referenced by a test under "
                  "tests/; `exempt` = accepted gap (see reason).\n")
+    lines.append("\nThe note column names the FIRST witnessing file in sorted "
+                 "order, not the strongest one and not the only one. A surface "
+                 "is routinely referenced by several tests, and this gate is "
+                 "about existence, not accuracy \u2014 the exact-delta counter "
+                 "assertions are catalogued in COUNTERS.md.\n")
+    evidence = evidence or {}
     cur = None
-    for kind, name, _t in surfaces:
+    for kind, name, _m in surfaces:
         if kind != cur:
             lines.append("\n## %s\n" % kind)
             lines.append("\n| surface | status | note |")
             lines.append("\n|---|---|---|")
             cur = kind
         if (kind, name) in covered_keys:
-            status, note = "witnessed", ""
+            status, note = "witnessed", "`%s`" % evidence.get((kind, name), "")
         elif (kind, name) in exemptions:
             status, note = "exempt", exemptions[(kind, name)]
         else:

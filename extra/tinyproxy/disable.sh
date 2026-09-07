@@ -5,15 +5,35 @@
 set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-MARKER="# tinyproxy-autostart"
+# shellcheck source=crontab.sh
+. "${BASE_DIR}/crontab.sh"
 
-if crontab -l 2>/dev/null | grep -qF "$MARKER"; then
-  # Remove the marker line and the line after it
-  crontab -l 2>/dev/null | grep -v -A1 "$MARKER" | grep -v "start.sh" | crontab -
-  echo "Removed from crontab."
+crontab_lock
+CUR="${BASE_DIR}/run/crontab.current.$$"
+NEW="${BASE_DIR}/run/crontab.new.$$"
+trap 'rm -f "${CUR}" "${NEW}"' EXIT
+
+crontab_snapshot "$CUR"
+if grep -qF "$CRONTAB_MARKER" "$CUR"; then
+  crontab_backup_from "$CUR"
+  # Delete exactly two kinds of line: the marker, and an entry naming *this*
+  # directory's start.sh.  The previous version used `grep -v -A1`, which
+  # prints context around the *non*-matching lines and so left the marker in
+  # place, and an unanchored `grep -v start.sh`, which deleted every
+  # unrelated cron line that happened to mention a start.sh anywhere.
+  grep -vF -e "$CRONTAB_MARKER" -e "${BASE_DIR}/start.sh" "$CUR" > "$NEW" || true
+  crontab_install "$NEW"
+  echo "Removed from crontab (backup: ${CRONTAB_BACKUP})."
 else
   echo "Not found in crontab — nothing to remove."
 fi
+crontab_unlock
 
-# Stop if running
-"${BASE_DIR}/stop.sh" 2>/dev/null || true
+# Stop if running.  Do not hide the result: reporting success while
+# tinyproxy keeps running is worse than a visible failure.
+if [[ -x "${BASE_DIR}/stop.sh" ]]; then
+  "${BASE_DIR}/stop.sh"
+else
+  echo "warning: ${BASE_DIR}/stop.sh is not executable — tinyproxy not stopped" >&2
+  exit 1
+fi

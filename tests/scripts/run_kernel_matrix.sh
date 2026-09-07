@@ -28,7 +28,9 @@
 #   v5.15  — Landlock ABI v1 (needs lsm= boot param on Ubuntu mainline)
 #   v6.1   — Landlock ABI v2 (REFER support)
 #   v6.5   — Landlock ABI v3 (TRUNCATE support)
-#   v6.8   — Landlock ABI v4 (IOCTL_DEV support)
+#   v6.7   — Landlock ABI v4 (TCP bind/connect port rules)
+#   v6.10  — Landlock ABI v5 (IOCTL_DEV)
+#   v6.12  — Landlock ABI v6 (scoping)
 
 set -euo pipefail
 
@@ -40,7 +42,7 @@ USE_KVM=1
 VERBOSE=0
 MEMORY="2G"
 CPUS=1
-KERNELS="v5.4 v5.10 v5.15 v6.1 v6.5 v6.8"
+KERNELS="v5.4 v5.10 v5.15 v6.1 v6.5 v6.7 v6.10 v6.12"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -63,17 +65,21 @@ if ! command -v vng >/dev/null 2>&1; then
     echo "ERROR: virtme-ng (vng) not found."
     echo "  Install: pip install virtme-ng"
     echo "       or: apt install virtme-ng"
-    exit 1
+    # A SUMMARY on every exit path, so `make test-kernels` reports a
+    # skipped suite rather than a bare exit code nothing sums.
+    echo "  SKIP: virtme-ng not installed"
+    echo "SUMMARY kernel-matrix: pass=0 fail=0 skip=1"
+    exit 77
 fi
 
-KVM_FLAG=""
+KVM_FLAG=()
 if [[ $USE_KVM -eq 0 ]]; then
-    KVM_FLAG="--disable-kvm"
+    KVM_FLAG=(--disable-kvm)
     echo "NOTE: Running without KVM (TCG emulation) — tests will be slower."
 elif [[ ! -w /dev/kvm ]] 2>/dev/null; then
     echo "WARNING: /dev/kvm not writable — falling back to TCG emulation."
     echo "  Fix: sudo usermod -aG kvm \$(whoami)"
-    KVM_FLAG="--disable-kvm"
+    KVM_FLAG=(--disable-kvm)
 fi
 
 echo ""
@@ -82,7 +88,7 @@ echo "║  Compartment kernel matrix test (virtme-ng)                 ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 echo "Kernels: $KERNELS"
-echo "KVM: ${KVM_FLAG:-enabled}"
+echo "KVM: ${KVM_FLAG[*]:-enabled}"
 echo "Memory: $MEMORY  CPUs: $CPUS"
 echo ""
 
@@ -97,21 +103,34 @@ run_kernel_test() {
     local test_name="$2"
     local cmd="$3"
     local expect_rc="${4:-0}"   # expected exit code (0=success, 1=expected failure)
-    # extra_args: array-safe via shift
-    shift 4 || true
+    # extra_args: array-safe. `shift 4 || true` with three arguments
+    # leaves $@ UNCHANGED in bash, which spliced the kernel name, the
+    # test name and the command itself into the vng argument list for
+    # every three-argument call — four of the eight tests per kernel.
+    if [[ $# -ge 4 ]]; then shift 4; else shift $#; fi
     local -a extra_args=("$@")
 
     TOTAL=$((TOTAL + 1))
     printf "  %-12s %-40s " "$kernel" "$test_name"
 
     local output rc=0
-    local -a vng_cmd=(vng --run "$kernel" $KVM_FLAG --rw --pwd
+    local -a vng_cmd=(vng --run "$kernel" ${KVM_FLAG[@]+"${KVM_FLAG[@]}"} --rw --pwd
                       --memory "$MEMORY" --cpus "$CPUS"
                       "${extra_args[@]}" --exec)
 
-    output=$("${vng_cmd[@]}" "$cmd" 2>&1) || rc=$?
+    # Liveness marker, the same discipline deny_probe uses. Every
+    # assertion here was rc-only, so an expect_rc=1 case passed when vng
+    # was missing, when the guest failed to boot, and when the command
+    # was never reached — the three ways this whole suite can report
+    # nothing while looking green.
+    local marker="KM_START_${TOTAL}"
+    output=$("${vng_cmd[@]}" "echo ${marker}; ${cmd}" 2>&1) || rc=$?
 
-    if [[ $rc -eq $expect_rc ]]; then
+    if ! printf '%s\n' "$output" | grep -q "${marker}"; then
+        echo "FAIL (the guest never ran the command)"
+        FAIL=$((FAIL + 1))
+        RESULTS="${RESULTS}FAIL  $kernel  $test_name  (no ${marker}: guest did not boot or vng is missing)\n"
+    elif [[ $rc -eq $expect_rc ]]; then
         echo "PASS"
         PASS=$((PASS + 1))
         RESULTS="${RESULTS}PASS  $kernel  $test_name\n"
@@ -212,6 +231,9 @@ echo ""
 echo -e "$RESULTS"
 echo "Total: $TOTAL  Pass: $PASS  Fail: $FAIL  Skip: $SKIP"
 echo ""
+# The runners sum this line; without it the suite could not be counted
+# even once it was wired in (tests/scripts/rootless.d/README.md).
+echo "SUMMARY kernel-matrix: pass=${PASS} fail=${FAIL} skip=${SKIP}"
 
 if [[ $FAIL -gt 0 ]]; then
     echo "SOME TESTS FAILED"

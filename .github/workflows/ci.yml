@@ -9,20 +9,43 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # ── Build + the whole rootless suite, on both supported releases ──
+  #
+  # 22.04 and 24.04 differ in kernel (Landlock ABI), glibc (_FORTIFY_SOURCE=3
+  # needs >= 2.35) and gcc, which is exactly what the hardening probes and the
+  # ABI negotiation have to cope with.
   build-and-test:
-    runs-on: ubuntu-latest
+    name: build + rootless suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Toolchain and kernel
+        run: |
+          cc --version | head -1
+          ldd --version | head -1
+          uname -a
 
       - name: Build
         run: make
 
+      - name: Hardening flags selected on this toolchain
+        run: make show-hardening
+
       - name: Build deny_probe
         run: make tests/probes/deny_probe
-
-      - name: Run tests
-        run: make test-quick
 
       - name: Verify --version
         run: |
@@ -30,7 +53,254 @@ jobs:
           ./compartment-root --version
 
       - name: Verify --verify
-        run: ./compartment-user --verify
+        run: |
+          set +e
+          ./compartment-user --verify
+          rc=$?
+          set -e
+          echo "compartment-user --verify exit=${rc}"
+          if [ "${rc}" -ne 0 ]; then
+            echo "::warning::--verify reports a degraded host (exit ${rc}); see the output above"
+          fi
 
       - name: Dry-run smoke test
         run: ./compartment-user --dry-run -- /bin/true
+
+      - name: Hardening properties of the built binaries
+        run: |
+          rc=0
+          for b in compartment-user compartment-root tests/probes/deny_probe; do
+            echo "== ${b}"
+            readelf -hd "${b}" | grep -E 'Type:|BIND_NOW' || true
+            readelf -lW "${b}" | grep -E 'GNU_STACK|GNU_RELRO' || true
+            readelf -h  "${b}" | grep -q 'Type:[[:space:]]*DYN' \
+              || { echo "::error::${b} is not a PIE"; rc=1; }
+            readelf -d  "${b}" | grep -q 'BIND_NOW' \
+              || { echo "::error::${b} lacks BIND_NOW (full RELRO)"; rc=1; }
+            readelf -lW "${b}" | grep -E '^ *GNU_STACK' | grep -q 'RW ' \
+              || { echo "::error::${b} has an executable stack"; rc=1; }
+          done
+          exit "${rc}"
+
+      # The full suite, minus the one suite that needs a third-party CLI and
+      # an authenticated session. sandbox.sh still runs: it needs only
+      # unprivileged user namespaces, which the runners allow, and its single
+      # proxy case skips itself when no proxy answers.
+      - name: Integration suite (no external services)
+        env:
+          COMPARTMENT_SKIP_EXTERNAL: "1"
+        run: make test-integration
+
+  # ── Root-only suites ─────────────────────────────────────────────
+  #
+  # GitHub runners give passwordless sudo and unprivileged user namespaces,
+  # so the compartment-root paths that no CI has ever executed can run here.
+  root-tests:
+    name: root suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build as the normal user first so sudo does not leave root-owned
+      # objects in the checkout.
+      - name: Build
+        run: |
+          make
+          make tests/probes/deny_probe
+
+      - name: Refuses to run unprivileged
+        run: |
+          set +e
+          ./tests/scripts/run_root_tests.sh
+          rc=$?
+          set -e
+          if [ "${rc}" -eq 0 ]; then
+            echo "::error::run_root_tests.sh must refuse to run as a non-root user"
+            exit 1
+          fi
+          echo "run_root_tests.sh correctly refused (exit ${rc})"
+
+      - name: Root suite
+        run: sudo make test-root
+
+  # ── Sanitizers ───────────────────────────────────────────────────
+  sanitizers:
+    name: asan+ubsan (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    # LeakSanitizer cannot run over the enforcing paths: it reads
+    # /proc/<pid>/task from an at-exit handler, and by then Landlock and
+    # seccomp are applied, so it aborts with "LeakSanitizer has
+    # encountered a fatal error" on every run. detect_leaks=0 therefore
+    # stays for the suite — but it used to be the only setting, which
+    # meant nothing anywhere looked for a leak. The step below runs LSan
+    # over every path that returns instead of exec'ing (--version,
+    # --verify, --dry-run, --dump-profile, and compartment-root's own
+    # dry run), which is where the parser allocates and where
+    # config_free_oneshot() now frees.
+    # UBSan is made fatal so a report fails the job instead of being printed
+    # and ignored.
+    env:
+      ASAN_OPTIONS: detect_leaks=0
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      COMPARTMENT_SKIP_EXTERNAL: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with -fsanitize=address,undefined
+        run: |
+          make clean
+          make \
+            EXTRA_CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -U_FORTIFY_SOURCE -g -O1' \
+            EXTRA_LDFLAGS='-fsanitize=address,undefined'
+          make tests/probes/deny_probe \
+            EXTRA_CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -U_FORTIFY_SOURCE -g -O1' \
+            EXTRA_LDFLAGS='-fsanitize=address,undefined'
+
+      - name: Sanitized dry-run
+        run: ./compartment-user --dry-run -- /bin/true
+
+      - name: Rootless suite under the sanitizers
+        run: ./tests/scripts/run_all.sh --quick
+
+      # Every non-enforcing path, with LeakSanitizer on. These are the
+      # paths that parse a profile and then return, so they exercise the
+      # whole allocation surface without reaching restrict_self() — which
+      # is the only reason detect_leaks had to be off at all.
+      - name: LeakSanitizer over the non-enforcing paths
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          set -e
+          conf="$(mktemp --suffix=.conf)"
+          printf 'ro /usr\nro /lib32?\nrw /tmp\nenv-deny FOO\nworkdir /tmp\nlandlock on\nseccomp on\n' > "$conf"
+          chmod go-w "$conf"
+          ./compartment-user --version
+          ./compartment-user --verify   || true
+          ./compartment-user --dry-run -- /bin/true
+          ./compartment-user --dump-profile ai-agent > /dev/null
+          ./compartment-user --dump-profile strict   > /dev/null
+          ./compartment-user --dry-run --profile "$conf" -- /bin/true
+          ./compartment-user --dry-run --profile "$conf" --workdir /tmp \
+                             --audit-log /tmp -- /bin/true
+          ./compartment-root --dry-run --verbose -c /tmp -U root \
+                             -M /proc/foo -A net_bind_service -L /tmp -- /bin/true
+          rm -f "$conf"
+
+  # ── compartment-bpf: everything that needs neither root nor a
+  #    BPF-capable kernel ─────────────────────────────────────────────
+  #
+  # The whole of compartment-bpf/ was outside CI: 39 bypass witnesses,
+  # 3284 mesh trials, 17 strict-launch witnesses, the coverage gate and
+  # check-release ran only by hand on two VMs. The enforcement suites
+  # genuinely need root and a bpf-LSM kernel, but the build and the
+  # static gates do not, and those are what break first.
+  bpf-static:
+    name: compartment-bpf build + static gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libbpf-dev linux-tools-common \
+                                  linux-tools-generic libelf-dev zlib1g-dev \
+                                  libsodium-dev
+          clang --version | head -1
+          # The runner may use an Azure kernel while linux-tools-generic
+          # installs tools for a generic kernel. Bypass Ubuntu's uname-based
+          # wrapper with the packaged binary for these BTF/static gates.
+          if ! bpftool version; then
+            installed_bpftool="$(find -L /usr/lib/linux-tools -type f -name bpftool -executable | sort -V | tail -1)"
+            test -n "$installed_bpftool"
+            sudo ln -s "$installed_bpftool" /usr/local/sbin/bpftool
+            export PATH="/usr/local/sbin:$PATH"
+            echo /usr/local/sbin >> "$GITHUB_PATH"
+          fi
+          bpftool version
+
+      - name: Kernel BTF is readable
+        run: test -r /sys/kernel/btf/vmlinux
+
+      - name: Build
+        working-directory: compartment-bpf
+        run: make
+
+      - name: Coverage gate
+        working-directory: compartment-bpf
+        run: make check-coverage-static
+
+      - name: Coverage-map selftest
+        working-directory: compartment-bpf
+        run: tools/coverage-map.py --selftest
+
+      - name: ABI / actor-hook gate
+        working-directory: compartment-bpf
+        run: make check-actor-hook
+
+      - name: Every shipped profile parses
+        working-directory: compartment-bpf
+        run: make check-profiles
+
+      # sudo, but still no BPF: check-parser-actor stages its fixtures
+      # under $TMPDIR and the loader refuses an actor resolved through a
+      # world-writable directory, so an unprivileged run fails on the
+      # fixtures rather than on the parser. 46 assertions of parser and
+      # actor-resolution coverage that CI has never had.
+      - name: Parser and actor witnesses
+        working-directory: compartment-bpf
+        run: sudo make check-parser-actor
+
+      - name: HOWTO examples still load
+        working-directory: compartment-bpf
+        run: make check-howto-examples
+
+  # ── Repository hygiene ───────────────────────────────────────────
+  lint:
+    name: shellcheck + file modes
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          if ! command -v shellcheck > /dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+
+      # Every tracked *.sh outside compartment-bpf/ must be clean at
+      # -S warning. Suppress a specific code only next to the line it
+      # applies to, with a comment saying why.
+      - name: shellcheck
+        run: make check-shell
+
+      # compartment-bpf/ is excluded above and had never been linted by
+      # any gate. Baselined rather than fixed at a release gate; a NEW
+      # finding fails.
+      - name: shellcheck (compartment-bpf, against the baseline)
+        run: make check-shell-bpf
+
+      - name: No orphaned test scripts
+        run: make check-orphans
+
+      - name: Documented symbols exist
+        run: make check-docs-symbols
+
+      # Every *.sh with a shebang must be mode 755 (all 12 scripts under
+      # extra/ shipped non-executable, so the documented ./start.sh workflow
+      # failed), and every *.sh without one must not be.
+      - name: Executable bits
+        run: make check-modes
+
+      - name: Workflow YAML is parseable
+        run: python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/ci.yml"))'

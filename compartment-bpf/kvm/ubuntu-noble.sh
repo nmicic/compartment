@@ -14,7 +14,29 @@
 # `virbr0` NAT bridge; override the variables below if your host uses a
 # different lab layout.
 
+# usage: ubuntu-noble.sh [--check]
+#
+#   (no args)  tear down any existing VM and bring up a fresh one
+#   --check    preflight only: report host prerequisites, the NAT plan, the
+#              console log path and the cloud-image state, then exit WITHOUT
+#              touching the VM, the disks, iptables or the network
+#
+# Every knob is an environment variable with a default; see USER CONFIG below.
+# END-USAGE
 set -euo pipefail
+
+# ===== Argument handling =====
+CHECK_ONLY=0
+for arg in "${@:-}"; do
+  case "$arg" in
+    "") ;;
+    --check) CHECK_ONLY=1 ;;
+    -h|--help)
+      sed -n '/^# usage:/,/^# END-USAGE$/p' "$0" | sed '$d; s/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "unknown argument '$arg' (try --help)" >&2; exit 2 ;;
+  esac
+done
 
 # ===== USER CONFIG =====
 VM_NAME="${VM_NAME:-compartment-bpf-noble}"
@@ -41,6 +63,14 @@ BASE_IMG="${BASE_IMG:-${IMAGES_DIR}/noble-server-cloudimg-amd64.img}"
 VM_DISK="${VM_DISK:-${IMAGES_DIR}/${VM_NAME}.qcow2}"
 VM_DISK_SIZE="${VM_DISK_SIZE:-16G}"
 SEED_ISO="${SEED_ISO:-${IMAGES_DIR}/${VM_NAME}-seed.iso}"
+
+# First-boot serial console. With `--console pty,target_type=serial` plus
+# `--noautoconsole` the entire first boot goes nowhere retrievable: if
+# cloud-init fails you have no log at all, which makes an automated bring-up
+# undebuggable. Default to a file so `--check`/CI runs leave evidence. libvirt
+# will not accept a pty and a file on serial port 0 at the same time, so
+# setting CONSOLE_LOG="" restores the interactive `virsh console <vm>` pty.
+CONSOLE_LOG="${CONSOLE_LOG-${IMAGES_DIR}/${VM_NAME}-console.log}"
 
 # Guest user. The same SSH keys are injected for both this user and
 # root. By default the script scans `~/.ssh/*.pub`; override with
@@ -78,12 +108,72 @@ mask2cidr() {
   echo "$cidr"
 }
 
-ensure_pkg() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "Installing host packages..."
-    sudo apt-get update -y
-    sudo apt-get install -y qemu-kvm libvirt-daemon-system virtinst cloud-image-utils genisoimage bridge-utils iptables curl
-  }
+# Host packages. `virt-install`/`cloud-localds` used to be the only two probed,
+# so a host that happened to have those skipped the whole install and a missing
+# ovmf surfaced much later as an opaque virt-install error. Probe EVERY binary
+# this script executes, plus the UEFI firmware `--boot uefi` needs.
+#
+# Every package HOST_TOOLS names has to appear in HOST_PKGS as well, or the
+# probe reports a package the installer never installs and the run dies on the
+# re-probe with "Still missing after apt-get install". iproute2 (`ip`) did
+# exactly that, and `sysctl` — run unconditionally to set ip_forward — was not
+# probed at all, so a host without procps failed at the call site with 127.
+HOST_PKGS=(
+  qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients virtinst
+  cloud-image-utils genisoimage bridge-utils iptables curl
+  libosinfo-bin ovmf iproute2 procps
+)
+
+# tool:apt-package pairs for every external command used below.
+HOST_TOOLS=(
+  "virt-install:virtinst"
+  "virsh:libvirt-clients"
+  "qemu-img:qemu-utils"
+  "cloud-localds:cloud-image-utils"
+  "genisoimage:genisoimage"
+  "brctl:bridge-utils"
+  "iptables:iptables"
+  "curl:curl"
+  "ip:iproute2"
+  "osinfo-query:libosinfo-bin"
+  "sysctl:procps"
+)
+
+# ovmf ships firmware blobs, not a binary; --boot uefi fails without them.
+ovmf_present() {
+  local f
+  for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
+           /usr/share/OVMF/OVMF_CODE.secboot.fd /usr/share/ovmf/OVMF.fd; do
+    [[ -r "$f" ]] && return 0
+  done
+  return 1
+}
+
+# missing_host_tools -> prints "tool (apt: pkg)" lines for whatever is absent.
+missing_host_tools() {
+  local pair tool pkg
+  for pair in "${HOST_TOOLS[@]}"; do
+    tool="${pair%%:*}"; pkg="${pair#*:}"
+    command -v "$tool" >/dev/null 2>&1 || printf '%s (apt: %s)\n' "$tool" "$pkg"
+  done
+  ovmf_present || printf 'OVMF firmware for --boot uefi (apt: ovmf)\n'
+}
+
+ensure_host_packages() {
+  local missing
+  missing="$(missing_host_tools)"
+  [[ -z "$missing" ]] && return 0
+  echo "Missing host prerequisites:"
+  printf '%s\n' "$missing" | sed 's/^/  /'
+  echo "Installing host packages: ${HOST_PKGS[*]}"
+  sudo apt-get update -y
+  sudo apt-get install -y "${HOST_PKGS[@]}"
+  missing="$(missing_host_tools)"
+  if [[ -n "$missing" ]]; then
+    echo "Still missing after apt-get install:" >&2
+    printf '%s\n' "$missing" | sed 's/^/  /' >&2
+    exit 1
+  fi
 }
 
 iptables_append_once() {
@@ -92,6 +182,33 @@ iptables_append_once() {
   if ! sudo iptables -t "$table" -C "${rule[@]}" 2>/dev/null; then
     sudo iptables -t "$table" -A "${rule[@]}"
   fi
+}
+
+# net_prefix <ip> <netmask> -> network address (e.g. 192.168.122.0)
+net_prefix() {
+  local ip="$1" mask="$2"
+  local IFS=.
+  # shellcheck disable=SC2206
+  local -a i=( $ip ) m=( $mask )
+  echo "$(( i[0] & m[0] )).$(( i[1] & m[1] )).$(( i[2] & m[2] )).$(( i[3] & m[3] ))"
+}
+
+# libvirt_nat_network_for <bridge> -> name of the libvirt network that owns
+# this bridge AND is in forward mode 'nat', or empty. libvirt installs its own
+# correctly scoped LIBVIRT_PRT MASQUERADE for such a network, so ours would be
+# redundant.
+libvirt_nat_network_for() {
+  local bridge="$1" net br
+  command -v virsh >/dev/null 2>&1 || return 0
+  for net in $(sudo virsh net-list --name 2>/dev/null); do
+    br="$(sudo virsh net-info "$net" 2>/dev/null | awk '/^Bridge:/ {print $2}')"
+    [[ "$br" == "$bridge" ]] || continue
+    if sudo virsh net-dumpxml "$net" 2>/dev/null | grep -q "forward mode='nat'"; then
+      echo "$net"
+      return 0
+    fi
+  done
+  return 0
 }
 
 collect_ssh_keys() {
@@ -127,8 +244,50 @@ collect_ssh_keys() {
 }
 
 # ===== Preflight =====
-ensure_pkg virt-install
-ensure_pkg cloud-localds
+CIDR="$(mask2cidr "$NETMASK")"
+GUEST_SUBNET="${GUEST_SUBNET:-$(net_prefix "$VM_IP" "$NETMASK")/${CIDR}}"
+
+if [[ -n "$CONSOLE_LOG" ]]; then
+  CONSOLE_ARGS=( --serial "file,path=${CONSOLE_LOG}" )
+else
+  CONSOLE_ARGS=( --console "pty,target_type=serial" )
+fi
+
+if (( CHECK_ONLY )); then
+  echo "=== ${VM_NAME}: preflight (--check; nothing will be created or changed) ==="
+  miss="$(missing_host_tools)"
+  if [[ -n "$miss" ]]; then
+    echo "host packages MISSING:"
+    printf '%s\n' "$miss" | sed 's/^/  /'
+  else
+    echo "host packages: OK (all probed binaries + OVMF firmware present)"
+  fi
+  if keys="$(collect_ssh_keys)"; then
+    echo "ssh keys: $(printf '%s\n' "$keys" | grep -c .) key(s) would be injected"
+  else
+    echo "ssh keys: NONE FOUND — set SSH_AUTH_KEYS_FILE or add a *.pub under ~/.ssh/"
+  fi
+  echo "guest:    ${VM_NAME} ${VM_IP}/${CIDR} via ${GATEWAY} mac ${MAC_ADDR}"
+  echo "bridge:   ${BRIDGE_NAME}"
+  net="$(libvirt_nat_network_for "$BRIDGE_NAME")"
+  if [[ -n "$net" ]]; then
+    echo "NAT:      libvirt network '${net}' already masquerades ${GUEST_SUBNET}; no iptables rule needed"
+  else
+    echo "NAT:      would add  iptables -t nat -A POSTROUTING -s ${GUEST_SUBNET} ! -d ${GUEST_SUBNET} -o <default-if> -j MASQUERADE"
+  fi
+  echo "console:  ${CONSOLE_LOG:-pty (virsh console ${VM_NAME})}"
+  echo "base img: ${BASE_IMG}$( [[ -f "$BASE_IMG" ]] && echo ' (present)' || echo " (would download from ${BASE_IMG_URL})" )"
+  echo "disks:    ${VM_DISK} (${VM_DISK_SIZE}), ${SEED_ISO}"
+  if sudo virsh dominfo "$VM_NAME" >/dev/null 2>&1; then
+    echo "existing: domain ${VM_NAME} EXISTS — a real run would destroy and undefine it"
+  else
+    echo "existing: no domain named ${VM_NAME}"
+  fi
+  [[ -n "$miss" ]] && exit 1
+  exit 0
+fi
+
+ensure_host_packages
 AUTHORIZED_KEYS="$(collect_ssh_keys)" || {
   echo "No SSH public keys found." >&2
   echo "Set SSH_AUTH_KEYS_FILE=/path/to/authorized_keys.pub or place at least one *.pub file under ~/.ssh/." >&2
@@ -167,12 +326,25 @@ if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
 fi
 sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 EXT_IF=$(ip route | awk '/^default/ {print $5; exit}')
-iptables_append_once nat POSTROUTING -o "$EXT_IF" -j MASQUERADE
-iptables_append_once filter FORWARD -i "$BRIDGE_NAME" -j ACCEPT
-iptables_append_once filter FORWARD -o "$BRIDGE_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# NAT for the guest subnet ONLY. The rule used to be an unscoped
+#   iptables -t nat -A POSTROUTING -o $EXT_IF -j MASQUERADE
+# which, on any host that already forwards other traffic (docker, WireGuard,
+# a second libvirt network), NATs EVERYTHING leaving the default-route
+# interface. And when the bridge belongs to a libvirt NAT network it is
+# redundant: libvirt's LIBVIRT_PRT chain already masquerades this subnet
+# correctly. Skip it in that case, scope it otherwise.
+LIBVIRT_NET="$(libvirt_nat_network_for "$BRIDGE_NAME")"
+if [[ -n "$LIBVIRT_NET" ]]; then
+  echo "Bridge ${BRIDGE_NAME} belongs to libvirt NAT network '${LIBVIRT_NET}'; it already"
+  echo "masquerades ${GUEST_SUBNET} (LIBVIRT_PRT). Not adding a second MASQUERADE rule."
+else
+  iptables_append_once nat POSTROUTING -s "$GUEST_SUBNET" ! -d "$GUEST_SUBNET" -o "$EXT_IF" -j MASQUERADE
+  iptables_append_once filter FORWARD -i "$BRIDGE_NAME" -j ACCEPT
+  iptables_append_once filter FORWARD -o "$BRIDGE_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT
+fi
 
 # ===== cloud-init seed =====
-CIDR=$(mask2cidr "$NETMASK")
 DNS_YAML=$(printf '%s\n' "$DNS_SERVERS" | awk '{for(i=1;i<=NF;i++) printf (i==NF?"%s": "%s, "), $i}')
 
 SEED_DIR=$(mktemp -d)
@@ -241,6 +413,34 @@ packages:
   - make
   - build-essential
   - pkg-config
+  # Daemons the profile-e2e and observe witnesses need. Without them
+  # tests/profile-e2e/aide.sh, tests/profile-e2e/postgres.sh and observe
+  # T12 SKIP, and each skip had to be carried in
+  # tests/release-skip-allowlist.txt — four allow-listed skips on every
+  # release, for three packages. postgresql (not just -common) is needed
+  # because postgres.sh asserts against a live, online cluster.
+  - aide
+  - postgresql-common
+  - postgresql
+  # Fixtures two bypass witnesses need, neither of which a cloud image or
+  # build-essential brings in:
+  #   acl          — tests/bypass/16-setfacl-no-chmod.sh SKIPs without
+  #                  setfacl/getfacl. That drops the bypass tally to 38,
+  #                  below the floor of 39 tracked in
+  #                  tests/release-totals.sh, so "sudo make check-release"
+  #                  on a guest built from this script FAILED with
+  #                  "bypass: 38, floor is 39 — the corpus shrank". The
+  #                  skip is not in tests/release-skip-allowlist.txt
+  #                  either, by design: a skip a package would close is a
+  #                  package problem, not a gate problem.
+  #   gcc-multilib — tests/bypass/18-chattr-no-chmod.sh builds its 32-bit
+  #                  compat-ioctl witness (W3) with "gcc -m32". Without a
+  #                  multilib toolchain that sub-witness is quietly not
+  #                  exercised: the script still prints one PASS label, so
+  #                  no tally moves and nothing fails — the FS_IOC_SETFLAGS
+  #                  compat path simply stops being tested.
+  - acl
+  - gcc-multilib
 
 write_files:
   - path: /etc/ssh/sshd_config.d/99-allow-root.conf
@@ -260,19 +460,27 @@ write_files:
       # Set by ubuntu-noble.sh — activates BPF LSM for compartment-bpf.
       GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} lsm=${LSM_LIST}"
 
-  - path: /etc/profile.d/compartment-bpf.sh
-    permissions: "0644"
-    owner: root:root
-    content: |
-      # Convenience for the test loop. bpftool ships under linux-tools-<ver>
-      # and is not always on PATH for non-root.
-      if [ -d /usr/lib/linux-tools/\$(uname -r) ]; then
-        export PATH=\$PATH:/usr/lib/linux-tools/\$(uname -r)
-      fi
-
 runcmd:
   - systemctl enable --now qemu-guest-agent || true
   - systemctl restart sshd
+  # bpftool on PATH for BOTH ways the suites are actually invoked.
+  #
+  # This used to be an /etc/profile.d snippet appending
+  # /usr/lib/linux-tools/\$(uname -r) to PATH. A non-interactive, non-login
+  # "ssh host 'make'" never sources /etc/profile.d, and sudo replaces PATH
+  # with its compiled-in secure_path, so the snippet could not help either
+  # of the two ways the suites are run. On both of these images it was moot
+  # anyway: linux-tools-common ships /usr/sbin/bpftool, which is already on
+  # the default PATH for root and for the guest user.
+  #
+  # Symlink into /usr/local/sbin instead — that directory IS in the default
+  # PATH and IS in sudo's secure_path — and only when bpftool is genuinely
+  # not resolvable.
+  - >
+    command -v bpftool >/dev/null 2>&1 ||
+    { [ -x "/usr/lib/linux-tools/\$(uname -r)/bpftool" ] &&
+      ln -sf "/usr/lib/linux-tools/\$(uname -r)/bpftool" /usr/local/sbin/bpftool; } ||
+    true
   # Wire BPF LSM into the kernel cmdline. Takes effect on next boot.
   - update-grub
   # Touch a marker so the operator can confirm cloud-init reached this step.
@@ -303,7 +511,13 @@ ethernets:
     set-name: ens3
     dhcp4: false
     addresses: [${VM_IP}/${CIDR}]
-    gateway4: ${GATEWAY}
+    # netplan v2 default route. \`gateway4:\` is deprecated — cloud-init on
+    # 24.04 and 26.04 both log
+    #   WARNING: \`gateway4\` has been deprecated, use default routes instead.
+    # and it will eventually stop working.
+    routes:
+      - to: default
+        via: ${GATEWAY}
     nameservers:
       addresses: [${DNS_YAML}]
 renderer: networkd
@@ -317,6 +531,11 @@ sudo cloud-localds -v --network-config="$SEED_DIR/network-config" "$SEED_ISO" "$
 OS_VARIANT="ubuntu24.04"
 if ! osinfo-query os 2>/dev/null | awk '{print $1}' | grep -qx ubuntu24.04; then
   OS_VARIANT="ubuntu22.04"
+  echo "NOTE: this host's osinfo-db does not know ubuntu24.04; falling back to"
+  echo "      --os-variant ${OS_VARIANT}. The guest is therefore DESCRIBED to libvirt"
+  echo "      as 22.04. Harmless here (virtio everywhere, and the variant only"
+  echo "      feeds device/feature hints), but it is what \`virsh dominfo\` will"
+  echo "      report. Install a newer osinfo-db to remove the discrepancy."
 fi
 echo "Using --os-variant ${OS_VARIANT}"
 
@@ -331,7 +550,7 @@ sudo virt-install \
   --network "bridge=${BRIDGE_NAME},model=virtio,mac=${MAC_ADDR}" \
   --os-variant "${OS_VARIANT}" \
   --graphics none \
-  --console pty,target_type=serial \
+  "${CONSOLE_ARGS[@]}" \
   --import \
   --noautoconsole \
   --autostart \
@@ -352,10 +571,25 @@ After that reboot, validate from the host:
 
 Then sync the compartment-bpf source and run the smoke gate:
 
-  rsync -a --exclude=.git/ ~/compartment-bpf/ ${USERNAME}@${VM_IP}:~/compartment-bpf/
-  ssh ${USERNAME}@${VM_IP} 'cd compartment-bpf && make vmlinux.h && make && sudo make check'
+  rsync -a --exclude=.git/ <checkout>/compartment-bpf/ ${USERNAME}@${VM_IP}:~/compartment-bpf/
+  ssh ${USERNAME}@${VM_IP} "bash -lc 'cd ~/compartment-bpf && make regen-vmlinux && make && sudo make check'"
 
-Expected output: 'smoke ok'.
+\`make regen-vmlinux\`, not \`make vmlinux.h\`: rsyncing a checkout that has
+already been built on the host carries that host's vmlinux.h across, and
+\`make vmlinux.h\` is then a no-op on an up-to-date file — the guest would
+compile its BPF objects against the HOST kernel's BTF, which is the one
+thing a kernel-matrix VM exists to avoid. regen-vmlinux re-dumps the header
+from the guest's own /sys/kernel/btf/vmlinux first.
+
+\`make check\` runs every gate and prints a per-target transcript; the last
+lines are the howto-examples tally, and the run is green when it exits 0.
+\`sudo make smoke\` on its own is the one that prints 'smoke ok'. For the
+strict gate — where an unrecognised SKIP is a failure — use:
+
+  ssh ${USERNAME}@${VM_IP} "bash -lc 'cd ~/compartment-bpf && sudo make check-release'"
+  # ends with: [check-release] PASS ...
+
+Boot/console log for this VM: ${CONSOLE_LOG:-<pty; use \`virsh console ${VM_NAME}\`>}
 
 This VM is key-only by default. Set SSH_AUTH_KEYS_FILE to control which
 public keys are injected into ${USERNAME} and root.

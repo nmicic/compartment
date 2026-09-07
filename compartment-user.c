@@ -30,43 +30,38 @@
 #endif
 #include <getopt.h>
 #include <libgen.h>
+#include <dirent.h>
 #include <syslog.h>
 #include <sys/utsname.h>
 
-#include <linux/landlock.h>
 #include <sys/statfs.h>
 #include <sys/resource.h>
+#include <sys/mount.h>
+#include <sched.h>
+#include <linux/capability.h>
+#include <linux/securebits.h>
 
-/* Fallback defines for older kernel headers (pre-5.19 / pre-6.2) */
-#ifndef LANDLOCK_ACCESS_FS_REFER
-#define LANDLOCK_ACCESS_FS_REFER       (1ULL << 13)
-#endif
-#ifndef LANDLOCK_ACCESS_FS_TRUNCATE
-#define LANDLOCK_ACCESS_FS_TRUNCATE    (1ULL << 14)
-#endif
-
-/* Shared types, config, syscall table, profile loader, audit,
- * env sanitize, seccomp BPF builder — all static inline. */
+/* Shared types, config, syscall table, profile loader, Landlock ruleset
+ * builder, audit, env sanitize, seccomp BPF builder — all static inline. */
 #include "compartment.h"
 
-/* ── Landlock syscall wrappers ───────────────────────────────────────── */
-
-/* Landlock syscall numbers are architecture-independent (444-446)
- * since Linux 5.13. Provide fallback if kernel headers are too old. */
-#ifndef __NR_landlock_create_ruleset
-#define __NR_landlock_create_ruleset 444
-#define __NR_landlock_add_rule       445
-#define __NR_landlock_restrict_self  446
-#endif
+#define TOOL "compartment-user"
 
 /* ── AI agent profile ────────────────────────────────────────────────
- * Default paths and blocked syscalls for running Claude/Codex/etc. */
+ * Default paths and blocked syscalls for running AI CLI agents. */
 
-static void apply_profile_ai_agent(Config *cfg)
+/* Location label used by the fail-closed policy-append helpers. */
+#define BUILTIN_WHERE "built-in profile"
+#define CLI_WHERE     "command line"
+
+static int apply_profile_ai_agent(Config *cfg)
 {
-    /* Filesystem: read-only system paths */
+    /* Filesystem: read-only system paths.
+     *
+     * '/lib32?' is optional: it is absent on most 64-bit installs, and a
+     * rule for a path that does not exist is a fatal error by default. */
     const char *ro_paths[] = {
-        "/usr", "/lib", "/lib64", "/lib32",
+        "/usr", "/lib", "/lib64", "/lib32?",
         "/etc", "/bin", "/sbin",
         "/proc", "/dev", "/sys",
         "/run",     /* resolv.conf, systemd, dbus */
@@ -74,73 +69,79 @@ static void apply_profile_ai_agent(Config *cfg)
         NULL
     };
     for (int i = 0; ro_paths[i]; i++) {
-        if (cfg->path_count < MAX_PATHS) {
-            cfg->paths[cfg->path_count].path = ro_paths[i];
-            cfg->paths[cfg->path_count].mode = PATH_RO;
-            cfg->path_count++;
-        }
+        if (cfg_add_path(cfg, BUILTIN_WHERE, ro_paths[i], PATH_RO, 0) != 0)
+            return -1;
     }
 
     /* Filesystem: read-write for working dirs */
     const char *rw_paths[] = {"/tmp", NULL};
     for (int i = 0; rw_paths[i]; i++) {
-        if (cfg->path_count < MAX_PATHS) {
-            cfg->paths[cfg->path_count].path = rw_paths[i];
-            cfg->paths[cfg->path_count].mode = PATH_RW;
-            cfg->path_count++;
-        }
+        if (cfg_add_path(cfg, BUILTIN_WHERE, rw_paths[i], PATH_RW, 0) != 0)
+            return -1;
+    }
+
+    /* Writable device nodes, one rule each.
+     *
+     * `ro /dev` above makes the directory readable but leaves /dev/null
+     * unwritable, so any command containing `2>/dev/null` failed inside the
+     * flagship profile.  The fix is per-node rules rather than a blanket
+     * `rw /dev`: from ABI 5 a writable rule also carries
+     * LANDLOCK_ACCESS_FS_IOCTL_DEV, and granting that across the whole of
+     * /dev would hand back every device ioctl — including TIOCSTI on
+     * kernels where dev.tty.legacy_tiocsti is enabled. */
+    const char *rw_dev[] = {
+        "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom",
+        "/dev/tty",  "/dev/pts",  "/dev/ptmx",
+        NULL
+    };
+    for (int i = 0; rw_dev[i]; i++) {
+        if (cfg_add_path(cfg, BUILTIN_WHERE, rw_dev[i], PATH_RW, 0) != 0)
+            return -1;
     }
 
     /* Add HOME and workdir as RWX (agents write AND execute scripts) */
     const char *home = getenv("HOME");
-    if (home && cfg->path_count < MAX_PATHS) {
-        cfg->paths[cfg->path_count].path = home;
-        cfg->paths[cfg->path_count].mode = PATH_RWX;
-        cfg->path_count++;
+    if (home) {
+        const char *why = NULL;
+        if (!home_dir_usable(home, &why)) {
+            fprintf(stderr, "compartment-user: refusing to use HOME=%s as a "
+                    "sandbox root: %s\n", home, why);
+            fprintf(stderr, "  Set HOME to your own home directory, or use "
+                    "--profile none with explicit --ro/--rw rules.\n");
+            return -1;
+        }
+        if (cfg_add_path(cfg, BUILTIN_WHERE, home, PATH_RWX, 0) != 0)
+            return -1;
     }
-    if (cfg->workdir && cfg->path_count < MAX_PATHS) {
-        cfg->paths[cfg->path_count].path = cfg->workdir;
-        cfg->paths[cfg->path_count].mode = PATH_RWX;
-        cfg->path_count++;
-    }
+    if (cfg->workdir &&
+        cfg_add_path(cfg, BUILTIN_WHERE, cfg->workdir, PATH_RWX, 0) != 0)
+        return -1;
 
-    /* Syscalls to block */
-    const char *blocked[] = {
-        "ptrace", "mount", "umount2", "reboot",
-        "kexec_load", "kexec_file_load",
-        "init_module", "finit_module", "delete_module",
-        "pivot_root", "chroot", "unshare", "setns",
-        "keyctl", "add_key", "request_key",
-        "bpf", "userfaultfd", "perf_event_open",
-        "process_vm_readv", "process_vm_writev",
-        "acct", "swapon", "swapoff",
-        "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
-        "io_uring_setup", "io_uring_enter", "io_uring_register",
-        /* Container escape vectors: handle-based file access, new mount API */
-        "open_by_handle_at", "name_to_handle_at",
-        "open_tree", "move_mount", "fsopen", "fsmount", "fsconfig", "fspick",
-        "mount_setattr",
-        /* Cross-process FD theft */
-        "pidfd_getfd",
-#ifdef __x86_64__
-        "ioperm", "iopl",
-#endif
-        NULL
-    };
-    for (int i = 0; blocked[i]; i++) {
-        int nr = resolve_syscall(blocked[i]);
-        if (nr >= 0 && cfg->blocked_count < MAX_BLOCKED_SC)
-            cfg->blocked_syscalls[cfg->blocked_count++] = nr;
-    }
+    /* Syscalls to block — the table shared with compartment-root. */
+    if (cfg_add_builtin_denylist(cfg, BUILTIN_WHERE) != 0)
+        return -1;
 
-    /* Dangerous env vars to strip */
+    /* Dangerous env vars to strip.
+     *
+     * A trailing '*' is a prefix match, which is what keeps this list
+     * honest: "LD_*" covers LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH,
+     * LD_DEBUG, LD_PROFILE, LD_ORIGIN_PATH and whatever the loader grows
+     * next, instead of naming three of them and missing the rest.
+     *
+     * Deliberately NOT stripped: the *_API_KEY variables an agent
+     * authenticates its model provider with. compartment-user exists to
+     * run those agents; removing the credential they need in order to
+     * start would make the tool useless for its main job. See the
+     * credential note in HOWTO.md — if an agent must not see a key, do
+     * not export it into the agent's environment. */
     const char *deny_env[] = {
-        /* Dynamic linker injection */
-        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+        /* Dynamic linker and libc behaviour */
+        "LD_*",                             /* whole ld.so family */
+        "GLIBC_TUNABLES",                   /* CVE-2023-4911 vector */
         "GCONV_PATH",                       /* glibc iconv arbitrary .so load */
         "HOSTALIASES",                      /* hostname resolution hijack */
         "LOCPATH", "NLSPATH",               /* locale/message catalog injection */
-        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+        "DYLD_*",                           /* macOS loader family */
         "_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS",
         /* Cloud credentials — prevent ambient credential leakage */
         "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
@@ -148,13 +149,23 @@ static void apply_profile_ai_agent(Config *cfg)
         "AZURE_CLIENT_SECRET",
         /* VCS / CI tokens */
         "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "NPM_TOKEN",
-        /* Interpreter startup injection */
+        /* Shell startup and behaviour hijack */
         "BASH_ENV", "ENV",                  /* sourced by non-interactive bash/sh */
+        "BASH_FUNC_*",                      /* exported shell functions */
+        "PROMPT_COMMAND",                   /* runs on every bash prompt */
+        "IFS",                              /* word-splitting hijack */
+        "ZDOTDIR",                          /* zsh startup file location */
+        "CDPATH", "GLOBIGNORE",
+        /* Interpreter startup injection */
         "NODE_OPTIONS",                     /* Node.js flag injection */
-        "PYTHONSTARTUP",                    /* Python startup code injection */
-        "PERL5OPT", "PERL5LIB",            /* Perl arbitrary code load */
-        "RUBYOPT", "RUBYLIB",              /* Ruby arbitrary code load */
-        "CDPATH", "GLOBIGNORE",             /* shell behavior hijack */
+        "PYTHON*",                          /* PYTHONPATH/HOME/STARTUP/... */
+        "PERL5*", "PERLLIB",                /* Perl arbitrary code load */
+        "RUBYOPT", "RUBYLIB",               /* Ruby arbitrary code load */
+        /* git: each of these names a program git will execute */
+        "GIT_SSH_COMMAND", "GIT_CONFIG_*", "GIT_EDITOR",
+        "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR",
+        /* Programs launched by other programs (git, man, sudoedit, ...) */
+        "PAGER", "MANPAGER", "EDITOR", "VISUAL",
         /* SSH agent — prevents key use via forwarded socket */
         "SSH_AUTH_SOCK",
         /* Database credentials */
@@ -162,16 +173,18 @@ static void apply_profile_ai_agent(Config *cfg)
         NULL
     };
     for (int i = 0; deny_env[i]; i++) {
-        if (cfg->env_deny_count < MAX_ENV_VARS)
-            cfg->env_deny[cfg->env_deny_count++] = deny_env[i];
+        if (cfg_add_env_deny(cfg, BUILTIN_WHERE, deny_env[i], 0) != 0)
+            return -1;
     }
+    return 0;
 }
 
 /* ── Strict profile: minimal access ─────────────────────────────── */
 
-static void apply_profile_strict(Config *cfg)
+static int apply_profile_strict(Config *cfg)
 {
-    apply_profile_ai_agent(cfg);  /* start with ai-agent base */
+    if (apply_profile_ai_agent(cfg) != 0)  /* start with ai-agent base */
+        return -1;
 
     /* Also block: personality, lookup_dcookie, nfsservctl, quotactl */
     const char *extra[] = {
@@ -181,157 +194,9 @@ static void apply_profile_strict(Config *cfg)
     };
     for (int i = 0; extra[i]; i++) {
         int nr = resolve_syscall(extra[i]);
-        if (nr >= 0 && cfg->blocked_count < MAX_BLOCKED_SC)
-            cfg->blocked_syscalls[cfg->blocked_count++] = nr;
-    }
-}
-
-/* ── Landlock enforcement ────────────────────────────────────────── */
-
-static int landlock_add_path(int ruleset_fd, const char *path, uint64_t access)
-{
-    int fd = open(path, O_PATH | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0 && errno == ELOOP) {
-        /* Path is a symlink (e.g. /lib -> /usr/lib). Resolve it and use
-         * the target. This prevents an attacker from creating a symlink
-         * like /tmp/workdir -> / to expand the sandbox to the whole fs. */
-        char resolved[PATH_MAX];
-        if (!realpath(path, resolved)) {
-            fprintf(stderr, "compartment-user: landlock: symlink %s: %s\n",
-                    path, strerror(errno));
-            return 0; /* skip nonexistent symlink target */
-        }
-        fd = open(resolved, O_PATH | O_CLOEXEC | O_NOFOLLOW);
-        if (fd < 0 && errno == ELOOP) {
-            /* Resolved path is still a symlink — give up */
-            fprintf(stderr, "compartment-user: landlock: chained symlink %s -> %s\n",
-                    path, resolved);
-            return 0;
-        }
-    }
-    if (fd < 0) {
-        /* Path doesn't exist — skip silently (e.g. /lib32 on some systems) */
-        return 0;
-    }
-    struct landlock_path_beneath_attr attr = {
-        .allowed_access = access,
-        .parent_fd = fd,
-    };
-    int r = syscall(__NR_landlock_add_rule, ruleset_fd,
-                    LANDLOCK_RULE_PATH_BENEATH, &attr, 0);
-    close(fd);
-    if (r < 0 && errno != EINVAL) {
-        fprintf(stderr, "compartment-user: landlock add_rule %s: %s\n",
-                path, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-static int apply_landlock(Config *cfg)
-{
-    /* Check Landlock ABI version */
-    int abi = syscall(__NR_landlock_create_ruleset, NULL, 0,
-                      LANDLOCK_CREATE_RULESET_VERSION);
-    if (abi < 0) {
-        fprintf(stderr, "compartment-user: Landlock not available (%s)\n",
-                strerror(errno));
-        return -1;
-    }
-
-    /* Access rights we control — must include ALL rights we want to
-     * restrict, otherwise Landlock silently allows them.
-     * ABI v1: base rights (read, write, execute, remove, make_*)
-     * ABI v2: REFER (cross-directory rename/link)
-     * ABI v3: TRUNCATE
-     * ABI v4: IOCTL_DEV (device ioctls — when kernel headers support it) */
-    uint64_t handled =
-        LANDLOCK_ACCESS_FS_READ_FILE   |
-        LANDLOCK_ACCESS_FS_READ_DIR    |
-        LANDLOCK_ACCESS_FS_WRITE_FILE  |
-        LANDLOCK_ACCESS_FS_REMOVE_DIR  |
-        LANDLOCK_ACCESS_FS_REMOVE_FILE |
-        LANDLOCK_ACCESS_FS_MAKE_CHAR   |
-        LANDLOCK_ACCESS_FS_MAKE_REG    |
-        LANDLOCK_ACCESS_FS_MAKE_DIR    |
-        LANDLOCK_ACCESS_FS_MAKE_SYM    |
-        LANDLOCK_ACCESS_FS_MAKE_BLOCK  |
-        LANDLOCK_ACCESS_FS_MAKE_SOCK   |
-        LANDLOCK_ACCESS_FS_MAKE_FIFO   |
-        LANDLOCK_ACCESS_FS_EXECUTE;
-    if (abi >= 2)
-        handled |= LANDLOCK_ACCESS_FS_REFER;
-    if (abi >= 3)
-        handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
-    if (abi >= 4)
-        handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
-#endif
-
-    /* An empty ruleset (0 paths) with a non-zero handled mask would deny
-     * ALL filesystem access — the process couldn't even load libc. */
-    if (cfg->path_count == 0) {
-        fprintf(stderr, "compartment-user: landlock enabled but no paths "
-                "configured — this would deny all filesystem access\n");
-        return -1;
-    }
-
-    struct landlock_ruleset_attr rs_attr = { .handled_access_fs = handled };
-    int ruleset_fd = syscall(__NR_landlock_create_ruleset,
-                             &rs_attr, sizeof(rs_attr), 0);
-    if (ruleset_fd < 0) {
-        fprintf(stderr, "compartment-user: create_ruleset: %s\n", strerror(errno));
-        return -1;
-    }
-
-    /* Define access masks for each mode */
-    uint64_t read_access =
-        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-    uint64_t write_access =
-        LANDLOCK_ACCESS_FS_WRITE_FILE  |
-        LANDLOCK_ACCESS_FS_REMOVE_DIR  |
-        LANDLOCK_ACCESS_FS_REMOVE_FILE |
-        LANDLOCK_ACCESS_FS_MAKE_CHAR   |
-        LANDLOCK_ACCESS_FS_MAKE_REG    |
-        LANDLOCK_ACCESS_FS_MAKE_DIR    |
-        LANDLOCK_ACCESS_FS_MAKE_SYM    |
-        LANDLOCK_ACCESS_FS_MAKE_BLOCK  |
-        LANDLOCK_ACCESS_FS_MAKE_SOCK   |
-        LANDLOCK_ACCESS_FS_MAKE_FIFO;
-    if (abi >= 2) write_access |= LANDLOCK_ACCESS_FS_REFER;
-    if (abi >= 3) write_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
-    if (abi >= 4) write_access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
-#endif
-    uint64_t exec_access = LANDLOCK_ACCESS_FS_EXECUTE;
-
-    for (int i = 0; i < cfg->path_count; i++) {
-        uint64_t access = 0;
-        switch (cfg->paths[i].mode) {
-        case PATH_RO:   access = read_access | exec_access; break;
-        case PATH_RW:   access = read_access | write_access; break; /* W^X: no exec */
-        case PATH_EXEC: access = read_access | exec_access; break;
-        case PATH_RWX:  access = read_access | write_access | exec_access; break;
-        }
-        if (landlock_add_path(ruleset_fd, cfg->paths[i].path, access) != 0) {
-            fprintf(stderr, "compartment-user: landlock: failed to add rule for %s\n",
-                    cfg->paths[i].path);
-            close(ruleset_fd);
+        if (nr >= 0 && cfg_add_blocked(cfg, BUILTIN_WHERE, extra[i], nr) != 0)
             return -1;
-        }
     }
-
-    /* Enforce */
-    if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) != 0) {
-        fprintf(stderr, "compartment-user: restrict_self: %s\n", strerror(errno));
-        close(ruleset_fd);
-        return -1;
-    }
-    close(ruleset_fd);
-
-    if (cfg->verbose)
-        fprintf(stderr, "compartment-user: landlock enforced (ABI v%d, %d path rules)\n",
-                abi, cfg->path_count);
     return 0;
 }
 
@@ -349,22 +214,51 @@ static void print_usage(void)
         "  --profile strict      Minimal access (ai-agent + extra blocks)\n"
         "  --profile none        No defaults, only explicit rules\n"
         "  --profile FILE.conf   Load profile from file\n"
-        "  --profile NAME        Search ~/.config/compartment/NAME.conf,\n"
-        "                        then /etc/compartment/NAME.conf\n"
+        "  --profile NAME        Search /etc/compartment/NAME.conf\n"
+        "  --dump-profile NAME   Print the effective profile as .conf and exit\n"
+        "  --user-profiles       Also search ~/.config/compartment/NAME.conf\n"
+        "                        (off by default: the sandboxed process can\n"
+        "                        usually write there)\n"
         "\n"
         "Filesystem (Landlock):\n"
         "  --ro PATH             Read-only + execute access\n"
-        "  --rw PATH             Read-write + execute access\n"
-        "  --exec PATH           Read + execute access (alias for --ro)\n"
-        "  --workdir PATH        Working directory (added as --rw)\n"
+        "                        (append '?' to skip the rule when the path\n"
+        "                        does not exist: --ro /lib32?)\n"
+        "  --rw PATH             Read-write access (no execute — W^X)\n"
+        "  --exec PATH           Read + execute access (a rule naming a FILE\n"
+        "                        is a per-binary execute grant)\n"
+        "  --workdir PATH        Working directory (added read+write+execute,\n"
+        "                        not the W^X rights of --rw)\n"
         "  --no-landlock         Disable Landlock\n"
+        "\n"
+        "Network (Landlock, ABI v4+ / Linux 6.7+, TCP only):\n"
+        "  --net-bind PORT       Allow bind(2) on this TCP port (repeatable)\n"
+        "  --net-connect PORT    Allow connect(2) to this TCP port (repeatable)\n"
+        "  --net-deny            Handle TCP bind and connect; deny every port\n"
+        "                        not named above.  Without any of these three\n"
+        "                        the network is not restricted at all.\n"
+        "\n"
+        "Capabilities and namespace (root callers):\n"
+        "  --cap-drop CAP        Drop CAP from the bounding set before exec\n"
+        "                        (repeatable; needs CAP_SETPCAP).  Also clears\n"
+        "                        the ambient and inheritable sets and locks the\n"
+        "                        securebits.  SECBIT_NOROOT is NOT set: a root\n"
+        "                        caller keeps every capability not named here.\n"
+        "  --mask PATH           Cover PATH inside a private mount namespace\n"
+        "                        (repeatable; needs CAP_SYS_ADMIN at setup).\n"
+        "                        Append '?' to downgrade a missing\n"
+        "                        CAP_SYS_ADMIN from a refusal to a warning.\n"
         "\n"
         "Syscalls (seccomp BPF):\n"
         "  --block SYSCALL       Block a syscall (by name)\n"
+        "  --allow SYSCALL       Switch to allow-list mode and permit SYSCALL\n"
+        "                        (everything not listed then fails with EPERM)\n"
         "  --no-seccomp          Disable seccomp\n"
         "\n"
         "Environment:\n"
-        "  --env-deny VAR        Strip environment variable\n"
+        "  --env-deny VAR        Strip environment variable (VAR or PREFIX*)\n"
+        "  --env-allow VAR       Switch to allow-list mode and keep VAR\n"
+        "                        (everything not listed is then stripped)\n"
         "  --no-env-sanitize     Don't strip dangerous env vars\n"
         "\n"
         "General:\n"
@@ -372,10 +266,14 @@ static void print_usage(void)
         "  --verbose             Print actions to stderr\n"
         "  --audit               Log events to stderr + file\n"
         "  --audit-log DIR       Set audit log directory (implies --audit)\n"
-        "                        Default: /var/tmp/compartment-audit-$UID/\n"
+        "                        Default: /var/lib/compartment/audit/$UID if an\n"
+        "                        admin provisioned it, else\n"
+        "                        /var/tmp/compartment-audit-$UID\n"
+        "                        (root: /var/log/compartment)\n"
         "  --insecure            Allow execution when enforcement is degraded\n"
         "                        (missing Landlock, unsupported filesystem, etc.)\n"
         "  --verify              Check system support and exit\n"
+        "  --version             Print the version and exit\n"
         "  --help                This help\n"
         "\n"
         "Examples:\n"
@@ -670,6 +568,453 @@ static int print_verify(void)
 #define REAL_SHELL_DIR "/bin/shells"
 #endif
 
+/* ── Profile dump (--dump-profile) ───────────────────────────────── */
+
+static const char *syscall_name(int nr)
+{
+    for (int i = 0; syscall_table[i].name; i++)
+        if (syscall_table[i].nr == nr)
+            return syscall_table[i].name;
+    return NULL;
+}
+
+/* Serialise the resolved policy back to .conf syntax on stdout, so
+ * documentation and shipped examples can be generated from the binary
+ * instead of being transcribed by hand and going stale. */
+static void dump_profile(const Config *cfg)
+{
+    printf("# Generated by: compartment-user --dump-profile %s\n",
+           cfg->profile);
+    printf("# Source: %s\n#\n",
+           cfg->profile_source ? cfg->profile_source : "built-in");
+
+    printf("# Filesystem (Landlock)\n");
+    for (int i = 0; i < cfg->path_count; i++) {
+        static const char *modes[] = { "ro", "rw", "exec", "rwx" };
+        printf("%s %s%s\n", modes[cfg->paths[i].mode], cfg->paths[i].path,
+               cfg->paths[i].optional ? "?" : "");
+    }
+    if (cfg->net_bind_count || cfg->net_connect_count || cfg->net_default_deny) {
+        printf("\n# Network (Landlock TCP ports)\n");
+        for (int i = 0; i < cfg->net_bind_count; i++)
+            printf("net-bind %d\n", cfg->net_bind_ports[i]);
+        for (int i = 0; i < cfg->net_connect_count; i++)
+            printf("net-connect %d\n", cfg->net_connect_ports[i]);
+        if (cfg->net_default_deny)
+            printf("net-default deny\n");
+    }
+    if (cfg->workdir)
+        printf("\nworkdir %s\n", cfg->workdir);
+
+    if (cfg->seccomp_default != SECCOMP_DEFAULT_ERRNO)
+        printf("\nseccomp-default %s\n", seccomp_action_name(cfg));
+    if (cfg->seccomp_allow_mode) {
+        printf("\n# Syscall allow-list (seccomp)\nseccomp-mode allow\n");
+        for (int i = 0; i < cfg->allowed_sc_count; i++) {
+            const char *n = syscall_name(cfg->allowed_syscalls[i]);
+            if (n) printf("allow %s\n", n);
+            else   printf("# allow <unnamed syscall %d>\n",
+                          cfg->allowed_syscalls[i]);
+        }
+    } else {
+        printf("\n# Syscall deny-list (seccomp)\n");
+        for (int i = 0; i < cfg->blocked_count; i++) {
+            const char *n = syscall_name(cfg->blocked_syscalls[i]);
+            if (n) printf("block %s\n", n);
+            else   printf("# block <unnamed syscall %d>\n",
+                          cfg->blocked_syscalls[i]);
+        }
+    }
+
+    if (cfg->env_allow_mode) {
+        printf("\n# Environment allow-list ('*' suffix = prefix match)\n"
+               "env-mode allow\n");
+        for (int i = 0; i < cfg->env_allow_count; i++)
+            printf("env-allow %s\n", cfg->env_allow[i]);
+    } else {
+        printf("\n# Environment deny-list ('*' suffix = prefix match)\n");
+        for (int i = 0; i < cfg->env_deny_count; i++)
+            printf("env-deny %s\n", cfg->env_deny[i]);
+    }
+
+    if (cfg->cap_drop_count) {
+        printf("\n# Capability bounding-set drops\n");
+        for (int i = 0; i < cfg->cap_drop_count; i++)
+            printf("cap-drop %s\n", cfg->cap_drop_names[i]);
+    }
+    if (cfg->mask_count) {
+        printf("\n# Mount masks (private mount namespace)\n");
+        for (int i = 0; i < cfg->mask_count; i++)
+            printf("mask %s%s\n", cfg->masks[i],
+                   cfg->mask_optional[i] ? "?" : "");
+    }
+
+    printf("\n# Features (a profile may only turn these on)\n");
+    printf("landlock on\nseccomp on\nno-new-privs on\nenv-sanitize on\n");
+    if (cfg->audit)
+        printf("audit on\n");
+    if (cfg->audit_log_dir)
+        printf("audit-log %s\n", cfg->audit_log_dir);
+}
+
+/* ── Mount masks ──────────────────────────────────────────────────
+ *
+ * Landlock has no access right that covers connect(2) to a unix socket
+ * named by a path: a domain that denies open() on /run/systemd/private
+ * still lets a process talk to systemd through it.  The only way to take
+ * that away from a confined process without a BPF socket hook is to make
+ * the path not be there, which means a private mount namespace and a
+ * cover mount.
+ *
+ * Two properties are load-bearing and easy to get wrong:
+ *
+ *  - MS_PRIVATE|MS_REC on / is mandatory.  On a distribution where / is
+ *    `shared` — which is the systemd default — a cover mount made in a
+ *    fresh namespace propagates straight back to the host and hides the
+ *    socket from every process on the machine, permanently.  unshare(2)
+ *    does not do this for you; util-linux's unshare(1) does, which is why
+ *    the shell one-liner appears to work.
+ *  - It fails closed.  A mask that did not go on is a hole the policy
+ *    claims is shut, so anything but "the path is not there" is fatal.
+ *    The single exception is the one the operator asked for in writing:
+ *    `mask /path?` degrades to a warning when the caller has no
+ *    CAP_SYS_ADMIN and therefore cannot make a namespace at all.
+ *
+ * And one property that is easy to misread as a hole and is not.  A
+ * non-directory mask is a /dev/null bind, so it NEUTRALISES a write
+ * rather than refusing one: the open succeeds — Landlock keys on inodes,
+ * and every usable profile grants `rw /dev/null` — and the bytes go
+ * nowhere.  A read-only remount does not change that, because the kernel's
+ * read-only-filesystem check in sb_permission() applies to regular files,
+ * directories and symlinks only, never to device nodes.  Nothing leaks and
+ * nothing reaches the masked target, but the caller sees success.  So mask
+ * is the right tool for a *read* or *connect* surface — /proc/kcore, a
+ * privileged unix socket — and Landlock is the right tool for a write
+ * surface, where a rule refuses the open outright with EACCES.  Do not
+ * reach for a mask to close something a path rule already closes.
+ */
+static int mask_one(const char *path, int verbose)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT) {
+            if (verbose)
+                fprintf(stderr, TOOL ": mask %s: absent, nothing to hide\n",
+                        path);
+            return 0;
+        }
+        fprintf(stderr, TOOL ": mask %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    int is_dir = S_ISDIR(st.st_mode);
+    int r = is_dir
+        ? mount("tmpfs", path, "tmpfs",
+                MS_RDONLY | MS_NOSUID | MS_NOEXEC | MS_NODEV, "size=0")
+        : mount("/dev/null", path, NULL, MS_BIND, NULL);
+    if (r != 0) {
+        fprintf(stderr, TOOL ": mask %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    if (verbose)
+        fprintf(stderr, TOOL ": mask %s (%s)\n", path,
+                is_dir ? "empty tmpfs" : "/dev/null");
+    return 0;
+}
+
+static int apply_masks(Config *cfg)
+{
+    if (cfg->mask_count == 0)
+        return 0;
+
+    if (unshare(CLONE_NEWNS) != 0) {
+        int all_optional = 1;
+        for (int i = 0; i < cfg->mask_count; i++)
+            if (!cfg->mask_optional[i]) all_optional = 0;
+        if (errno == EPERM && all_optional) {
+            fprintf(stderr, TOOL ": WARNING: no CAP_SYS_ADMIN — %d optional "
+                    "mask%s skipped; the paths they name stay reachable\n",
+                    cfg->mask_count, cfg->mask_count == 1 ? "" : "s");
+            return 0;
+        }
+        fprintf(stderr, TOOL ": mask: unshare(CLONE_NEWNS): %s\n",
+                strerror(errno));
+        if (errno == EPERM)
+            fprintf(stderr, "  'mask' needs CAP_SYS_ADMIN at setup time.  "
+                    "Append '?' to a mask path to make it optional when the "
+                    "caller is unprivileged.\n");
+        return -1;
+    }
+
+    /* Without this the cover mounts propagate to every peer of the shared
+     * mount they land on — i.e. to the host. */
+    if (mount(NULL, "/", NULL, MS_PRIVATE | MS_REC, NULL) != 0) {
+        fprintf(stderr, TOOL ": mask: making / private: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    for (int i = 0; i < cfg->mask_count; i++)
+        if (mask_one(cfg->masks[i], cfg->verbose) != 0)
+            return -1;
+
+    if (cfg->verbose)
+        fprintf(stderr, TOOL ": %d mask%s applied in a private mount "
+                "namespace\n", cfg->mask_count,
+                cfg->mask_count == 1 ? "" : "s");
+    return 0;
+}
+
+/* ── Capability bounding-set drops ────────────────────────────────
+ *
+ * For a uid-0 process exec'ing a file that carries no file capabilities
+ * the kernel recomputes the permitted set as (full set AND the bounding
+ * set), so dropping a capability from the bounding set here removes it
+ * from the effective set of everything exec'd afterwards — which is the
+ * whole point when the confined subject is root.  PR_CAPBSET_DROP is
+ * one-way: there is no CAPBSET_ADD, and capset(2) cannot raise a
+ * capability that is no longer in the bounding set.
+ *
+ * SECBIT_NOROOT is deliberately NOT set.  With it, the same exec
+ * computes permitted = (inheritable AND file-inheritable) = 0 and the
+ * shell gets no capabilities whatsoever — a different product.  A
+ * limited root has to keep CAP_DAC_OVERRIDE, CAP_KILL, CAP_NET_ADMIN,
+ * CAP_SYSLOG and the rest or it cannot read a log or run `ip`.  What is
+ * set is the locking half: the ambient set cannot be re-raised and the
+ * securebits themselves cannot be relaxed later in the session.
+ */
+static int apply_cap_drops(Config *cfg)
+{
+    if (cfg->cap_drop_count == 0)
+        return 0;
+
+    int privileged = (geteuid() == 0);
+
+    for (int i = 0; i < cfg->cap_drop_count; i++) {
+        int cap = resolve_cap(cfg->cap_drop_names[i]);
+        if (cap < 0) {
+            fprintf(stderr, TOOL ": cap-drop: unknown capability '%s'\n",
+                    cfg->cap_drop_names[i]);
+            return -1;
+        }
+        if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) != 0) {
+            /* EINVAL means this kernel does not have that capability
+             * number at all, which is not a policy failure. */
+            if (errno == EINVAL) {
+                if (cfg->verbose)
+                    fprintf(stderr, TOOL ": cap-drop %s: not present on this "
+                            "kernel, skipped\n", cfg->cap_drop_names[i]);
+                continue;
+            }
+            if (errno == EPERM && !privileged) {
+                fprintf(stderr, TOOL ": WARNING: cap-drop needs CAP_SETPCAP; "
+                        "this process is not root and holds no capabilities "
+                        "to drop\n");
+                return 0;
+            }
+            fprintf(stderr, TOOL ": prctl(PR_CAPBSET_DROP, %s): %s\n",
+                    cfg->cap_drop_names[i], strerror(errno));
+            return -1;
+        }
+    }
+
+    /* Ambient caps survive execve on their own and would hand a dropped
+     * capability straight back; inheritable is the set an ambient raise
+     * is computed from. */
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0 &&
+        errno != EINVAL) {
+        fprintf(stderr, TOOL ": PR_CAP_AMBIENT_CLEAR_ALL: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    {
+        struct __user_cap_header_struct hdr = {
+            .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0
+        };
+        struct __user_cap_data_struct data[2] = {{0, 0, 0}, {0, 0, 0}};
+        if (syscall(SYS_capget, &hdr, data) != 0) {
+            fprintf(stderr, TOOL ": capget: %s\n", strerror(errno));
+            return -1;
+        }
+        data[0].inheritable = 0;
+        data[1].inheritable = 0;
+        if (syscall(SYS_capset, &hdr, data) != 0) {
+            fprintf(stderr, TOOL ": capset (clear inheritable): %s\n",
+                    strerror(errno));
+            return -1;
+        }
+    }
+
+    int sb = prctl(PR_GET_SECUREBITS, 0, 0, 0, 0);
+    if (sb < 0) {
+        fprintf(stderr, TOOL ": PR_GET_SECUREBITS: %s\n", strerror(errno));
+        return -1;
+    }
+    /* NOROOT itself is left alone; the _LOCKED bits freeze whatever it is
+     * now, so nothing later in the session can turn NOROOT off (it is off)
+     * or turn the setuid fixup back on. */
+    int want = sb | SECBIT_NO_CAP_AMBIENT_RAISE |
+                    SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED |
+                    SECBIT_NOROOT_LOCKED |
+                    SECBIT_NO_SETUID_FIXUP_LOCKED;
+    if (prctl(PR_SET_SECUREBITS, want, 0, 0, 0) != 0) {
+        fprintf(stderr, TOOL ": PR_SET_SECUREBITS(0x%x): %s\n",
+                (unsigned)want, strerror(errno));
+        return -1;
+    }
+
+    if (cfg->verbose) {
+        fprintf(stderr, TOOL ": %d capabilit%s dropped from the bounding "
+                "set, securebits 0x%x\n", cfg->cap_drop_count,
+                cfg->cap_drop_count == 1 ? "y" : "ies",
+                (unsigned)prctl(PR_GET_SECUREBITS, 0, 0, 0, 0));
+        FILE *st = fopen("/proc/self/status", "re");
+        if (st) {
+            char line[256];
+            while (fgets(line, sizeof(line), st))
+                if (strncmp(line, "CapBnd:", 7) == 0) {
+                    fprintf(stderr, TOOL ": %s", line);
+                    break;
+                }
+            fclose(st);
+        }
+    }
+    return 0;
+}
+
+/* Remove every descriptor inherited from the caller before installing
+ * Landlock or the profile's seccomp filter.  A filter is allowed to block
+ * close_range(2) and close(2), so doing this afterwards lets the policy
+ * disable its own cleanup. */
+static int close_inherited_fds(void)
+{
+    if (close_range(3, ~0U, 0) == 0)
+        return 0;
+
+    int close_range_errno = errno;
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) {
+        fprintf(stderr, TOOL ": cannot close inherited file descriptors: "
+                "close_range: %s; /proc/self/fd: %s\n",
+                strerror(close_range_errno), strerror(errno));
+        return -1;
+    }
+
+    int scan_fd = dirfd(dir);
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(dir);
+        if (!de) {
+            if (errno != 0) {
+                fprintf(stderr, TOOL ": readdir /proc/self/fd: %s\n",
+                        strerror(errno));
+                failed = 1;
+            }
+            break;
+        }
+
+        char *end = NULL;
+        errno = 0;
+        long fd = strtol(de->d_name, &end, 10);
+        if (errno != 0 || end == de->d_name || *end != '\0' ||
+            fd < 3 || fd > INT_MAX || fd == scan_fd)
+            continue;
+
+        if (close((int)fd) == 0 || errno == EBADF)
+            continue;
+
+        /* An outer sandbox may block close(2) too.  FD_CLOEXEC still
+         * establishes the required boundary: no caller descriptor reaches
+         * the target image. */
+        int flags = fcntl((int)fd, F_GETFD);
+        if (flags >= 0 && fcntl((int)fd, F_SETFD, flags | FD_CLOEXEC) == 0)
+            continue;
+
+        fprintf(stderr, TOOL ": cannot close or mark inherited fd %ld: %s\n",
+                fd, strerror(errno));
+        failed = 1;
+    }
+
+    /* opendir() marks its own descriptor close-on-exec.  Even an outer
+     * filter that rejects this close cannot leak the scan descriptor. */
+    (void)closedir(dir);
+    return failed ? -1 : 0;
+}
+
+/* ── Hardening applied on every path, just before exec ───────────── */
+
+static void apply_hardening(void)
+{
+    /* Clear ambient capabilities — prevents inherited caps from parent */
+    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+
+    /* Disable coredumps — prevents pipe core_pattern bypass and
+     * also restricts /proc/self access from other same-UID processes */
+    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+
+}
+
+/* ── COMPARTMENT_SHELL_DIR validation ────────────────────────────── */
+
+/* The env var comes from the caller — in a login-shell deployment, from
+ * the very user being confined — and it decides which binary the "shell"
+ * actually is. The 'hardened' Makefile target randomises REAL_SHELL_DIR
+ * precisely so that path is unguessable; an unchecked override defeats
+ * that. Honour it only when the directory and the shell binary inside it
+ * are owned by root or by the caller and are not group- or
+ * world-writable. Anything else is a warning and a fall back to the
+ * compile-time REAL_SHELL_DIR — never a refusal, because this code path
+ * must not be able to lock a user out of their account.
+ *
+ * The sandbox is applied before the exec either way. */
+static int shell_dir_acceptable(const char *dir, const char *shell_name)
+{
+    if (dir[0] != '/') {
+        fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
+                "'%s': must be absolute\n", dir);
+        return 0;
+    }
+    for (const char *p = dir; *p; p++) {
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0') &&
+            (p == dir || p[-1] == '/')) {
+            fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
+                    "'%s': contains '..'\n", dir);
+            return 0;
+        }
+    }
+
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
+                "'%s': %s\n", dir, strerror(errno));
+        return 0;
+    }
+    /* Same ownership and write rules as a profile file: root or the real
+     * uid, nothing group- or world-writable. */
+    int ok = profile_fd_trusted(dfd, 0, S_IFDIR, "shell directory", dir) == 0;
+    if (ok) {
+        /* O_PATH: we only need to stat it, and an execute-only shell
+         * binary would not be readable. */
+        int sfd = openat(dfd, shell_name, O_PATH | O_CLOEXEC);
+        if (sfd < 0) {
+            fprintf(stderr, "compartment-user: ignoring COMPARTMENT_SHELL_DIR "
+                    "'%s': %s/%s: %s\n", dir, dir, shell_name, strerror(errno));
+            ok = 0;
+        } else {
+            ok = profile_fd_trusted(sfd, 0, S_IFREG, "shell binary",
+                                    shell_name) == 0;
+            close(sfd);
+        }
+    }
+    close(dfd);
+    if (!ok)
+        fprintf(stderr, "compartment-user: falling back to %s\n",
+                REAL_SHELL_DIR);
+    return ok;
+}
+
 int main(int argc, char *argv[])
 {
     /*
@@ -681,45 +1026,39 @@ int main(int argc, char *argv[])
      *   # real shell lives at /bin/shells/bash
      */
     char *invoked_name = basename(argv[0]);
-    if (strcmp(invoked_name, "compartment-user") != 0) {
-        const char *shell_dir = getenv("COMPARTMENT_SHELL_DIR");
-        if (!shell_dir) shell_dir = REAL_SHELL_DIR;
 
-        /* Validate shell_dir: must be absolute and must not contain ".." */
-        if (shell_dir[0] != '/') {
-            fprintf(stderr, "compartment-user: COMPARTMENT_SHELL_DIR must be absolute: %s\n",
-                    shell_dir);
-            return 126;
-        }
-        /* Check for ".." traversal in shell_dir */
-        {
-            const char *p = shell_dir;
-            while (*p) {
-                if (p[0] == '.' && p[1] == '.' &&
-                    (p[2] == '/' || p[2] == '\0') &&
-                    (p == shell_dir || p[-1] == '/')) {
-                    fprintf(stderr, "compartment-user: COMPARTMENT_SHELL_DIR contains '..': %s\n",
-                            shell_dir);
-                    return 126;
-                }
-                p++;
-            }
-        }
+    /* login(1) and sshd hand a *login* shell an argv[0] of "-bash": the
+     * leading dash is a convention that tells the shell to read the login
+     * startup files, not part of the program's name.  Without stripping it
+     * the stash lookup becomes "<stash>/-bash" and every interactive login
+     * through the wrapper fails to exec — which made the whole login-shell
+     * deployment work only for `ssh host command`, where sshd passes the
+     * bare basename.  argv itself is left alone on the exec below, so the
+     * real shell still sees its dash and still behaves as a login shell. */
+    const char *shell_name = invoked_name;
+    if (shell_name[0] == '-' && shell_name[1] != '\0')
+        shell_name++;
+
+    if (strcmp(shell_name, "compartment-user") != 0) {
+        const char *shell_dir = getenv("COMPARTMENT_SHELL_DIR");
+        if (shell_dir && !shell_dir_acceptable(shell_dir, shell_name))
+            shell_dir = NULL;
+        if (!shell_dir) shell_dir = REAL_SHELL_DIR;
 
         char real_shell[PATH_MAX];
         int rsn = snprintf(real_shell, sizeof(real_shell), "%s/%s",
-                           shell_dir, invoked_name);
+                           shell_dir, shell_name);
         if (rsn < 0 || (size_t)rsn >= sizeof(real_shell)) {
             fprintf(stderr, "compartment-user: shell path too long\n");
             return 126;
         }
 
-        /* Apply ai-agent profile sandbox, then exec real shell.
-         *
-         * IMPORTANT: Shell-replacement mode must NEVER block login.
-         * If enforcement fails, log to syslog and continue unsecured.
-         * Blocking /bin/bash would lock out the user — worse than
-         * running unsandboxed. */
+        /* Apply the ai-agent profile sandbox, then exec the real shell.
+         * Runtime mechanism failures may degrade to a syslog warning for
+         * the built-in agent-interception profile.  An explicit operator
+         * policy, and invariants whose failure would directly preserve a
+         * bypass (capability drops, masks and inherited descriptors), fail
+         * closed. */
         Config shell_cfg = {
             .use_landlock     = 1,
             .use_seccomp      = 1,
@@ -728,11 +1067,87 @@ int main(int argc, char *argv[])
             .audit_log_fd     = -1,
             .profile          = "ai-agent",
         };
-        /* Try profile file first, fall back to built-in */
-        if (resolve_and_load_profile(&shell_cfg, "ai-agent", 0) != 0)
-            apply_profile_ai_agent(&shell_cfg);
+        /* Profile resolution, in order:
+         *
+         *   1. /etc/compartment/shell-replacement.conf — the operator has
+         *      said in writing what a shell run through the wrapper may do.
+         *      This is what a limited-root deployment installs, and it is
+         *      also the switch that makes this code path FAIL CLOSED (see
+         *      below): an operator who writes that file is confining an
+         *      account, not sandboxing an agent.
+         *   2. the ai-agent profile file, then the built-in — the original
+         *      behaviour, unchanged, for the agent-interception deployment.
+         *
+         * Flags 0: shell-replacement mode reads /etc/compartment only.
+         * $HOME belongs to the very user being confined. */
+        int strict_shell = 0;
+        int shell_pr = resolve_and_load_profile(&shell_cfg,
+                                                "shell-replacement", 0, 0);
+        if (shell_pr == PROFILE_ERROR) {
+            /* Not a fall-back: the file exists and says something we cannot
+             * read.  Running the ai-agent policy instead would confine a
+             * root login with a policy written for an AI agent and report
+             * success. */
+            syslog(LOG_ERR, "compartment-user[%s]: "
+                   "shell-replacement.conf was rejected — refusing to run",
+                   invoked_name);
+            fprintf(stderr, TOOL ": /etc/compartment/shell-replacement.conf "
+                    "was rejected — refusing to run\n");
+            return 126;
+        }
+        if (shell_pr == PROFILE_OK) {
+            strict_shell = 1;
+            shell_cfg.profile = "shell-replacement";
+        } else {
+            shell_pr = resolve_and_load_profile(&shell_cfg, "ai-agent", 0, 0);
+            if (shell_pr == PROFILE_ERROR)
+                syslog(LOG_WARNING, "compartment-user[%s]: ai-agent profile "
+                       "was rejected — falling back to the built-in policy",
+                       invoked_name);
+            if (shell_pr != PROFILE_OK)
+                (void)apply_profile_ai_agent(&shell_cfg);
+        }
 
+        /* Fail-closed vs never-lock-the-user-out.
+         *
+         * The agent deployment's contract is that a failed mechanism
+         * degrades to syslog and the login proceeds, because an
+         * unsandboxed agent beats a user locked out of /bin/bash.  For an
+         * account whose whole reason to exist is that it is confined, an
+         * unconfined uid-0 login IS the failure, so shell-replacement.conf
+         * inverts it.  Recovery is a separate real-admin account whose
+         * shell is the stashed binary, plus the console. */
         int shell_degraded = 0;
+
+        /* Same preflight as the normal path, but advisory: a degraded
+         * environment must not stop a login. */
+        {
+            int pf = preflight_check(&shell_cfg);
+            if (pf > 0) {
+                syslog(LOG_WARNING, "compartment-user[%s]: %d preflight "
+                       "check%s failed — enforcement may be degraded",
+                       invoked_name, pf, pf > 1 ? "s" : "");
+                shell_degraded += pf;
+            }
+        }
+
+        /* Masks and capability drops are fatal in both modes: they are new
+         * policy, nothing depends on them degrading, and a mask that did
+         * not go on is a hole the profile says is shut. */
+        if (apply_masks(&shell_cfg) != 0) {
+            syslog(LOG_ERR, "compartment-user[%s]: a required mask could not "
+                   "be applied — refusing to run", invoked_name);
+            fprintf(stderr, TOOL ": refusing to run — a mask the profile "
+                    "requires could not be applied\n");
+            return 126;
+        }
+        if (apply_cap_drops(&shell_cfg) != 0) {
+            syslog(LOG_ERR, "compartment-user[%s]: the capability policy "
+                   "could not be applied — refusing to run", invoked_name);
+            fprintf(stderr, TOOL ": refusing to run — the capability policy "
+                    "could not be applied\n");
+            return 126;
+        }
 
         if (shell_cfg.use_no_new_privs) {
             if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
@@ -744,8 +1159,19 @@ int main(int argc, char *argv[])
         }
         if (shell_cfg.use_env_sanitize)
             sanitize_env(&shell_cfg);
+
+        /* Landlock does not revoke access through an already-open fd, and
+         * the profile may block the close syscalls.  Fail closed if the
+         * caller's descriptor table cannot be cleaned first. */
+        if (close_inherited_fds() != 0) {
+            syslog(LOG_ERR, "compartment-user[%s]: inherited file descriptor "
+                   "cleanup failed — refusing to run", invoked_name);
+            fprintf(stderr, TOOL ": refusing to run — inherited file "
+                    "descriptors could not be closed safely\n");
+            return 126;
+        }
         if (shell_cfg.use_landlock) {
-            if (apply_landlock(&shell_cfg) != 0) {
+            if (apply_landlock(&shell_cfg, TOOL) != 0) {
                 syslog(LOG_WARNING, "compartment-user[%s]: "
                        "Landlock failed — running without filesystem restriction",
                        invoked_name);
@@ -766,7 +1192,18 @@ int main(int argc, char *argv[])
                    invoked_name, shell_degraded,
                    shell_degraded > 1 ? "s" : "",
                    getuid(), getpid(), getppid());
+            if (strict_shell) {
+                fprintf(stderr, TOOL ": refusing to run — %d enforcement "
+                        "mechanism%s failed and shell-replacement.conf is "
+                        "in force\n", shell_degraded,
+                        shell_degraded > 1 ? "s" : "");
+                return 126;
+            }
         }
+
+        /* Same ambient-cap clear and PR_SET_DUMPABLE(0) the normal path
+         * performs. Descriptor cleanup happened before the filters. */
+        apply_hardening();
 
         execv(real_shell, argv);
         fprintf(stderr, "compartment-user: exec %s: %s\n",
@@ -803,10 +1240,22 @@ int main(int argc, char *argv[])
         {"insecure",        no_argument,       NULL, 'U'},
         {"unsecure",        no_argument,       NULL, 'U'},  /* alias */
         {"verify",          no_argument,       NULL, 'V'},
+        {"net-bind",        required_argument, NULL, 4},
+        {"net-connect",     required_argument, NULL, 5},
+        {"net-deny",        no_argument,       NULL, 6},
+        {"cap-drop",        required_argument, NULL, 7},
+        {"mask",            required_argument, NULL, 8},
+        {"user-profiles",   no_argument,       NULL, 2},
+        {"dump-profile",    required_argument, NULL, 3},
         {"version",         no_argument,       NULL, 1},
         {"help",            no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
+
+    /* Profile resolution: system profiles only unless --user-profiles is
+     * given. $HOME is writable by the process we are confining. */
+    unsigned profile_flags = 0;
+    int dump = 0;
 
     int opt;
     while ((opt = getopt_long(argc, argv, "+P:r:w:x:W:b:l:E:e:A:LSNdvaUVh",
@@ -814,27 +1263,20 @@ int main(int argc, char *argv[])
         switch (opt) {
         case 'P': cfg.profile = optarg; break;
         case 'r': /* --ro */
-            if (cfg.path_count < MAX_PATHS) {
-                cfg.paths[cfg.path_count].path = optarg;
-                cfg.paths[cfg.path_count].mode = PATH_RO;
-                cfg.path_count++;
-            }
+            if (cfg_add_path(&cfg, CLI_WHERE, optarg, PATH_RO, 0) != 0)
+                return 1;
             break;
         case 'w': /* --rw */
-            if (cfg.path_count < MAX_PATHS) {
-                cfg.paths[cfg.path_count].path = optarg;
-                cfg.paths[cfg.path_count].mode = PATH_RW;
-                cfg.path_count++;
-            }
+            if (cfg_add_path(&cfg, CLI_WHERE, optarg, PATH_RW, 0) != 0)
+                return 1;
             break;
         case 'x': /* --exec */
-            if (cfg.path_count < MAX_PATHS) {
-                cfg.paths[cfg.path_count].path = optarg;
-                cfg.paths[cfg.path_count].mode = PATH_EXEC;
-                cfg.path_count++;
-            }
+            if (cfg_add_path(&cfg, CLI_WHERE, optarg, PATH_EXEC, 0) != 0)
+                return 1;
             break;
-        case 'W': cfg.workdir = optarg; break;
+        /* xstrdup, not optarg: config_free_oneshot() owns this field,
+         * and an argv pointer cannot be freed. */
+        case 'W': free((void *)cfg.workdir); cfg.workdir = xstrdup(optarg); break;
         case 'b': { /* --block */
             int nr = resolve_syscall(optarg);
             if (nr < 0) {
@@ -845,8 +1287,8 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "\n");
                 return 1;
             }
-            if (cfg.blocked_count < MAX_BLOCKED_SC)
-                cfg.blocked_syscalls[cfg.blocked_count++] = nr;
+            if (cfg_add_blocked(&cfg, CLI_WHERE, optarg, nr) != 0)
+                return 1;
             break;
         }
         case 'l': { /* --allow (syscall allowlist) */
@@ -855,22 +1297,18 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "compartment-user: unknown syscall: %s\n", optarg);
                 return 1;
             }
-            if (cfg.allowed_sc_count < MAX_ALLOWED_SC) {
-                cfg.allowed_syscalls[cfg.allowed_sc_count++] = nr;
-                cfg.seccomp_allow_mode = 1;
-            }
+            if (cfg_add_allowed(&cfg, CLI_WHERE, optarg, nr) != 0)
+                return 1;
             break;
         }
         case 'E': /* --env-deny */
-            if (cfg.env_deny_count < MAX_ENV_VARS)
-                cfg.env_deny[cfg.env_deny_count++] = optarg;
+            if (cfg_add_env_deny(&cfg, CLI_WHERE, optarg, 0) != 0)
+                return 1;
             break;
         case 'e': /* --env-allow */
-            if (cfg.env_allow_count < MAX_ENV_VARS) {
-                cfg.env_allow[cfg.env_allow_count++] = optarg;
-                cfg.env_allow_mode = 1;
-                cfg.use_env_sanitize = 1;
-            }
+            if (cfg_add_env_allow(&cfg, CLI_WHERE, optarg, 0) != 0)
+                return 1;
+            cfg.use_env_sanitize = 1;
             break;
         case 'L': cfg.use_landlock = 0; break;
         case 'S': cfg.use_seccomp = 0; break;
@@ -878,16 +1316,45 @@ int main(int argc, char *argv[])
         case 'd': cfg.dry_run = 1; cfg.verbose = 1; break;
         case 'v': cfg.verbose = 1; break;
         case 'a': cfg.audit = 1; break;
-        case 'A': cfg.audit_log_dir = optarg; cfg.audit = 1; break;
+        case 'A': free((void *)cfg.audit_log_dir);
+                  cfg.audit_log_dir = xstrdup(optarg); cfg.audit = 1; break;
         case 'U': cfg.allow_insecure = 1; break;
         case 'V': return print_verify();
+        case  4 : /* --net-bind */
+            if (cfg_add_net_port(CLI_WHERE, "net-bind", optarg,
+                                 cfg.net_bind_ports, &cfg.net_bind_count) != 0)
+                return 1;
+            break;
+        case  5 : /* --net-connect */
+            if (cfg_add_net_port(CLI_WHERE, "net-connect", optarg,
+                                 cfg.net_connect_ports,
+                                 &cfg.net_connect_count) != 0)
+                return 1;
+            break;
+        case  6 : cfg.net_default_deny = 1; break;
+        case  7 : /* --cap-drop */
+            if (resolve_cap(optarg) < 0) {
+                fprintf(stderr, TOOL ": unknown capability: %s\n", optarg);
+                return 1;
+            }
+            if (cfg_add_str(cfg.cap_drop_names, &cfg.cap_drop_count,
+                            MAX_ENV_VARS, CLI_WHERE, "cap-drop",
+                            optarg, 1) != 0)
+                return 1;
+            break;
+        case  8 : /* --mask */
+            if (cfg_add_mask(&cfg, CLI_WHERE, optarg, 1) != 0)
+                return 1;
+            break;
+        case  2 : profile_flags |= PROFILE_SEARCH_USER; break;
+        case  3 : cfg.profile = optarg; dump = 1; break;
         case  1 : printf("compartment-user %s\n", COMPARTMENT_VERSION); return 0;
         case 'h': print_usage(); return 0;
         default:  print_usage(); return 1;
         }
     }
 
-    if (optind >= argc) {
+    if (optind >= argc && !dump) {
         fprintf(stderr, "compartment-user: no command specified\n");
         print_usage();
         return 1;
@@ -899,23 +1366,41 @@ int main(int argc, char *argv[])
     int cli_disabled_seccomp      = (cfg.use_seccomp == 0);
     int cli_disabled_env_sanitize = (cfg.use_env_sanitize == 0);
 
-    /* Apply profile: try file first, then fall back to built-in */
+    /* Apply profile: try file first, then fall back to built-in.
+     *
+     * A profile that exists but does not parse is fatal: falling back to
+     * the built-in would run a policy the operator never asked for, and
+     * report it as "(built-in)" while the rejected file's already-parsed
+     * rules were still in force. */
     if (strcmp(cfg.profile, "none") != 0) {
-        if (resolve_and_load_profile(&cfg, cfg.profile, 0) == 0) {
-            /* loaded from file */
-        } else if (strcmp(cfg.profile, "ai-agent") == 0) {
-            apply_profile_ai_agent(&cfg);
-            cfg.profile_source = "built-in";
-        } else if (strcmp(cfg.profile, "strict") == 0) {
-            apply_profile_strict(&cfg);
-            cfg.profile_source = "built-in";
-        } else {
-            fprintf(stderr, "compartment-user: unknown profile: %s\n", cfg.profile);
-            fprintf(stderr, "  searched: ~/.config/compartment/%s.conf, "
-                    "/etc/compartment/%s.conf\n", cfg.profile, cfg.profile);
+        int pr = resolve_and_load_profile(&cfg, cfg.profile, 0, profile_flags);
+        if (pr == PROFILE_ERROR) {
+            fprintf(stderr, "compartment-user: profile '%s' was rejected — "
+                    "refusing to run\n", cfg.profile);
             return 1;
         }
+        if (pr == PROFILE_NOT_FOUND) {
+            if (strcmp(cfg.profile, "ai-agent") == 0) {
+                if (apply_profile_ai_agent(&cfg) != 0) return 1;
+                /* Heap, not a literal: config_free_oneshot() frees this
+                 * field unconditionally, and a free() of .rodata is a
+                 * crash rather than a leak. */
+                cfg.profile_source = xstrdup("built-in");
+            } else if (strcmp(cfg.profile, "strict") == 0) {
+                if (apply_profile_strict(&cfg) != 0) return 1;
+                cfg.profile_source = xstrdup("built-in");
+            } else {
+                fprintf(stderr, "compartment-user: unknown profile: %s\n",
+                        cfg.profile);
+                profile_print_search_path(stderr, cfg.profile, profile_flags);
+                return 1;
+            }
+        }
     }
+
+    if (cfg.verbose)
+        fprintf(stderr, "compartment-user: profile %s (%s)\n", cfg.profile,
+                cfg.profile_source ? cfg.profile_source : "built-in");
 
     /* CLI --no-* flags always win over profile — if the user explicitly
      * disabled a mechanism on the command line, the profile cannot
@@ -927,7 +1412,7 @@ int main(int argc, char *argv[])
     /* workdir implies rw — the user expects to write there.
      * The ai-agent built-in does this already; this ensures file-loaded
      * profiles get the same behavior. Skip if already in the path list. */
-    if (cfg.workdir && cfg.path_count < MAX_PATHS) {
+    if (cfg.workdir) {
         int already = 0;
         for (int i = 0; i < cfg.path_count; i++) {
             if (cfg.paths[i].mode == PATH_RW &&
@@ -936,11 +1421,20 @@ int main(int argc, char *argv[])
                 break;
             }
         }
-        if (!already) {
-            cfg.paths[cfg.path_count].path = cfg.workdir;
-            cfg.paths[cfg.path_count].mode = PATH_RW;
-            cfg.path_count++;
-        }
+        if (!already &&
+            cfg_add_path(&cfg, CLI_WHERE, cfg.workdir, PATH_RW, 0) != 0)
+            return 1;
+    }
+
+    /* ── Reject a policy Landlock cannot express (M9) ───────────── */
+    if (cfg.use_landlock && config_check_additive(&cfg, TOOL) != 0)
+        return 1;
+
+    /* ── Dump the resolved policy as .conf and exit ─────────────── */
+    if (dump) {
+        dump_profile(&cfg);
+        config_free_oneshot(&cfg);
+        return 0;
     }
 
     /* ── Dry run: show config and exit ──────────────────────────── */
@@ -952,12 +1446,55 @@ int main(int argc, char *argv[])
                 cfg.use_no_new_privs ? "yes" : "no");
         fprintf(stderr, "  landlock: %s (%d path rules)\n",
                 cfg.use_landlock ? "yes" : "no", cfg.path_count);
-        for (int i = 0; i < cfg.path_count; i++)
-            fprintf(stderr, "    %s %s\n",
+        for (int i = 0; i < cfg.path_count; i++) {
+            struct stat pst;
+            const char *note = "";
+            if (stat(cfg.paths[i].path, &pst) != 0)
+                note = cfg.paths[i].optional ? "   (absent — optional, skipped)"
+                                             : "   (ABSENT — this run would fail)";
+            fprintf(stderr, "    %s %s%s%s\n",
                     cfg.paths[i].mode == PATH_RO ? "ro" :
                     cfg.paths[i].mode == PATH_RW ? "rw" :
                     cfg.paths[i].mode == PATH_EXEC ? "exec" : "rwx",
-                    cfg.paths[i].path);
+                    cfg.paths[i].path,
+                    cfg.paths[i].optional ? "?" : "", note);
+        }
+        {
+            int abi = landlock_abi();
+            int nrules = cfg.net_bind_count + cfg.net_connect_count;
+            if (nrules > 0 || cfg.net_default_deny) {
+                fprintf(stderr, "  landlock net: %s (%d TCP port rule%s)\n",
+                        (abi >= 4) ? "yes" : "NOT SUPPORTED on this kernel",
+                        nrules, nrules == 1 ? "" : "s");
+                for (int i = 0; i < cfg.net_bind_count; i++)
+                    fprintf(stderr, "    net-bind %d\n", cfg.net_bind_ports[i]);
+                for (int i = 0; i < cfg.net_connect_count; i++)
+                    fprintf(stderr, "    net-connect %d\n",
+                            cfg.net_connect_ports[i]);
+                if (cfg.net_default_deny)
+                    fprintf(stderr, "    net-default deny\n");
+            }
+        }
+        if (cfg.cap_drop_count) {
+            fprintf(stderr, "  cap-drop: %d capabilit%s\n",
+                    cfg.cap_drop_count,
+                    cfg.cap_drop_count == 1 ? "y" : "ies");
+            for (int i = 0; i < cfg.cap_drop_count; i++)
+                fprintf(stderr, "    cap-drop %s\n", cfg.cap_drop_names[i]);
+        }
+        if (cfg.mask_count) {
+            fprintf(stderr, "  mask: %d path%s (private mount namespace)\n",
+                    cfg.mask_count, cfg.mask_count == 1 ? "" : "s");
+            for (int i = 0; i < cfg.mask_count; i++) {
+                struct stat mst;
+                const char *note = "";
+                if (lstat(cfg.masks[i], &mst) != 0)
+                    note = "   (absent — nothing to hide)";
+                fprintf(stderr, "    mask %s%s%s\n", cfg.masks[i],
+                        cfg.mask_optional[i] ? "?" : "", note);
+            }
+        }
+        fprintf(stderr, "  seccomp-default: %s\n", seccomp_action_name(&cfg));
         if (cfg.seccomp_allow_mode) {
             fprintf(stderr, "  seccomp: %s ALLOW-LIST (%d allowed, rest denied)\n",
                     cfg.use_seccomp ? "yes" : "no", cfg.allowed_sc_count);
@@ -965,14 +1502,8 @@ int main(int argc, char *argv[])
             fprintf(stderr, "  seccomp: %s DENY-LIST (%d blocked)\n",
                     cfg.use_seccomp ? "yes" : "no", cfg.blocked_count);
             for (int i = 0; i < cfg.blocked_count; i++) {
-                const char *name = "?";
-                for (int j = 0; syscall_table[j].name; j++) {
-                    if (syscall_table[j].nr == cfg.blocked_syscalls[i]) {
-                        name = syscall_table[j].name;
-                        break;
-                    }
-                }
-                fprintf(stderr, "    block %s (%d)\n", name,
+                const char *name = syscall_name(cfg.blocked_syscalls[i]);
+                fprintf(stderr, "    block %s (%d)\n", name ? name : "?",
                         cfg.blocked_syscalls[i]);
             }
         }
@@ -984,22 +1515,34 @@ int main(int argc, char *argv[])
                     cfg.env_deny_count);
         }
         if (cfg.audit) {
+            char defdir[PATH_MAX - 32];
             fprintf(stderr, "  audit: yes (log: %s)\n",
                     cfg.audit_log_dir ? cfg.audit_log_dir :
-                    "/var/tmp/compartment-audit-$UID/");
+                    (audit_default_dir(defdir, sizeof(defdir)) == 0
+                         ? defdir : "(none)"));
         }
         fprintf(stderr, "  command: %s\n", argv[optind]);
+        config_free_oneshot(&cfg);
         return 0;
     }
 
     /* ── Audit (open log file BEFORE Landlock — fd survives) ──── */
     if (cfg.audit) {
-        audit_log_open(&cfg);  /* non-fatal if it fails */
+        /* Fatal: auditing was explicitly requested. Continuing without a
+         * durable record — or worse, with the record redirected through a
+         * symlink someone else controls — is not a degraded mode worth
+         * having. */
+        if (audit_log_open(&cfg) != 0) {
+            fprintf(stderr, "compartment-user: audit logging was requested "
+                    "but could not be set up safely — refusing to run\n");
+            return 1;
+        }
 
         char detail[512];
-        snprintf(detail, sizeof(detail), "command=%s profile=%s "
+        snprintf(detail, sizeof(detail), "command=%s profile=%s source=%s "
                  "landlock=%d seccomp=%d paths=%d blocked=%d",
                  argv[optind], cfg.profile,
+                 cfg.profile_source ? cfg.profile_source : "built-in",
                  cfg.use_landlock, cfg.use_seccomp,
                  cfg.path_count, cfg.blocked_count);
         audit_log(&cfg, "COMPARTMENT_START", detail);
@@ -1042,9 +1585,31 @@ int main(int argc, char *argv[])
     if (cfg.use_env_sanitize)
         sanitize_env(&cfg);
 
+    /* ── 2b. Mount masks (needs CAP_SYS_ADMIN; before the cap drops) ── */
+    if (apply_masks(&cfg) != 0) {
+        fprintf(stderr, TOOL ": refusing to run — a mask the profile "
+                "requires could not be applied\n");
+        return 1;
+    }
+
+    /* ── 2c. Capability bounding-set drops (after the masks, which need
+     *        CAP_SYS_ADMIN, and before anything that could exec) ────── */
+    if (apply_cap_drops(&cfg) != 0) {
+        fprintf(stderr, TOOL ": refusing to run — the capability policy "
+                "could not be applied\n");
+        return 1;
+    }
+
+    /* ── 2d. Inherited descriptors (before Landlock/seccomp) ───── */
+    if (close_inherited_fds() != 0) {
+        fprintf(stderr, TOOL ": refusing to run — inherited file "
+                "descriptors could not be closed safely\n");
+        return 1;
+    }
+
     /* ── 3. Landlock (filesystem) ──────────────────────────────── */
     if (cfg.use_landlock) {
-        if (apply_landlock(&cfg) != 0) {
+        if (apply_landlock(&cfg, TOOL) != 0) {
             fprintf(stderr, "compartment-user: Landlock failed — aborting. "
                     "Use --no-landlock to run without filesystem restriction.\n");
             return 1;
@@ -1071,25 +1636,7 @@ int main(int argc, char *argv[])
     }
 
     /* ── 6. Hardening (defense in depth) ─────────────────────── */
-
-    /* Clear ambient capabilities — prevents inherited caps from parent */
-    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
-
-    /* Disable coredumps — prevents pipe core_pattern bypass and
-     * also restricts /proc/self access from other same-UID processes */
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-
-    /* Close inherited file descriptors — Landlock only restricts new
-     * open() calls, not already-open fds leaked from the parent.
-     * close_range() available since Linux 5.9, glibc 2.34. */
-    if (close_range(3, ~0U, 0) != 0) {
-        /* Fallback for older kernels — use rlimit to find upper bound */
-        struct rlimit rl;
-        int max_fd = 4096;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < (rlim_t)max_fd)
-            max_fd = (int)rl.rlim_cur;
-        for (int cfd = 3; cfd < max_fd; cfd++) close(cfd);
-    }
+    apply_hardening();
 
     /* ── 7. exec ───────────────────────────────────────────────── */
     if (cfg.verbose)
@@ -1098,5 +1645,6 @@ int main(int argc, char *argv[])
     execvp(argv[optind], &argv[optind]);
     fprintf(stderr, "compartment-user: exec %s: %s\n",
             argv[optind], strerror(errno));
+    config_free_oneshot(&cfg);
     return 127;
 }

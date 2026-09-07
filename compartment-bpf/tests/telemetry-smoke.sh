@@ -98,8 +98,12 @@ MISSING="$(comm -23 <(echo "${PINNED}") <(echo "${SURFACED}") || true)"
 EXTRA="$(comm -13 <(echo "${PINNED}") <(echo "${SURFACED}") || true)"
 # Floor: with both lists empty, `comm` reports no diff and parity would PASS
 # vacuously ("all 0 surfaced") — masking TOTAL drift (counters gone / not pinned).
-# Require the known counter floor so an empty surface FAILS loudly.
-TM_MIN_COUNTERS="${TM_MIN_COUNTERS:-12}"
+# Require the known counter floor so an empty surface FAILS loudly. The floor is
+# the WHOLE catalogue, not a safe-looking lower bound: the two self-protection
+# counters are pinned unconditionally (the flag gates the program, not the
+# counters), so a build that dropped them from pin_counter_maps would still
+# clear a floor of 13 and leave two orphan maps that --unpin cannot sweep.
+TM_MIN_COUNTERS="${TM_MIN_COUNTERS:-15}"
 if [ "${n_pin}" -lt "${TM_MIN_COUNTERS}" ]; then
 	bad TM-1 "too few pinned counters: ${n_pin} < ${TM_MIN_COUNTERS} floor (counter surface missing/empty — not a vacuous PASS)"
 elif [ -n "${MISSING}" ]; then

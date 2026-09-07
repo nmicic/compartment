@@ -9,7 +9,13 @@
  * single-line results for machine parsing.
  *
  * Output format:
+ *   PROBE_START op=<op> pid=<n>          always the first line
  *   RESULT op=<op> <key>=<val>... rc=<n> errno=<n> name=<errname>
+ *
+ * PROBE_START is a positive "the probe really executed" marker: without it a
+ * harness cannot tell an empty capture caused by a blocked operation from one
+ * caused by the sandbox refusing to exec the probe at all.  stdout is line
+ * buffered so the marker survives a SIGSYS kill (x32 probes).
  *
  * Build:
  *   cc -o deny_probe deny_probe.c
@@ -400,6 +406,69 @@ static int do_sc_perf_event_open(void)
     return r >= 0 ? 0 : 1;
 }
 
+/* pidfd_getfd, mount_setattr and ioperm are in the built-in deny-list and
+ * were witnessed only by greps of --dump-profile text: mutation M03b
+ * (remove pidfd_getfd from the deny-list) was caught by three text
+ * assertions and by nothing that observed the syscall being permitted.
+ * Each probe below calls the syscall in a shape that is harmless and, on
+ * an unsandboxed host, reaches the kernel — so the host-policy baseline
+ * the matrix takes can tell "the seccomp filter refused it" from "this
+ * kernel or this container refuses it anyway". */
+static int do_sc_pidfd_getfd(void)
+{
+#ifdef __NR_pidfd_getfd
+    /* Our own pidfd, our own fd 0: no other process is touched, and
+     * without a filter this returns a new descriptor. */
+    long pfd = syscall(__NR_pidfd_open, getpid(), 0);
+    if (pfd < 0) {
+        result("sc_pidfd_getfd", "pidfd_open=failed", -1);
+        return 1;
+    }
+    long r = syscall(__NR_pidfd_getfd, (int)pfd, 0, 0);
+    int saved = errno;
+    if (r >= 0) close((int)r);
+    close((int)pfd);
+    errno = saved;
+    result("sc_pidfd_getfd", "", r >= 0 ? 0 : -1);
+    return r >= 0 ? 0 : 1;
+#else
+    result("sc_pidfd_getfd", "not available", -1);
+    return 1;
+#endif
+}
+
+static int do_sc_mount_setattr(void)
+{
+#ifdef __NR_mount_setattr
+    /* AT_FDCWD + "" + AT_EMPTY_PATH with a zero attr set: a no-op
+     * change on the current directory's mount.  Without a filter this
+     * returns 0 or EPERM from the kernel's own permission check; with
+     * the filter it is the filter's errno. */
+    struct { unsigned long long attr_set, attr_clr, propagation, userns_fd; } a = { 0, 0, 0, 0 };
+    long r = syscall(__NR_mount_setattr, AT_FDCWD, "", AT_EMPTY_PATH, &a, sizeof(a));
+    result("sc_mount_setattr", "", r >= 0 ? 0 : -1);
+    return r >= 0 ? 0 : 1;
+#else
+    result("sc_mount_setattr", "not available", -1);
+    return 1;
+#endif
+}
+
+static int do_sc_ioperm(void)
+{
+#if defined(__NR_ioperm) && (defined(__x86_64__) || defined(__i386__))
+    /* Port 0, length 0, turn off: nothing is granted even if it
+     * succeeds.  Unprivileged callers get EPERM from the kernel, which
+     * is why the matrix compares against a host-policy baseline. */
+    long r = syscall(__NR_ioperm, 0UL, 0UL, 0);
+    result("sc_ioperm", "", r >= 0 ? 0 : -1);
+    return r >= 0 ? 0 : 1;
+#else
+    result("sc_ioperm", "arch=no-ioperm", -1);
+    return 1;
+#endif
+}
+
 static int do_sc_io_uring_setup(void)
 {
 #ifdef __NR_io_uring_setup
@@ -409,6 +478,22 @@ static int do_sc_io_uring_setup(void)
     return r >= 0 ? 0 : 1;
 #else
     result("sc_io_uring_setup", "not available", -1);
+    return 1;
+#endif
+}
+
+static int do_sc_ptrace_x32(void)
+{
+#if defined(__x86_64__)
+    /* x86-64 x32 ABI: the same syscall number with __X32_SYSCALL_BIT set.
+     * A filter that only compares the low bits of nr lets this through; a
+     * correct one kills the process with SIGSYS. */
+    long r = syscall(__NR_ptrace | 0x40000000L, PTRACE_TRACEME, 0, NULL, NULL);
+    if (r == 0) ptrace(PTRACE_DETACH, 0, NULL, NULL);
+    result("sc_ptrace_x32", "", r >= 0 ? 0 : -1);
+    return r >= 0 ? 0 : 1;
+#else
+    result("sc_ptrace_x32", "arch=not-x86_64", -1);
     return 1;
 #endif
 }
@@ -437,7 +522,9 @@ static void usage(void)
         "  spawn_sh <cmd>              spawn_abs_bash <cmd>\n"
         "  spawn_nested <cmd>\n\n"
         "Syscall probes:\n"
-        "  sc_ptrace_traceme           sc_unshare_user\n"
+        "  sc_ptrace_traceme           sc_ptrace_x32\n"
+        "  sc_unshare_user             sc_pidfd_getfd\n"
+        "  sc_mount_setattr            sc_ioperm\n"
         "  sc_process_vm_readv         sc_process_vm_writev\n"
         "  sc_userfaultfd              sc_perf_event_open\n"
         "  sc_io_uring_setup\n"
@@ -446,9 +533,16 @@ static void usage(void)
 
 int main(int argc, char *argv[])
 {
+    /* Line buffered: results must reach the harness even when the probe is
+     * killed mid-run (SIGSYS from a seccomp KILL_PROCESS rule). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (argc < 2) { usage(); return 1; }
 
     const char *cmd = argv[1];
+
+    /* Positive "the probe executed" marker — see the header comment. */
+    printf("PROBE_START op=%s pid=%d\n", cmd, (int)getpid());
 
     /* Filesystem */
     if (strcmp(cmd, "fs_read") == 0 && argc >= 3)      return do_fs_read(argv[2]);
@@ -483,12 +577,16 @@ int main(int argc, char *argv[])
 
     /* Syscall probes */
     if (strcmp(cmd, "sc_ptrace_traceme") == 0)          return do_sc_ptrace();
+    if (strcmp(cmd, "sc_ptrace_x32") == 0)              return do_sc_ptrace_x32();
     if (strcmp(cmd, "sc_unshare_user") == 0)            return do_sc_unshare();
     if (strcmp(cmd, "sc_process_vm_readv") == 0)        return do_sc_process_vm_readv();
     if (strcmp(cmd, "sc_process_vm_writev") == 0)       return do_sc_process_vm_writev();
     if (strcmp(cmd, "sc_userfaultfd") == 0)             return do_sc_userfaultfd();
     if (strcmp(cmd, "sc_perf_event_open") == 0)         return do_sc_perf_event_open();
     if (strcmp(cmd, "sc_io_uring_setup") == 0)         return do_sc_io_uring_setup();
+    if (strcmp(cmd, "sc_pidfd_getfd") == 0)             return do_sc_pidfd_getfd();
+    if (strcmp(cmd, "sc_mount_setattr") == 0)           return do_sc_mount_setattr();
+    if (strcmp(cmd, "sc_ioperm") == 0)                  return do_sc_ioperm();
 
     fprintf(stderr, "deny_probe: unknown command: %s\n", cmd);
     usage();

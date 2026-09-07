@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <ftw.h>
 #include <limits.h>
+#include <stdint.h>   /* UINT32_MAX (sealed_devs refcount saturation) */
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/resource.h>
@@ -1541,6 +1542,10 @@ static const char *action_name(__u32 a)
 	case ACTION_DENY_PRCTL_SET_MM:          return "DENY_PRCTL_SET_MM";
 	case ACTION_DENY_PTRACE_ACCESS:         return "DENY_PTRACE_ACCESS";
 	case ACTION_DENY_PTRACE_TRACEME:        return "DENY_PTRACE_TRACEME";
+	case ACTION_DENY_MOUNT:                 return "DENY_MOUNT";
+	case ACTION_DENY_UMOUNT:                return "DENY_UMOUNT";
+	case ACTION_DENY_BPF_SELF:              return "DENY_BPF_SELF";
+	case ACTION_DENY_PIN_TAMPER:            return "DENY_PIN_TAMPER";
 	default: return "?";
 	}
 }
@@ -1845,6 +1850,48 @@ static int validate_recursive_dir_seal(const char *path)
 // the leaf, so "seal /usr/bin/python" sealed whatever python pointed to
 // (e.g. python3.13). Now we refuse a symlink leaf and tell the operator
 // to pass the target path explicitly. The README documents this.
+// v0.8: register `dev` in sealed_devs (or bump its refcount) so
+// comp_sb_umount knows this superblock hosts sealed state. Called once per
+// successfully written seal, from seal_path() below.
+//
+// The value is a refcount purely for diagnostics — the hook tests presence.
+// A lost update under a concurrent loader is not possible here (policy load
+// is single-threaded and holds the pin lifecycle lock), so a plain
+// lookup/increment/update is correct.
+static int record_sealed_dev(struct compartment_bpf *skel, __u64 dev,
+			     const char *path)
+{
+	int dfd = bpf_map__fd(skel->maps.sealed_devs);
+	__u32 n = 0;
+
+	if (dfd < 0) {
+		fprintf(stderr, "seal %s: sealed_devs map fd unavailable\n", path);
+		return -1;
+	}
+	if (bpf_map_lookup_elem(dfd, &dev, &n) < 0) {
+		if (errno != ENOENT) {
+			fprintf(stderr, "seal %s: sealed_devs lookup: %s\n",
+				path, strerror(errno));
+			return -1;
+		}
+		n = 0;
+	}
+	if (n < UINT32_MAX)
+		n++;
+	if (bpf_map_update_elem(dfd, &dev, &n, BPF_ANY) < 0) {
+		// E2BIG here means the profile spans more distinct filesystems
+		// than sealed_devs holds. Refuse rather than attach a policy
+		// whose umount protection silently covers only some of them.
+		fprintf(stderr,
+			"seal %s: sealed_devs update (dev=0x%llx): %s. "
+			"The profile spans more filesystems than the "
+			"sealed_devs map holds; refusing fail-closed.\n",
+			path, (unsigned long long)dev, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 static int seal_path(struct compartment_bpf *skel, const char *path,
 		     __u32 flags, const struct actor_group *actor_ref,
 		     struct held_fds *held, struct profile_state *ps)
@@ -2125,6 +2172,17 @@ static int seal_path(struct compartment_bpf *skel, const char *path,
 
 	if (bpf_map_update_elem(mfd, &k, &sv, BPF_ANY) < 0) {
 		fprintf(stderr, "seal %s: map update: %s\n", path, strerror(errno));
+		close(pfd);
+		return -1;
+	}
+
+	// v0.8: record the hosting superblock in sealed_devs so comp_sb_umount
+	// can refuse to let the filesystem be detached out from under this
+	// path. The hook is handed a struct vfsmount and has no way back to an
+	// inode, so this is the only state that can answer it. Fail-closed: a
+	// seal we cannot register is a seal whose path guarantee we cannot
+	// keep, so refuse the load rather than attach a half-covered policy.
+	if (record_sealed_dev(skel, dev, path) < 0) {
 		close(pfd);
 		return -1;
 	}
@@ -2706,11 +2764,28 @@ static void usage(const char *p)
 		"                 location inside " PIN_ROOT " or it is refused.\n"
 		"                 Mutually exclusive with --pin/--dry-run and a\n"
 		"                 profile argument. " PIN_ROOT " itself is preserved.\n"
+		"  --self-protect (with --pin) refuse removal of this policy's own\n"
+		"                 kernel state by anything other than this loader image:\n"
+		"                 no fd to a compartment BPF map, no unlink/rename/rmdir\n"
+		"                 of a pin, no umount or over-mount of the bpffs holding\n"
+		"                 them. OFF by default. Read HOWTO before using it: a\n"
+		"                 rebuilt or upgraded binary is a DIFFERENT image and\n"
+		"                 cannot unpin the policy. --unpin first, or pre-authorise\n"
+		"                 the successor with --authorize-loader.\n"
+		"  --authorize-loader PATH\n"
+		"                 additionally allow the binary at PATH to maintain this\n"
+		"                 policy. Repeatable, at most 8 entries in total. Implies\n"
+		"                 --self-protect. PATH is resolved to (dev, ino) at pin\n"
+		"                 time; replacing the file later does not carry the\n"
+		"                 authorisation over.\n"
 		"  --stats        open the pinned per-CPU counter maps under " PIN_ROOT "/maps\n"
-		"                 (all 12: deny_total, audit_drop_total, actor_mismatch_total,\n"
-		"                 strict_launch_{missing,allowed}_total, marker_{set,clear_foreign_exec,\n"
-		"                 copy_fork,stale_generation}_total, prctl_set_mm_exe_file_denied_total,\n"
-		"                 ptrace_{access,traceme}_denied_total — see COUNTERS.md), sum\n"
+		"                 (all 15: deny_total, audit_drop_total, actor_mismatch_total,\n"
+		"                 strict_launch_{missing,allowed}_total, marker_{set,set_fail,\n"
+		"                 clear_foreign_exec,copy_fork,stale_generation}_total,\n"
+		"                 prctl_set_mm_exe_file_denied_total,\n"
+		"                 ptrace_{access,traceme}_denied_total,\n"
+		"                 bpf_self_denied_total, pin_tamper_denied_total\n"
+		"                 — see COUNTERS.md), sum\n"
 		"                 per-CPU values, and print one '[stats] <name>=<N> ...' line. Exit 2 with\n"
 		"                 '[stats] no pinned counters found' if no pin\n"
 		"                 exists. Read-only.\n"
@@ -2899,6 +2974,397 @@ static void unlink_pinned_links(char pinned[][PATH_MAX], int pinned_count)
 // the second concurrent invocation returns EBUSY-with-diagnostic
 // rather than blocking — operators get a fast, deterministic failure
 // surface.
+// ============== v0.8 self-protection (--self-protect) ==================
+//
+// The problem this solves, measured on 6.8.0-139 and 7.0.0-31:
+//
+//   1. `rm /sys/fs/bpf/compartment/links/<name>` detaches that hook. It is the
+//      ONLY working detach path — bpf(BPF_LINK_DETACH) returns -EOPNOTSUPP for
+//      LSM links on both kernels — and nothing gated it.
+//   2. `umount /sys/fs/bpf` drops enforcement entirely (6.8), or orphans it
+//      beyond recovery when another mount namespace holds a peer bpffs mount
+//      (7.0, polkitd). `mount -t bpf bpf /sys/fs/bpf` hides the pin tree while
+//      enforcement stays live, and --unpin then prints "nothing to do".
+//   3. bpf_map_freeze() is not map integrity. A CAP_BPF caller that gets ANY
+//      fd to a frozen compartment map (BPF_F_RDONLY suffices) can splice it
+//      into its own BPF program and write it from program context. Verified
+//      on both kernels; the syscall path stays EPERM, the program path does
+//      not. So every seal map is mutable by an unconfined root today.
+//
+// Identity model. "The loader" is an on-disk executable image, identified by
+// (dev, ino) exactly as the actor allowlist identifies actors, because --pin,
+// --unpin and --stats are three different processes running the same binary.
+// The set is fixed at pin time and frozen: a loader that could extend its own
+// allowlist afterwards would mean anything able to run the loader once could
+// widen it.
+//
+// Recovery. A rebuild or package upgrade gives the binary a new inode, so the
+// new binary cannot unpin the old policy. That is deliberate, it is why the
+// feature is opt-in, and the ceremony is documented in HOWTO: --unpin before
+// replacing the binary, or pre-authorise the successor with
+// --authorize-loader at pin time. The worst case is bounded: bpffs is not
+// persistent, so a reboot clears a stranded pin tree — the same reboot an
+// unconfined root can perform anyway, which is why stranding is no worse than
+// the residual risk the threat model already accepts.
+static int opt_self_protect = 0;
+static const char *authorize_loader_paths[COMPARTMENT_MAX_LOADER_IDS];
+static size_t n_authorize_loader_paths = 0;
+
+// Resolve an on-disk binary to the same (dev, ino) shape the BPF side reads
+// out of inode->i_sb->s_dev / i_ino. Deliberately mirrors the dev math in
+// seal_path()/actor_resolve_paths() rather than reimplementing it, so the two
+// notions of identity cannot drift.
+// `follow` is 1 only for /proc/self/exe, which IS a symlink by construction
+// and must be resolved to reach the running image. Every operator-supplied
+// path keeps O_NOFOLLOW: a symlinked --authorize-loader would let whoever can
+// rewrite the symlink pick the maintenance binary.
+static int resolve_binary_key(const char *path, struct inode_key *out,
+			      const char *ctx, int follow)
+{
+	int pfd = open(path, O_PATH | O_CLOEXEC |
+			     (follow ? 0 : O_NOFOLLOW));
+	if (pfd < 0) {
+		fprintf(stderr, "%s %s: open: %s\n", ctx, path, strerror(errno));
+		return -1;
+	}
+	struct stat st;
+	if (fstat(pfd, &st) < 0) {
+		fprintf(stderr, "%s %s: fstat: %s\n", ctx, path, strerror(errno));
+		close(pfd);
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "%s %s: not a regular file; refusing.\n", ctx, path);
+		close(pfd);
+		return -1;
+	}
+	if (st.st_uid != 0) {
+		fprintf(stderr,
+			"%s %s: not root-owned (uid %u); refusing — install "
+			"the maintenance binary as root:root mode 0755 before "
+			"pinning with --self-protect.\n",
+			ctx, path, (unsigned)st.st_uid);
+		close(pfd);
+		return -1;
+	}
+	if (st.st_mode & (S_IWOTH | S_IWGRP)) {
+		// A group/world-writable maintenance binary would let a non-root
+		// user become the loader by overwriting it in place. Same gate
+		// actor_resolve_paths() applies to actor binaries.
+		fprintf(stderr,
+			"%s %s: group- or world-writable (mode 0%o); refusing — "
+			"anyone who can write it could replace the maintenance "
+			"binary and remove enforcement. Install it root-owned "
+			"and 0755 (chmod go-w) before pinning with "
+			"--self-protect.\n",
+			ctx, path, (unsigned)(st.st_mode & 07777));
+		close(pfd);
+		return -1;
+	}
+	unsigned ma = major(st.st_dev), mi = minor(st.st_dev);
+	if (ma >= (1U << 12) || mi >= (1U << 20)) {
+		fprintf(stderr, "%s %s: device %u:%u out of encodable range.\n",
+			ctx, path, ma, mi);
+		close(pfd);
+		return -1;
+	}
+	out->dev = ((__u64)ma << 20) | mi;
+	out->ino = (__u64)st.st_ino;
+	close(pfd);
+	if (out->dev == 0) {
+		fprintf(stderr, "%s %s: anon-bdev superblock (dev=0); refusing.\n",
+			ctx, path);
+		return -1;
+	}
+	return 0;
+}
+
+// bpffs superblock device for PIN_ROOT, in the same encoding. Returns 0 when
+// /sys/fs/bpf is not a bpffs (or does not exist), which the BPF side treats as
+// "no pin device known" and therefore "no pin protection".
+static __u64 pin_root_dev(void)
+{
+	struct stat st;
+	if (stat("/sys/fs/bpf", &st) < 0)
+		return 0;
+	unsigned ma = major(st.st_dev), mi = minor(st.st_dev);
+	if (ma >= (1U << 12) || mi >= (1U << 20))
+		return 0;
+	return ((__u64)ma << 20) | mi;
+}
+
+// Phase 1, run after __load() (map ids exist) and BEFORE freeze_seal_maps()
+// and __attach(). Populates the two maps that are the root of trust and must
+// be immutable before the gate goes live.
+static int self_protect_populate_early(struct compartment_bpf *skel)
+{
+	if (!opt_self_protect)
+		return 0;
+
+	int lfd = bpf_map__fd(skel->maps.loader_ids);
+	int pfd = bpf_map__fd(skel->maps.protected_map_ids);
+	int cfd = bpf_map__fd(skel->maps.self_protect_cfg_map);
+	if (lfd < 0 || pfd < 0 || cfd < 0) {
+		fprintf(stderr, "self-protect: map fd unavailable; refusing.\n");
+		return -1;
+	}
+
+	// (a) loader_ids: this executable image first, then any pre-authorised
+	//     successors. /proc/self/exe resolves to the image even when the
+	//     binary has already been replaced on disk, which is what we want:
+	//     the identity is the running image, not whatever now sits at argv[0].
+	struct inode_key k;
+	__u8 one = 1;
+	if (resolve_binary_key("/proc/self/exe", &k, "self-protect loader", 1) < 0) {
+		fprintf(stderr,
+			"self-protect: cannot identify this executable image; "
+			"refusing to arm a gate that would then lock out its own "
+			"loader.\n");
+		return -1;
+	}
+	if (bpf_map_update_elem(lfd, &k, &one, BPF_ANY) < 0) {
+		fprintf(stderr, "self-protect: loader_ids update: %s\n",
+			strerror(errno));
+		return -1;
+	}
+	fprintf(stderr,
+		"[self-protect] maintenance loader dev=%llu ino=%llu (this image)\n",
+		(unsigned long long)k.dev, (unsigned long long)k.ino);
+
+	for (size_t i = 0; i < n_authorize_loader_paths; i++) {
+		struct inode_key a;
+		if (resolve_binary_key(authorize_loader_paths[i], &a,
+				       "self-protect --authorize-loader", 0) < 0)
+			return -1;
+		if (bpf_map_update_elem(lfd, &a, &one, BPF_ANY) < 0) {
+			fprintf(stderr,
+				"self-protect: loader_ids update (%s): %s%s\n",
+				authorize_loader_paths[i], strerror(errno),
+				errno == E2BIG ? " — at most "
+				"COMPARTMENT_MAX_LOADER_IDS entries" : "");
+			return -1;
+		}
+		fprintf(stderr,
+			"[self-protect] authorised loader %s dev=%llu ino=%llu\n",
+			authorize_loader_paths[i],
+			(unsigned long long)a.dev, (unsigned long long)a.ino);
+	}
+
+	// (b) protected_map_ids: every map this object owns, discovered from the
+	//     object rather than hand-listed, so a map added later cannot be
+	//     forgotten. Includes protected_map_ids and loader_ids themselves.
+	size_t n = 0;
+	struct bpf_map *m;
+	bpf_object__for_each_map(m, skel->obj) {
+		int fd = bpf_map__fd(m);
+		if (fd < 0)
+			continue;   /* autoload disabled for this map */
+		struct bpf_map_info info = {};
+		__u32 ilen = sizeof(info);
+		if (bpf_obj_get_info_by_fd(fd, &info, &ilen) < 0) {
+			fprintf(stderr, "self-protect: map info (%s): %s\n",
+				bpf_map__name(m), strerror(errno));
+			return -1;
+		}
+		if (bpf_map_update_elem(pfd, &info.id, &one, BPF_ANY) < 0) {
+			fprintf(stderr,
+				"self-protect: protected_map_ids update (%s id=%u): %s%s\n",
+				bpf_map__name(m), info.id, strerror(errno),
+				errno == E2BIG ? " — grow protected_map_ids" : "");
+			return -1;
+		}
+		n++;
+	}
+	fprintf(stderr, "[self-protect] %zu map ids protected\n", n);
+
+	// (c) cfg: enabled now, pin_dev filled in phase 2 (the bpffs may not be
+	//     mounted yet in daemon mode, and PIN_ROOT is created by pin_links()).
+	__u32 z = 0;
+	struct self_protect_cfg cfg = { .pin_dev = 0, .enabled = 1, ._pad = 0 };
+	if (bpf_map_update_elem(cfd, &z, &cfg, BPF_ANY) < 0) {
+		fprintf(stderr, "self-protect: cfg update: %s\n", strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+// Phase 2, run after pin_links() and pin_counter_maps() while the pin
+// lifecycle lock is held. Records the inodes that must not be unlinked,
+// renamed, rmdir'd or over-mounted, then freezes the two late maps.
+//
+// This window (attach done, late maps not yet frozen) is safe: both late maps
+// are already in protected_map_ids and comp_bpf_map is already attached, so no
+// caller other than this process can obtain an fd to them.
+static int self_protect_record_pins(struct compartment_bpf *skel,
+				    const char *const *link_names, size_t n_links,
+				    const char *const *map_names, size_t n_maps)
+{
+	if (!opt_self_protect)
+		return 0;
+
+	int ppfd = bpf_map__fd(skel->maps.protected_pins);
+	int cfd  = bpf_map__fd(skel->maps.self_protect_cfg_map);
+	if (ppfd < 0 || cfd < 0) {
+		fprintf(stderr, "self-protect: late map fd unavailable\n");
+		return -1;
+	}
+
+	__u64 dev = pin_root_dev();
+	if (dev == 0) {
+		fprintf(stderr,
+			"self-protect: cannot resolve the bpffs device for "
+			"/sys/fs/bpf; refusing to claim pin protection.\n");
+		return -1;
+	}
+
+	size_t n = 0;
+	__u8 one = 1;
+	// Every object under PIN_ROOT, plus the three directories and the bpffs
+	// mount root. The mount root is what `mount -t bpf bpf /sys/fs/bpf`
+	// targets; without it the over-mount shadowing stays open.
+	const char *fixed[] = { "/sys/fs/bpf", PIN_ROOT, PIN_ROOT "/links",
+				PIN_ROOT "/maps" };
+	for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+		struct stat st;
+		if (stat(fixed[i], &st) < 0) {
+			fprintf(stderr, "self-protect: stat %s: %s\n",
+				fixed[i], strerror(errno));
+			return -1;
+		}
+		struct inode_key k = { .dev = dev, .ino = (__u64)st.st_ino };
+		if (bpf_map_update_elem(ppfd, &k, &one, BPF_ANY) < 0) {
+			fprintf(stderr, "self-protect: protected_pins %s: %s\n",
+				fixed[i], strerror(errno));
+			return -1;
+		}
+		n++;
+	}
+	// bpffs pin objects. stat() on bpffs reports the same s_dev the BPF side
+	// reads from inode->i_sb->s_dev (bpffs is an anon-bdev filesystem, but
+	// unlike btrfs/overlayfs the two agree), so no anon_bdev_refuse-style
+	// escape hatch is needed here.
+	for (int pass = 0; pass < 2; pass++) {
+		const char *dir = pass == 0 ? PIN_ROOT "/links" : PIN_ROOT "/maps";
+		const char *const *tab = pass == 0 ? link_names : map_names;
+		size_t ntab = pass == 0 ? n_links : n_maps;
+		for (size_t i = 0; i < ntab; i++) {
+			char path[PATH_MAX];
+			struct stat st;
+			if (snprintf(path, sizeof(path), "%s/%s", dir, tab[i]) >=
+			    (int)sizeof(path))
+				continue;
+			if (stat(path, &st) < 0) {
+				if (errno == ENOENT)
+					continue;   /* conditional pin absent */
+				fprintf(stderr, "self-protect: stat %s: %s\n",
+					path, strerror(errno));
+				return -1;
+			}
+			struct inode_key k = { .dev = dev,
+					       .ino = (__u64)st.st_ino };
+			if (bpf_map_update_elem(ppfd, &k, &one, BPF_ANY) < 0) {
+				fprintf(stderr,
+					"self-protect: protected_pins %s: %s%s\n",
+					path, strerror(errno),
+					errno == E2BIG ? " — grow protected_pins"
+					               : "");
+				return -1;
+			}
+			n++;
+		}
+	}
+
+	__u32 z = 0;
+	struct self_protect_cfg cfg = { .pin_dev = dev, .enabled = 1, ._pad = 0 };
+	if (bpf_map_update_elem(cfd, &z, &cfg, BPF_ANY) < 0) {
+		fprintf(stderr, "self-protect: cfg pin_dev update: %s\n",
+			strerror(errno));
+		return -1;
+	}
+
+	if (bpf_map_freeze(ppfd) < 0 || bpf_map_freeze(cfd) < 0) {
+		fprintf(stderr, "self-protect: late freeze: %s\n", strerror(errno));
+		return -1;
+	}
+
+	fprintf(stderr,
+		"[self-protect] %zu pin inodes protected on bpffs dev=%llu; "
+		"only the authorised loader image can unpin.\n",
+		n, (unsigned long long)dev);
+	return 0;
+}
+
+
+// security_bpf_map() is reached from bpf_map_new_fd(). Probe vmlinux BTF for
+// bpf_lsm_bpf_map and confirm the two-argument shape before autoloading the
+// program: the hook is identical on 6.8 and 7.0 (FUNC_PROTO vlen=2 on both,
+// measured), but a kernel that dropped or reshaped it must fail loudly rather
+// than attach something that silently never fires. Contrast lsm/bpf, which
+// gained a 4th `bool kernel` argument in 7.0 (vlen 3 -> 4) and would need the
+// select_inode_setattr_variant dual-wrapper treatment.
+//
+// The program is autoloaded ONLY when --self-protect was asked for. Attaching
+// it unconditionally would put an extra LSM program on bpf_map_new_fd() on
+// every box running the default build — a cost, however small, that an
+// operator who did not opt in never agreed to pay — and would make the pinned
+// link set differ from v0.8 for a feature that is off. So the default path
+// stays byte-identical to v0.8 (28 links), the armed path pins 29, and
+// tests/expected-links.txt marks comp_bpf_map `self-protect` accordingly.
+//
+// Must run after __open() and before __load(), like the other two probes.
+static int select_bpf_map_variant(struct compartment_bpf *skel)
+{
+	bool present = false;
+	int decided = 0;
+	struct btf *btf = btf__load_vmlinux_btf();
+
+	if (btf) {
+		__s32 id = btf__find_by_name_kind(btf, "bpf_lsm_bpf_map",
+						  BTF_KIND_FUNC);
+		if (id >= 0) {
+			const struct btf_type *fn = btf__type_by_id(btf, id);
+			const struct btf_type *proto =
+				fn ? btf__type_by_id(btf, fn->type) : NULL;
+			if (proto && btf_kind(proto) == BTF_KIND_FUNC_PROTO) {
+				present = (btf_vlen(proto) == 2);
+				decided = 1;
+			}
+		} else {
+			present = false;
+			decided = 1;
+		}
+		btf__free(btf);
+	}
+	if (!decided) {
+		present = false;
+		fprintf(stderr,
+			"[probe] warn: vmlinux BTF unavailable; disabling the "
+			"bpf_map self-protection program.\n");
+	}
+
+	if (opt_self_protect && !present) {
+		fprintf(stderr,
+			"[probe] error: --self-protect was requested but this "
+			"kernel has no usable bpf_lsm_bpf_map hook (absent, or "
+			"not the 2-argument shape). Refusing to load rather "
+			"than pretend the maps are protected.\n");
+		return -1;
+	}
+	bool want = present && opt_self_protect;
+	if (bpf_program__set_autoload(skel->progs.comp_bpf_map, want)) {
+		fprintf(stderr,
+			"[probe] error: set_autoload(bpf_map) failed; "
+			"refusing to load.\n");
+		return -1;
+	}
+	fprintf(stderr, "[probe] bpf_map hook: %s%s.\n",
+		present ? "present" : "absent",
+		present ? (opt_self_protect ? " (self-protection ARMED)"
+					    : " (not loaded, self-protection off)")
+			: " (no map self-protection on this kernel)");
+	return 0;
+}
+
 #define PIN_LIFECYCLE_LOCK_DEFAULT "/run/lock/compartment-bpf-pin.lock"
 #define PIN_LIFECYCLE_LOCK_FALLBACK "/tmp/.compartment-bpf-pin.lock"
 
@@ -2958,13 +3424,15 @@ static void pin_lifecycle_unlock(int fd)
 static int pin_links(struct compartment_bpf *skel)
 {
 	// pin_one_link writes into pinned[*pinned_count] without an
-	// explicit bound. We currently make 21 PIN_LINK invocations and have
-	// 32 slots. The assert hard-codes the current count (21) because
-	// KNOWN_LINK_NAMES is declared later in the file; if the PIN_LINK
-	// invocation count below grows, bump the literal here in lockstep.
+	// explicit bound. We currently make 29 pin calls at most (26 PIN_LINK,
+	// plus the canonical-name inode_setattr pin, the conditional
+	// file_ioctl_compat pin and the --self-protect-only comp_bpf_map pin)
+	// and have 32 slots. The assert hard-codes the current count because
+	// KNOWN_LINK_NAMES is declared later in the file; if the pin count
+	// below grows, bump the literal in lockstep.
 	char pinned[32][PATH_MAX];
-	_Static_assert(sizeof(pinned) / PATH_MAX >= 21,
-		       "pinned[] must hold all PIN_LINK invocations (currently 21: 16 v0.3 + 5 v0.4)");
+	_Static_assert(sizeof(pinned) / PATH_MAX >= 29,
+		       "pinned[] must hold all PIN_LINK invocations (currently 29 armed / 28 default: 16 v0.3 + 5 v0.4 + 7 v0.8 + comp_bpf_map only with --self-protect)");
 	int pinned_count = 0;
 
 	if (ensure_bpffs("/sys/fs/bpf") < 0 ||
@@ -3002,11 +3470,35 @@ static int pin_links(struct compartment_bpf *skel)
 	PIN_LINK(comp_inode_setxattr);
 	PIN_LINK(comp_inode_removexattr);
 	/* v0.4 strict-launch-marker hooks */
-	PIN_LINK(comp_bprm_check_security);
+	PIN_LINK(comp_bprm_committed_creds);  /* v0.8: was comp_bprm_check_security */
 	PIN_LINK(comp_task_alloc);
 	PIN_LINK(comp_task_prctl);
 	PIN_LINK(comp_ptrace_access_check);
 	PIN_LINK(comp_ptrace_traceme);
+	/* v0.8 metadata + mount coverage */
+	PIN_LINK(comp_inode_set_acl);
+	PIN_LINK(comp_inode_remove_acl);
+	PIN_LINK(comp_file_ioctl);
+	// file_ioctl_compat is autoload-gated on a BTF probe
+	// (select_file_ioctl_compat). When the running kernel has no
+	// security_file_ioctl_compat() the program is never loaded and libbpf
+	// leaves the link NULL, so skip the pin instead of failing: on such a
+	// kernel compat ioctls route through security_file_ioctl() and
+	// comp_file_ioctl already covers them. A NULL link with autoload
+	// enabled cannot reach here — compartment_bpf__attach() fails first.
+	if (skel->links.comp_file_ioctl_compat)
+		PIN_LINK(comp_file_ioctl_compat);
+	PIN_LINK(comp_sb_mount);
+	PIN_LINK(comp_sb_umount);
+	PIN_LINK(comp_move_mount);
+	/* v0.8 self-protection. Autoloaded only when --self-protect was asked
+	 * for AND the BTF probe found bpf_lsm_bpf_map (select_bpf_map_variant);
+	 * otherwise the link is NULL and the pin is skipped, exactly like
+	 * file_ioctl_compat. --self-protect refuses to load on a kernel without
+	 * the hook, so a skipped pin here can only mean self-protection was not
+	 * asked for. */
+	if (skel->links.comp_bpf_map)
+		PIN_LINK(comp_bpf_map);
 
 #undef PIN_LINK
 
@@ -3040,11 +3532,25 @@ static const char *const KNOWN_LINK_NAMES[] = {
 	"comp_inode_setxattr",
 	"comp_inode_removexattr",
 	/* v0.4: strict-launch-marker hooks */
+	"comp_bprm_committed_creds",
+	/* Legacy v0.4..v0.7 name for the marker hook. Never pinned by a v0.8+
+	 * loader; kept so `--unpin` can sweep a pin tree left by an older
+	 * loader instead of refusing it as an unknown object. */
 	"comp_bprm_check_security",
 	"comp_task_alloc",
 	"comp_task_prctl",
 	"comp_ptrace_access_check",
 	"comp_ptrace_traceme",
+	/* v0.8: metadata + mount coverage */
+	"comp_inode_set_acl",
+	"comp_inode_remove_acl",
+	"comp_file_ioctl",
+	"comp_file_ioctl_compat",
+	"comp_sb_mount",
+	"comp_sb_umount",
+	"comp_move_mount",
+	/* v0.8: self-protection */
+	"comp_bpf_map",
 };
 static const size_t N_KNOWN_LINK_NAMES =
 	sizeof(KNOWN_LINK_NAMES) / sizeof(KNOWN_LINK_NAMES[0]);
@@ -3092,6 +3598,7 @@ static int pin_tree_exists(void)
 	static const char *const KNOWN_MAP_NAMES[] = {
 	"sealed_inodes",
 	"sealed_dirs",
+	"sealed_devs",
 	"audit_rb",
 	"deny_total",
 	"audit_drop_total",
@@ -3104,15 +3611,33 @@ static int pin_tree_exists(void)
 	"strict_launch_missing_total",
 	"strict_launch_allowed_total",
 	"marker_set_total",
+	"marker_set_fail_total",
 	"marker_clear_foreign_exec_total",
 	"marker_copy_fork_total",
 	"marker_stale_generation_total",
 	"prctl_set_mm_exe_file_denied_total",
 	"ptrace_access_denied_total",
 	"ptrace_traceme_denied_total",
+	/* v0.8: self-protection counters. The four self-protection state maps
+	 * (protected_map_ids, loader_ids, protected_pins, self_protect_cfg_map)
+	 * are deliberately NOT pinned: nothing outside the kernel needs to read
+	 * them, and an unpinned map is one fewer object to name in an attack. */
+	"bpf_self_denied_total",
+	"pin_tamper_denied_total",
 };
 static const size_t N_KNOWN_MAP_NAMES =
 	sizeof(KNOWN_MAP_NAMES) / sizeof(KNOWN_MAP_NAMES[0]);
+
+/* self_protect_record_pins() inserts one protected_pins entry per name in the
+ * two tables above, plus four fixed paths (/sys/fs/bpf, PIN_ROOT and its two
+ * subdirectories). protected_pins is a HASH with max_entries 64 in
+ * compartment.bpf.c; overflowing it is an E2BIG that fails the pin closed, but
+ * only on a live box, and only for whoever adds the 61st hook. Tie the two
+ * numbers together at build time instead. */
+_Static_assert(4 + sizeof(KNOWN_LINK_NAMES) / sizeof(KNOWN_LINK_NAMES[0])
+		 + sizeof(KNOWN_MAP_NAMES) / sizeof(KNOWN_MAP_NAMES[0]) <= 64,
+	"protected_pins (max_entries 64 in compartment.bpf.c) cannot hold the "
+	"current pin set; grow the map and this assert in the same commit");
 
 static int name_in(const char *name, const char *const *table, size_t n)
 {
@@ -3172,6 +3697,15 @@ static int sweep_known(const char *dir,
 		if (unlinkat(dirfd(d), de->d_name, 0) < 0) {
 			fprintf(stderr, "unlinkat %s/%s: %s\n",
 				dir, de->d_name, strerror(errno));
+			if (errno == EACCES || errno == EPERM)
+				fprintf(stderr,
+					"unpin: the running policy was pinned with --self-protect and this\n"
+					"       executable is not in its authorised loader set, so the kernel\n"
+					"       refused to remove the pin (ACTION_DENY_PIN_TAMPER in the audit\n"
+					"       stream). Run --unpin from the binary image that pinned it, or\n"
+					"       from one authorised with --authorize-loader at pin time. If that\n"
+					"       image no longer exists (rebuild, package upgrade), the pin tree\n"
+					"       can only be cleared by rebooting: bpffs is not persistent.\n");
 			closedir(d);
 			return -1;
 		}
@@ -3179,6 +3713,43 @@ static int sweep_known(const char *dir,
 	}
 	closedir(d);
 	return 0;
+}
+
+// Enumerate loaded BPF programs and report whether any compartment program is
+// still live. Used by --unpin when PIN_ROOT is not visible, which is normally
+// "already unpinned" but is ALSO the observable signature of two measured
+// failure modes: an over-mounted bpffs shadowing the pin tree, and running in
+// a mount namespace that does not have the bpffs the policy was pinned in.
+// In both, enforcement is live and unreachable, and the old "nothing to do;
+// exit 0" was a lie.
+static void warn_if_enforcement_without_pins(void)
+{
+	__u32 id = 0;
+	int live = 0;
+	while (bpf_prog_get_next_id(id, &id) == 0) {
+		int fd = bpf_prog_get_fd_by_id(id);
+		if (fd < 0)
+			continue;   /* raced a teardown, or not ours to see */
+		struct bpf_prog_info info = {};
+		__u32 ilen = sizeof(info);
+		if (bpf_obj_get_info_by_fd(fd, &info, &ilen) == 0 &&
+		    strncmp(info.name, "comp_", 5) == 0)
+			live++;
+		close(fd);
+	}
+	if (live == 0)
+		return;
+	fprintf(stderr,
+		"unpin: WARNING — %d compartment-bpf program(s) are still loaded even though\n"
+		"       %s is not visible. Enforcement is LIVE and this invocation cannot\n"
+		"       reach it. Two known causes:\n"
+		"         * a second bpffs mounted over /sys/fs/bpf is shadowing the pin\n"
+		"           tree (check `findmnt /sys/fs/bpf`; unmount the top one), or\n"
+		"         * this process is in a mount namespace that does not have the\n"
+		"           bpffs the policy was pinned in (check\n"
+		"           `grep -l \" bpf \" /proc/*/mountinfo` and nsenter into the right one).\n"
+		"       Do NOT treat this as \"already unpinned\".\n",
+		live, PIN_ROOT);
 }
 
 // Path-prefix safety for --unpin. Canonicalise both sides with realpath(),
@@ -3203,6 +3774,14 @@ static int unpin_resolve(const char *requested,
 {
 	if (!realpath(PIN_ROOT, root_out)) {
 		if (errno == ENOENT) {
+			/* Measured failure mode: `mount -t bpf bpf /sys/fs/bpf`
+			 * over the live bpffs hides the pin tree while leaving
+			 * enforcement attached, and this branch then reported
+			 * "nothing to do" and exited 0 — the operator is told
+			 * the policy is gone when it is not. Same shape when
+			 * --unpin runs in a mount namespace that does not have
+			 * the bpffs the policy was pinned in. Say so. */
+			warn_if_enforcement_without_pins();
 			fprintf(stderr,
 				"[unpin] %s does not exist; nothing to do.\n",
 				PIN_ROOT);
@@ -3404,12 +3983,16 @@ static int pin_counter_maps(struct compartment_bpf *skel)
 		{ "strict_launch_missing_total",      skel->maps.strict_launch_missing_total },
 		{ "strict_launch_allowed_total",      skel->maps.strict_launch_allowed_total },
 		{ "marker_set_total",                  skel->maps.marker_set_total },
+		{ "marker_set_fail_total",             skel->maps.marker_set_fail_total },
 		{ "marker_clear_foreign_exec_total",   skel->maps.marker_clear_foreign_exec_total },
 		{ "marker_copy_fork_total",            skel->maps.marker_copy_fork_total },
 		{ "marker_stale_generation_total",     skel->maps.marker_stale_generation_total },
 		{ "prctl_set_mm_exe_file_denied_total", skel->maps.prctl_set_mm_exe_file_denied_total },
 		{ "ptrace_access_denied_total",        skel->maps.ptrace_access_denied_total },
 		{ "ptrace_traceme_denied_total",       skel->maps.ptrace_traceme_denied_total },
+		/* v0.8 self-protection counters */
+		{ "bpf_self_denied_total",             skel->maps.bpf_self_denied_total },
+		{ "pin_tamper_denied_total",           skel->maps.pin_tamper_denied_total },
 		{ "launcher_to_actor",                 skel->maps.launcher_to_actor },
 		{ "policy_state_map",                  skel->maps.policy_state_map },
 		{ "abi_version_map",                   skel->maps.abi_version_map },
@@ -3534,12 +4117,26 @@ static int check_pinned_seal_map_shapes(void)
 // across libbpf_num_possible_cpus(), and prints the result on stdout.
 // Exit 0 on success. Exit 2 with a stderr line if neither pin exists.
 // Exit 1 on real errors (open succeeded but read failed, etc.).
+//
+// Return -3 for a permission refusal specifically. With --self-protect in
+// force the caller gets EPERM on every one of the fifteen counter pins
+// stats_action() opens, and printing fifteen identical lines with no
+// explanation is the worst possible operator experience for what is a
+// one-sentence problem ("you are not the loader"). The caller prints the first
+// error verbatim, suppresses the rest, and adds the sentence.
+//
+// EACCES lands here too, and it is NOT the same thing: a non-root --stats gets
+// EACCES from the bpffs mode-700 pin directory, with no policy self-protection
+// involved at all. stats_action() splits them on errno so the wrong advice is
+// never printed.
 static int read_pinned_counter(const char *path, __u64 *out)
 {
 	int fd = bpf_obj_get(path);
 	if (fd < 0) {
 		if (errno == ENOENT)
 			return -2;
+		if (errno == EPERM || errno == EACCES)
+			return -3;
 		fprintf(stderr, "open pinned %s: %s\n", path, strerror(errno));
 		return -1;
 	}
@@ -3616,6 +4213,7 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		/* v0 / v0.1 seal map shapes */
 		{ "sealed_inodes",                    skel->maps.sealed_inodes },
 		{ "sealed_dirs",                      skel->maps.sealed_dirs },
+		{ "sealed_devs",                      skel->maps.sealed_devs },
 		/* v0 counters — userspace reads only via bpf_map_lookup_elem;
 		 * freezing blocks userspace writes, BPF-side (*v)++ still works. */
 		{ "deny_total",                       skel->maps.deny_total },
@@ -3630,19 +4228,33 @@ static int freeze_seal_maps(struct compartment_bpf *skel)
 		{ "strict_launch_missing_total",      skel->maps.strict_launch_missing_total },
 		{ "strict_launch_allowed_total",      skel->maps.strict_launch_allowed_total },
 		{ "marker_set_total",                 skel->maps.marker_set_total },
+		{ "marker_set_fail_total",            skel->maps.marker_set_fail_total },
 		{ "marker_clear_foreign_exec_total",  skel->maps.marker_clear_foreign_exec_total },
 		{ "marker_copy_fork_total",           skel->maps.marker_copy_fork_total },
 		{ "marker_stale_generation_total",    skel->maps.marker_stale_generation_total },
 		{ "prctl_set_mm_exe_file_denied_total", skel->maps.prctl_set_mm_exe_file_denied_total },
 		{ "ptrace_access_denied_total",       skel->maps.ptrace_access_denied_total },
 		{ "ptrace_traceme_denied_total",      skel->maps.ptrace_traceme_denied_total },
+		/* v0.8 self-protection. protected_map_ids and loader_ids are the
+		 * root of trust and MUST be immutable before comp_bpf_map goes
+		 * live, so they are frozen here with everything else.
+		 * protected_pins and self_protect_cfg_map cannot be: the inodes
+		 * they describe do not exist until pin_links() runs, which is
+		 * after attach. Those two are frozen by
+		 * self_protect_record_pins() instead, and are safe in the gap
+		 * because their ids are already in protected_map_ids and the
+		 * gate is already attached. */
+		{ "protected_map_ids",                skel->maps.protected_map_ids },
+		{ "loader_ids",                       skel->maps.loader_ids },
+		{ "bpf_self_denied_total",            skel->maps.bpf_self_denied_total },
+		{ "pin_tamper_denied_total",          skel->maps.pin_tamper_denied_total },
 	};
 	const size_t n = sizeof(entries) / sizeof(entries[0]);
-	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 = 17.
+	/* Symmetric-gate assert: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 6 v0.8 = 23.
 	 * If you add a freezable map to compartment.bpf.c without extending
 	 * this table, the assert below catches it at build time. */
-	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 17,
-		"freeze_seal_maps entry count drift (expected: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 = 17)");
+	_Static_assert(sizeof(entries) / sizeof(entries[0]) == 23,
+		"freeze_seal_maps entry count drift (expected: 5 v0/v0.3 + 11 v0.4 + 1 v0.6 + 6 v0.8 = 23)");
 
 	for (size_t i = 0; i < n; i++) {
 		int fd = bpf_map__fd(entries[i].map);
@@ -3684,16 +4296,22 @@ static int stats_action(void)
 		{ "strict_launch_missing_total",      0, 0 },
 		{ "strict_launch_allowed_total",      0, 0 },
 		{ "marker_set_total",                 0, 0 },
+		{ "marker_set_fail_total",            0, 0 },
 		{ "marker_clear_foreign_exec_total",  0, 0 },
 		{ "marker_copy_fork_total",           0, 0 },
 		{ "marker_stale_generation_total",    0, 0 },
 		{ "prctl_set_mm_exe_file_denied_total", 0, 0 },
 		{ "ptrace_access_denied_total",       0, 0 },
 		{ "ptrace_traceme_denied_total",      0, 0 },
+		/* v0.8 self-protection counters */
+		{ "bpf_self_denied_total",            0, 0 },
+		{ "pin_tamper_denied_total",          0, 0 },
 	};
 	const size_t n = sizeof(entries) / sizeof(entries[0]);
 	int all_missing = 1;
 	int any_io_err = 0;
+	int any_perm_err = 0;
+	int any_acces_err = 0;
 	char path[PATH_MAX];
 
 	for (size_t i = 0; i < n; i++) {
@@ -3708,8 +4326,39 @@ static int stats_action(void)
 			all_missing = 0;
 		if (entries[i].rc == -1)
 			any_io_err = 1;
+		if (entries[i].rc == -3) {
+			/* errno is still the one bpf_obj_get() set: nothing
+			 * between that return and here touches it. */
+			if (!any_perm_err)
+				fprintf(stderr, "open pinned %s: %s\n",
+					path, strerror(errno));
+			if (errno == EPERM)
+				any_perm_err = 1;   /* the gate */
+			else
+				any_acces_err = 1;  /* bpffs mode 700 */
+		}
 	}
 
+	if (any_perm_err) {
+		fprintf(stderr,
+			"[stats] the kernel refused this process an fd to the pinned counter\n"
+			"        maps. This normally means the running policy was pinned with\n"
+			"        --self-protect and this executable image is not in its authorised\n"
+			"        loader set. Run --stats from the binary image that pinned the\n"
+			"        policy, or from one authorised with --authorize-loader at pin\n"
+			"        time; ACTION_DENY_BPF_SELF in the audit stream confirms it.\n");
+		return 1;
+	}
+	if (any_acces_err) {
+		/* Not the self-protection gate: the pin directory is mode 700
+		 * and root-owned. Saying "--self-protect" here would send a
+		 * non-root operator after a feature that is not in play. */
+		fprintf(stderr,
+			"[stats] cannot open the pinned counter maps (permission denied on\n"
+			"        " PIN_ROOT "/maps, which is root-owned mode 700).\n"
+			"        Re-run as root.\n");
+		return 1;
+	}
 	if (all_missing) {
 		fprintf(stderr, "[stats] no pinned counters found\n");
 		return 2;
@@ -4205,8 +4854,10 @@ static int unpin_action(const char *requested)
 	// hard upper bound — one prog per link pin. Stack-sized array keeps
 	// the drain path allocation-free.
 	__u32 link_prog_ids[64];
-	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 21,
-		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id (currently 21)");
+	_Static_assert(sizeof(link_prog_ids)/sizeof(link_prog_ids[0]) >= 30,
+		       "link_prog_ids[] must hold every KNOWN_LINK_NAMES prog_id "
+		       "(currently 30: 29 live pins + the legacy "
+		       "comp_bprm_check_security sweep entry)");
 	size_t n_link_prog_ids;
 
 	if (strcmp(cand, root) == 0) {
@@ -4459,6 +5110,58 @@ static int select_inode_setattr_variant(struct compartment_bpf *skel)
 	return 0;
 }
 
+// security_file_ioctl_compat() is the entry point a 32-bit process on a
+// 64-bit kernel reaches (fs/ioctl.c COMPAT_SYSCALL_DEFINE3(ioctl)); the
+// native SYSCALL_DEFINE3 calls security_file_ioctl() instead. Without the
+// compat program a 32-bit `chattr +i` bypasses the whole v0.8 ioctl gate.
+//
+// The hook was backported into stable 6.6.y, so `uname` cannot decide it:
+// probe vmlinux BTF for bpf_lsm_file_ioctl_compat and autoload the program
+// only when the symbol exists. On a kernel without it, attaching would fail
+// the whole load; skipping is correct because such a kernel routes compat
+// ioctls through security_file_ioctl(), which comp_file_ioctl already covers.
+// Must run after __open() and before __load(), like the setattr probe.
+static int select_file_ioctl_compat(struct compartment_bpf *skel)
+{
+	bool present = false;
+	int decided = 0;
+	struct btf *btf = btf__load_vmlinux_btf();
+
+	if (btf) {
+		__s32 id = btf__find_by_name_kind(btf, "bpf_lsm_file_ioctl_compat",
+		                                  BTF_KIND_FUNC);
+		present = (id >= 0);
+		decided = 1;
+		btf__free(btf);
+	}
+	if (!decided) {
+		// BTF absent: the hook has existed since 6.7 and is in every
+		// supported stable line, but we cannot prove it here. Disable
+		// rather than risk failing the entire load on a BTF-less host —
+		// the native comp_file_ioctl program still attaches, so the
+		// 64-bit gate stays live and only the compat residual reopens
+		// (the same residual documented in LIMITATIONS.md for kernels
+		// that genuinely lack the hook).
+		present = false;
+		fprintf(stderr,
+			"[probe] warn: vmlinux BTF unavailable; disabling the "
+			"file_ioctl_compat program. 32-bit ioctl callers are "
+			"NOT gated on this host.\n");
+	}
+
+	if (bpf_program__set_autoload(skel->progs.comp_file_ioctl_compat,
+	                              present)) {
+		fprintf(stderr,
+			"[probe] error: set_autoload(file_ioctl_compat) failed; "
+			"refusing to load.\n");
+		return -1;
+	}
+	fprintf(stderr, "[probe] file_ioctl_compat hook: %s.\n",
+		present ? "present (32-bit ioctl callers gated)"
+		        : "absent (compat ioctls route through file_ioctl)");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	/* Subcommand dispatch: `compartment-bpf observe [OPTIONS]` */
@@ -4498,6 +5201,27 @@ int main(int argc, char **argv)
 			 * non-zero. dry-run / parse-only ignore this flag. */
 			allow_candidate = 1;
 			i++;
+		} else if (!strcmp(argv[i], "--self-protect")) {
+			opt_self_protect = 1;
+			i++;
+		} else if (!strcmp(argv[i], "--authorize-loader")) {
+			if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+				fprintf(stderr,
+					"--authorize-loader requires a PATH argument.\n");
+				return 2;
+			}
+			if (n_authorize_loader_paths >=
+			    COMPARTMENT_MAX_LOADER_IDS - 1) {
+				fprintf(stderr,
+					"--authorize-loader: at most %d entries "
+					"(the pinning image occupies one slot).\n",
+					COMPARTMENT_MAX_LOADER_IDS - 1);
+				return 2;
+			}
+			authorize_loader_paths[n_authorize_loader_paths++] =
+				argv[i + 1];
+			opt_self_protect = 1;
+			i += 2;
 		} else if (!strcmp(argv[i], "--stats")) {
 			stats_mode = 1;
 			i++;
@@ -4530,6 +5254,21 @@ int main(int argc, char **argv)
 	// --allow-empty, and a profile argument; combining them is a usage
 	// error so the operator catches a confused invocation at the door
 	// rather than after partial side effects.
+	// --self-protect is a property of the policy being loaded, not of an
+	// action on an existing one: the loader that pinned it already recorded
+	// who may remove it, so accepting the flag on --unpin/--stats would
+	// suggest it could be changed after the fact. Reject it at the door.
+	if ((unpin_mode || stats_mode) && opt_self_protect) {
+		fprintf(stderr,
+			"--self-protect / --authorize-loader apply to --pin only; "
+			"the authorised set is fixed when the policy is pinned.\n");
+		return 2;
+	}
+	if (opt_self_protect && !pin)
+		fprintf(stderr,
+			"warn: --self-protect without --pin protects the maps of this "
+			"daemon only; there are no pins to protect and everything goes "
+			"away when this process exits.\n");
 	if (unpin_mode) {
 		if (pin || dry_run || parse_only || allow_empty || allow_candidate || conf || stats_mode) {
 			fprintf(stderr,
@@ -4697,6 +5436,16 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	if (select_file_ioctl_compat(skel) < 0) {
+		compartment_bpf__destroy(skel);
+		return 1;
+	}
+
+	if (select_bpf_map_variant(skel) < 0) {
+		compartment_bpf__destroy(skel);
+		return 1;
+	}
+
 	// Optional test-only override for the audit ringbuf size,
 	// so counter-smoke.sh can deterministically induce ringbuf drops with
 	// a small burst of denies. Value is bytes; libbpf will reject anything
@@ -4776,6 +5525,16 @@ int main(int argc, char **argv)
 	// name and mutate entries. v0 explicitly excludes in-host CAP_BPF
 	// from its threat model; the v1 defense is SPEC §7 `bpf_gate` (armed-sentinel
 	// pid-gate + restrict_filesystems boot config).
+	// v0.8: the root of trust (loader_ids, protected_map_ids) must be
+	// written BEFORE freeze_seal_maps() freezes it, and the whole thing
+	// must be in place before attach so the gate is never live with an
+	// empty allowlist (which would deny the loader its own maps).
+	if (self_protect_populate_early(skel) < 0) {
+		held_fds_release(&held);
+		compartment_bpf__destroy(skel);
+		return 1;
+	}
+
 	if (freeze_seal_maps(skel) < 0) {
 		held_fds_release(&held);
 		compartment_bpf__destroy(skel);
@@ -4932,6 +5691,29 @@ int main(int argc, char **argv)
 			// do not leave a half-pinned state on bpffs;
 			// also remove the sentinel we wrote up front.
 			int removed = 0, unknown = 0;
+			(void)sweep_known(PIN_ROOT "/links",
+				KNOWN_LINK_NAMES, N_KNOWN_LINK_NAMES,
+				&removed, &unknown);
+			ed11_unpin_sentinel_unlink();
+			pin_lifecycle_unlock(pin_lock_fd);
+			ring_buffer__free(rb);
+			compartment_bpf__destroy(skel);
+			return 1;
+		}
+		// v0.8: the pin inodes exist only now. Record them, fill in
+		// pin_dev, and freeze the two late maps — all still under the
+		// pin lifecycle lock, so no concurrent --pin/--unpin can be
+		// interleaved with the window in which protected_pins is
+		// writable. On failure the pins are swept exactly like a
+		// pin_counter_maps failure: a policy that claims
+		// self-protection and does not have it is worse than no policy.
+		if (self_protect_record_pins(skel,
+					     KNOWN_LINK_NAMES, N_KNOWN_LINK_NAMES,
+					     KNOWN_MAP_NAMES, N_KNOWN_MAP_NAMES) < 0) {
+			int removed = 0, unknown = 0;
+			(void)sweep_known(PIN_ROOT "/maps",
+				KNOWN_MAP_NAMES, N_KNOWN_MAP_NAMES,
+				&removed, &unknown);
 			(void)sweep_known(PIN_ROOT "/links",
 				KNOWN_LINK_NAMES, N_KNOWN_LINK_NAMES,
 				&removed, &unknown);

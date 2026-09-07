@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # tests/pin-regression.sh -- V-4 pin/unpin regression suite.
 #
-# Four tests:
+# Five tests:
 #   T4.1 Killed daemon, pinned links: enforcement survives.
 #   T4.2 --unpin removes owned pins, enforcement stops, PIN_ROOT preserved.
 #   T4.3 --unpin <foreign bpffs object> refused; sentinel intact.
 #   T4.4 Reload sshd.conf -> chronyd.conf via (dry-run|unpin|pin) composition:
 #        no stale sshd denial, chronyd denial active.
+#   T4.5 A pin tree of the wrong shape is refused with a pin-shape
+#        diagnostic rather than adopted.
 #
 # Run only inside a dedicated VM. The probe uses sealprobe's
 # truncate-to-same-size operation, which triggers the truncate hooks
@@ -16,7 +18,7 @@
 # Outputs ${RESULTS}/pin-regression.csv -- one row per test:
 #   test,outcome,detail
 #
-# Exits non-zero unless all 4 tests pass.
+# Exits non-zero unless all 5 tests pass.
 
 set -euo pipefail
 
@@ -172,6 +174,14 @@ record()
 	# record <test> <outcome> <detail>
 	# Quote detail to keep commas in messages from splitting columns.
 	printf '%s,%s,"%s"\n' "$1" "$2" "$3" >> "${CSV}"
+	# Three of the skip paths here (a missing fixture, bpftool absent)
+	# wrote a CSV row and nothing else, so the release gate's allowlist
+	# could never see them: two of five pin/unpin regression tests could
+	# silently not run behind a single lowercase "N skipped" tally.
+	case "$2" in
+	SKIP) echo "[pin-regression] SKIP ${1}: ${3}" ;;
+	FAIL) echo "[pin-regression] failed ${1}: ${3}" >&2 ;;
+	esac
 }
 
 # Build a synthetic seal profile under /tmp that seals a throwaway file
@@ -463,7 +473,91 @@ rm -f "${SENTINEL}" 2>/dev/null || true
 
 # Derive the expected outcome-row count from the test list itself so adding a
 # T4.6 (or removing one) can't silently drift the recorded-count gate below.
-TESTS=(test_t41 test_t42 test_t43 test_t44 test_t45)
+# ---------- T4.6 -------------------------------------------------------
+# The pinned link set, name by name, against tests/expected-links.txt.
+#
+# Every one of six mutations that disabled an enforcement program left
+# smoke-pin at rc=0: the loader starts cleanly with one fewer link and
+# nothing in the pin layer counted them. Each was caught only by one or
+# two witnesses in tests/bypass/, and B06 (the strict-launch marker hook)
+# was invisible to the bypass corpus entirely.
+#
+# comp_file_ioctl_compat is expected only when the loader's own BTF probe
+# says the kernel has security_file_ioctl_compat(), so the assertion is
+# exact on 6.8 and on 7.0 instead of a count with a tolerance.
+#
+# comp_bpf_map is expected only when the pin armed --self-protect, which this
+# daemon does not; the armed 29-link set is asserted by bypass witness 22.
+test_t46()
+{
+	local expected_file="${REPO}/tests/expected-links.txt"
+	if [ ! -f "${expected_file}" ]; then
+		record T4.6 FAIL "tests/expected-links.txt is missing"
+		return 1
+	fi
+
+	synthetic_setup
+	start_daemon "${SYNTHETIC_PROFILE}"
+
+	local compat_state="unknown"
+	if grep -q '\[probe\] file_ioctl_compat hook: present' "${DAEMON_LOG}"; then
+		compat_state="present"
+	elif grep -q '\[probe\] file_ioctl_compat hook: absent' "${DAEMON_LOG}"; then
+		compat_state="absent"
+	fi
+
+	# comp_bpf_map is pinned only when --self-protect armed the policy.
+	# This daemon is started without it, so the expected set is the 28-link
+	# default; the armed set is asserted by bypass witness 22.
+	local sp_state="off"
+	if grep -q 'self-protection ARMED' "${DAEMON_LOG}"; then
+		sp_state="armed"
+	fi
+
+	local want got
+	want="$(mktemp /tmp/v4-links-want.XXXXXX)"
+	got="$(mktemp /tmp/v4-links-got.XXXXXX)"
+	awk -v compat="${compat_state}" -v sp="${sp_state}" '
+		/^[[:space:]]*(#|$)/ { next }
+		{
+			name = $1
+			if ($2 == "conditional") {
+				if (compat == "present") print name
+				next
+			}
+			if ($2 == "self-protect") {
+				if (sp == "armed") print name
+				next
+			}
+			print name
+		}' "${expected_file}" | sort > "${want}"
+	ls "${PIN_ROOT}/links" 2>/dev/null | sort > "${got}"
+
+	stop_daemon
+	"${BIN}" --unpin >/dev/null 2>&1 || true
+	synthetic_teardown
+
+	if [ "${compat_state}" = "unknown" ]; then
+		record T4.6 FAIL "the loader printed no file_ioctl_compat probe line; cannot decide the expected set"
+		rm -f "${want}" "${got}"
+		return 1
+	fi
+
+	local n_want n_got diff diff_out
+	n_want="$(wc -l < "${want}")"
+	n_got="$(wc -l < "${got}")"
+	if diff_out="$(diff "${want}" "${got}" 2>&1)"; then
+		record T4.6 PASS "pinned link set matches expected-links.txt (${n_got} links; file_ioctl_compat ${compat_state}; self-protect ${sp_state})"
+		rm -f "${want}" "${got}"
+		return 0
+	fi
+	diff="$(printf '%s' "${diff_out}" | tr '\n' ' ' | cut -c1-300)"
+	record T4.6 FAIL "pinned link set differs (want ${n_want}, got ${n_got}; < expected > actual): ${diff}"
+	rm -f "${want}" "${got}"
+	return 1
+}
+
+TESTS=(test_t41 test_t42 test_t43 test_t44 test_t45 test_t46)
 EXPECTED="${#TESTS[@]}"
 for t in "${TESTS[@]}"; do
 	"$t" || true
@@ -494,6 +588,7 @@ recorded=$((pass + fail + skip))
 
 echo
 echo "pin-regression: ${pass} passed, ${fail} failed, ${skip} skipped"
+echo "RESULT smoke-pin: pass=${pass} fail=${fail} skip=${skip}"
 echo "csv: ${CSV}"
 echo "final-bpffs: ${RESULTS}/final-bpffs.txt"
 

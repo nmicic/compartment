@@ -104,5 +104,32 @@ else
 	bad "DENY_ACTOR_MISMATCH mis-handled (should be review-only, no 'seal … actor=<name>')"
 fi
 
+# ---- synthetic: self-protection denies are review-only, with their own text ----
+# DENY_BPF_SELF and DENY_PIN_TAMPER are not policy denies: no seal flag relaxes
+# them. The generic "exec-domain / structural deny -- allow only if you
+# understand the implication" line is the wrong advice, so the tool must print
+# the loader-image remedy instead. DENY_BPF_SELF also carries dev=0 with the
+# BPF map id in ino, and must never be presented as a filesystem path.
+SP="${SCR}/selfprotect.log"
+cat > "${SP}" <<'EOF'
+[audit] DENY_BPF_SELF ts=3 pid=12 ppid=1 uid=0 comm=bpftool dev=0 ino=451 caller_dev=66 caller_ino=44
+[audit] DENY_PIN_TAMPER ts=4 pid=13 ppid=1 uid=0 comm=rm dev=51 ino=77 caller_dev=66 caller_ino=45
+EOF
+SPCAND="${RES}/selfprotect-candidate.conf"
+python3 "${TOOL}" --max 100 < "${SP}" > "${SPCAND}" 2>/dev/null
+if grep -qi "self-protection deny" "${SPCAND}" \
+   && grep -qi -- "--authorize-loader" "${SPCAND}" \
+   && ! grep -qi "UNKNOWN deny action" "${SPCAND}" \
+   && ! grep -qE "^#?\s*seal .* actor=<name>" "${SPCAND}"; then
+	ok "self-protection denies are review-only with the loader-image remedy"
+else
+	bad "DENY_BPF_SELF / DENY_PIN_TAMPER mis-handled (want the self-protection text, no auto-allow, not UNKNOWN)"
+fi
+if grep -q "DENY_BPF_SELF" "${SPCAND}" && grep -qE "DENY_BPF_SELF.*target=<dev=0 ino=451>" "${SPCAND}"; then
+	ok "DENY_BPF_SELF target rendered as a bpf map id, not a path"
+else
+	bad "DENY_BPF_SELF target mis-rendered (dev=0 ino=<map id> must not read as a filesystem object)"
+fi
+
 echo "=== deny-to-candidate SUMMARY: PASS=${PASS} FAIL=${FAIL} (${RES}) ==="
 [ "${FAIL}" -eq 0 ]

@@ -6,6 +6,13 @@
 #   0  — all executed tests PASS
 #   1  — at least one test FAIL
 #   77 — env unsupported (no root / no BPF LSM / not built)
+#
+# Observe-mode exec hook: the observe object attaches
+# SEC("lsm.s/bprm_check_security") (compartment-observe.bpf.c) to resolve the
+# exec'd inode against actor_targets and stamp current_actor / lineage. That is
+# distinct from the enforcement object, whose strict-launch marker moved to
+# lsm/bprm_committed_creds in v0.8; observe keeps bprm_check_security because it
+# only records, never denies, and needs the pre-commit sleepable context.
 
 set -u
 
@@ -52,9 +59,13 @@ grep -qw bpf /sys/kernel/security/lsm || {
 }
 
 # ------- fixture: a small actor binary for inode-based tests -------
-# Use /bin/true — stable path, always present.
-ACTOR_BIN="/bin/true"
-ACTOR_BIN2="/bin/false"
+# Purpose-built real ELF regular files, NOT /bin/true and /bin/false: those
+# are symlinks on uutils-coreutils distros (Ubuntu 26.04), which also made
+# T4's hardlink-to-the-actor step unrunnable there.
+# shellcheck source=tests/lib-realbin.sh
+. "$REPO/tests/lib-realbin.sh"
+ACTOR_BIN=$(realbin_noop)  || { say "[observe] SKIP (no real ELF actor fixture)"; exit 77; }
+ACTOR_BIN2=$(realbin_false) || { say "[observe] SKIP (no real ELF actor fixture)"; exit 77; }
 
 say ""
 say "=== T0: BPF verifier instruction count — combined load (M-5) ==="
@@ -107,7 +118,7 @@ fi
 
 say ""
 say "=== T4: actor selector follows exact inode, not path string ==="
-# Create a hardlink to /bin/true in /tmp; observe tracks by inode so
+# Create a hardlink to the actor fixture in /tmp; observe tracks by inode so
 # the same binary runs under a different name still fires
 HLINK="/tmp/observe_hlink_true_$$"
 ln "$ACTOR_BIN" "$HLINK" 2>/dev/null || { skip "T4: cannot create hardlink (skip)"; goto_t5=1; }
@@ -150,12 +161,12 @@ fi
 
 say ""
 say "=== T7: helper exec is lineage-only ==="
-# Wrap: /bin/sh -c 'exec /bin/true' — sh is actor, true is helper exec
+# Wrap: /bin/sh -c 'exec <noop>' — sh is actor, the noop is the helper exec
 # We register /bin/sh as actor; true should show as lineage event in compact mode
 SH_BIN="/bin/sh"
 cmpout="$RESULTS_DIR/t7.compact"
 "$BIN" observe --actor sh="$SH_BIN" --format compact --duration 3 \
-	-- "$SH_BIN" -c 'exec /bin/true' >"$cmpout" 2>/tmp/obs_t7.err
+	-- "$SH_BIN" -c "exec $ACTOR_BIN" >"$cmpout" 2>/tmp/obs_t7.err
 # At minimum: the output file is created, binary exits cleanly
 if [ -f "$cmpout" ]; then
 	ok "T7: compact output file created for helper-exec scenario"
@@ -392,7 +403,7 @@ if grep -q '\[run\] compartment-bpf live' /tmp/obs_t17b_pin.err 2>/dev/null; the
 	# Observe with the module loaded — the success branch should fire.
 	# V-7 P1-F: emit the candidate-profile JSON provenance so we can
 	# assert the abi_version field carries the kernel-detected value
-	# (0x0007 today; COMPARTMENT_ABI_VERSION in compartment-abi.h). A
+	# (0x0008 today; COMPARTMENT_ABI_VERSION in compartment-abi.h). A
 	# regression that reverts detect_runtime_abi to ABI_FALLBACK or
 	# zero-fills the provenance line would slip past the WARNING-absent
 	# check alone.
@@ -404,18 +415,18 @@ if grep -q '\[run\] compartment-bpf live' /tmp/obs_t17b_pin.err 2>/dev/null; the
 		nok "T17b: WARNING still fires after --pin; success path unreached"
 	else
 		# V-7 P1-F assertion: abi_version field must equal the
-		# compile-time COMPARTMENT_ABI_VERSION (0x0007). The
+		# compile-time COMPARTMENT_ABI_VERSION (0x0008). The
 		# emitter uses "%04x" so the exact JSON shape is
-		# "abi_version":"0x0007".
+		# "abi_version":"0x0008".
 		if [ ! -s "$T17B_PROV" ]; then
 			nok "T17b: --provenance-out produced empty/missing file at $T17B_PROV"
-		elif grep -q '"abi_version":"0x0007"' "$T17B_PROV"; then
-			ok "T17b: success path silent (no WARNING) AND provenance abi_version=0x0007"
+		elif grep -q '"abi_version":"0x0008"' "$T17B_PROV"; then
+			ok "T17b: success path silent (no WARNING) AND provenance abi_version=0x0008"
 		else
 			# Surface what we got for the next reader.
 			say "  T17b: provenance contents:"
 			sed 's/^/    /' < "$T17B_PROV" || true
-			nok "T17b: provenance abi_version != 0x0007 (abi_version_map not honored or fallback path taken)"
+			nok "T17b: provenance abi_version != 0x0008 (abi_version_map not honored or fallback path taken)"
 		fi
 	fi
 	kill -TERM "$T17B_DAEMON" 2>/dev/null || true

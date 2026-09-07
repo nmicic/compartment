@@ -18,7 +18,7 @@
 # Outputs ${RESULTS}/counter-smoke.csv -- one row per test:
 #   test,outcome,detail
 #
-# Exits non-zero unless all 3 tests pass.
+# Exits non-zero unless all 4 tests pass.
 
 set -euo pipefail
 

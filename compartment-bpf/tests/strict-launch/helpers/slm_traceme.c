@@ -3,7 +3,7 @@
 // tests/strict-launch/helpers/slm_traceme.c — SL-8c LSM-direct witness.
 //
 // Built statically (-static) and registered in the SL-8c policy as a
-// strict-launch launcher. comp_bprm_check_security therefore sets
+// strict-launch launcher. comp_bprm_committed_creds therefore sets
 // actor_marker.state=1 on this process at exec time. The helper then
 // calls ptrace(PTRACE_TRACEME) directly — there is NO seccomp wrapper
 // in the path, so the syscall reaches comp_ptrace_traceme, the LSM hook

@@ -39,10 +39,7 @@ Expected output: a single line containing the LSMs in load order,
 ending in `bpf`. That confirms the kernel has `CONFIG_BPF_LSM=y` and
 the BPF LSM hook is wired up. The mainline v6.8 kernel bundled with
 vng has `CONFIG_BPF_LSM=y` and was used to capture the self-test
-transcript shipped with this V-5 evidence
-(`tests/results/v5-on-ramp-20260512T192129Z-fabe97a/path-b/` — run
-`ls tests/results/` to find the most recent on-ramp directory if
-this one has been rotated out).
+transcript referenced below.
 
 To verify a different version, replace `v6.8` with one of the cached
 versions in `~/.cache/virtme-ng/` or any version `vng` can resolve.
@@ -128,10 +125,9 @@ Each one matters for what `make smoke` actually proves under Path B:
 
 ## Self-test transcript
 
-A reference self-test transcript lives at
-`tests/results/v5-on-ramp-20260512T192129Z-fabe97a/path-b/` (run
-`ls tests/results/` to find the most recent on-ramp directory if the
-tree contains a newer one). It exercises the
+On-ramp transcripts are written to `tests/results/`, which is a per-run
+artefact directory and is never committed — run the path below to produce
+one. It exercises the
 `/sys/kernel/security/lsm` activation under `--append lsm=…,bpf` on
 vng's v6.8 kernel and captures the `/proc/cmdline` proving the boot
 arg was honored. It does not run `make smoke` end-to-end because the

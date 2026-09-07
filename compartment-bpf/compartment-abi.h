@@ -143,11 +143,136 @@
 //    sealed file op” from “global PR_SET_MM deny” and ptrace hardening
 //    denies without parsing comments or inferring from counters.
 
+// ABI v0.8 — metadata/mount coverage + post-commit strict-launch marker.
+//  * No struct layout change: audit_event, seal_value, launcher_actor,
+//    actor_marker and policy_state are unchanged on the wire.
+//  * New action codes:
+//    - ACTION_DENY_MOUNT = 14. Emitted by the sb_mount / move_mount hooks
+//      when a new mount would be attached ON a sealed inode or anywhere
+//      INSIDE a sealed subtree (path-shadowing class; the pre-v0.8
+//      LIMITATIONS rows "bind-mount-OVER sealed path" and
+//      "Mount-inside-sealed-subtree bypass"). dev/ino carry the sealed
+//      inode (or covering sealed directory) that fired.
+//    - ACTION_DENY_UMOUNT = 15. Emitted by the sb_umount hook, and by
+//      move_mount's from-side gate, when a filesystem that hosts sealed
+//      inodes would be detached or moved away. dev carries the
+//      superblock's s_dev; ino is 0 — the subject is the whole filesystem,
+//      not one inode.
+//  * New map:
+//    - sealed_devs: HASH keyed by __u64 s_dev, value __u32 refcount. The
+//      loader inserts the superblock device of every sealed path (file and
+//      directory) as it populates sealed_inodes / sealed_dirs, and the map
+//      is frozen with the rest. It is the only state comp_sb_umount needs:
+//      an umount hook sees a struct vfsmount, not an inode, so per-inode
+//      seals cannot answer "does this filesystem host anything sealed?".
+//  * New hooks (compartment.bpf.c):
+//    - inode_set_acl / inode_remove_acl: since Linux 6.2 POSIX ACL writes
+//      go through vfs_set_acl()/vfs_remove_acl(), which have their own LSM
+//      hooks and never reach inode_setxattr/inode_removexattr. A `no-chmod`
+//      seal did not stop `setfacl` on the project's >= 6.6 floor. Both
+//      hooks enforce SEAL_NO_CHMOD with the existing DENY_CHMOD /
+//      DENY_CHMOD_PARENT_DIR codes.
+//    - file_ioctl + file_ioctl_compat: FS_IOC_SETFLAGS /
+//      FS_IOC32_SETFLAGS / FS_IOC_FSSETXATTR / FS_IOC_SETVERSION (chattr,
+//      project ids) mutate inode metadata via ->fileattr_set with no
+//      inode_setattr or xattr hook; gated under SEAL_NO_CHMOD (same two
+//      codes). Both the native and the 32-bit compat ioctl entry points
+//      are hooked — they are separate LSM hooks in the kernel, and an i386
+//      caller reaches only security_file_ioctl_compat(). The compat
+//      program is autoload-gated on a BTF probe for
+//      bpf_lsm_file_ioctl_compat, because the hook was backported into
+//      stable 6.6.y and a kernel-version test would be wrong.
+//    - sb_mount / move_mount: see ACTION_DENY_MOUNT.
+//    - sb_umount: see ACTION_DENY_UMOUNT. Gating the mount DESTINATION
+//      alone left the complementary shape open — detach the filesystem
+//      that hosts the seals and the sealed path resolves into the parent
+//      filesystem, where the (now unsealed) mountpoint dentry accepts a
+//      fresh mount that the destination gate happily allows. The sealed
+//      inodes stay protected throughout; the path guarantee does not.
+//  * Strict-launch marker mutation moved from bprm_check_security to
+//    bprm_committed_creds. security_bprm_check() runs in
+//    search_binary_handler() immediately before fmt->load_binary(); every
+//    failure inside load_elf_binary() BEFORE begin_new_exec() returns
+//    -errno to the caller's original image, which therefore keeps running
+//    with whatever the check hook already wrote. The most usable of those
+//    failures is open_exec(elf_interpreter) -> -ENOENT: shadowing the
+//    launcher's PT_INTERP path inside a mount namespace forces it
+//    deterministically, no race needed. (Failures inside begin_new_exec()
+//    and later — de_thread, dup_fd, exec_mmap — are past
+//    bprm->point_of_no_return and are converted to SIGSEGV, so they never
+//    return a marker to anyone.) committed_creds runs only once the new
+//    credentials and mm are installed. Pin link name changes
+//    comp_bprm_check_security -> comp_bprm_committed_creds; the loader
+//    keeps the legacy name in its --unpin sweep table so a v0.4..v0.7
+//    pin tree can still be torn down.
+//  * The marker hook is attached sleepable (lsm.s/): the hook is in the
+//    kernel's sleepable_lsm_hooks allowlist, and that is what makes the
+//    task-storage marker allocation blocking. A new counter,
+//    marker_set_fail_total, records the residual allocation failure so a
+//    strict-launch deny caused by memory pressure is distinguishable from
+//    one caused by an attack on the launcher chain.
+//  * inode_setattr: explicit timestamp writes (utimensat / touch -d) on a
+//    directly sealed inode are now chmod-class, matching the v0.5
+//    parent-dir rule. Truncation stays write-class.
+//  * The version bump makes a v0.7 audit consumer fail loud on code 14
+//    instead of printing "action=?".
+
+// ABI v0.8, continued — self-protection (the loader protects its own
+// kernel state). Folded into 0x0008 rather than bumping to 0x0009: v0.8
+// is unreleased, so no consumer has yet seen 0x0008 without these two
+// action codes. The header's MUST rule bumps the version on the first
+// schema-visible change *per released ABI*, not per commit; bumping twice
+// inside one unreleased version would ship a 0x0008 that never existed in
+// any artefact and force every consumer through a version it can never
+// meet. The audit_event layout is unchanged from v0.3 either way.
+//
+//    Measured motivation (both 6.8.0-139 and 7.0.0-31): bpf_map_freeze()
+//    gates only the *syscall* path (map_get_sys_perms()). A CAP_BPF caller
+//    that obtains ANY fd to a frozen compartment map — a BPF_F_RDONLY fd is
+//    enough — can splice it into a BPF program of its own and call
+//    bpf_map_update_elem()/bpf_map_delete_elem() on it from BPF context,
+//    which no freeze and no map flag stops. Freezing is therefore NOT the
+//    map-integrity control it was documented to be; the only chokepoint is
+//    fd creation, i.e. bpf_map_new_fd() -> security_bpf_map().
+//
+//    * New action codes:
+//      - ACTION_DENY_BPF_SELF = 16. Emitted by the lsm/bpf_map hook when a
+//        task whose mm->exe_file inode is not in loader_ids asks for ANY fd
+//        (read or write) to a map listed in protected_map_ids. dev is 0 and
+//        ino carries the target map id, so the audit line identifies the
+//        object without a second lookup.
+//      - ACTION_DENY_PIN_TAMPER = 17. Emitted by inode_unlink / inode_rename
+//        / inode_rmdir / sb_mount / move_mount when a non-loader tries to
+//        unlink, rename, rmdir or over-mount an inode recorded in
+//        protected_pins (the bpffs pin objects, the pin directories and the
+//        bpffs mount root). sb_umount also refuses to let that bpffs be
+//        detached, but keeps ACTION_DENY_UMOUNT (=15): the operator-visible
+//        fact is the one that code already names, and unlike the others it
+//        applies to every caller, the loader included.
+//        Distinct from ACTION_DENY_UNLINK (=1) / ACTION_DENY_RENAME (=2):
+//        1 and 2 mean "an operator seal denied this"; 17 means "the tool
+//        refused to let its own enforcement be removed".
+//
+//    * The audit_event layout is UNCHANGED from v0.3. No version bump: a
+//      consumer built against a released ABI has never seen 0x0008 without
+//      codes 16 and 17, so there is no 0x0008 stream in which they can
+//      surprise it. The next released ABI bump carries them along with
+//      whatever else lands.
+//
+//    * Self-protection is OPT-IN (`--pin --self-protect`). Without the flag
+//      the loader behaves exactly as it did before the feature and the two
+//      new codes never fire.
+//      The reason it is opt-in is the recovery semantics: once the pin tree
+//      is protected, only a binary whose (dev,ino) is in loader_ids can
+//      remove it, and a rebuild or package upgrade produces a new inode.
+//      See HOWTO.md 3.6 for the upgrade ceremony and the bounded worst
+//      case (a reboot clears bpffs).
+
 #ifndef COMPARTMENT_ABI_H
 #define COMPARTMENT_ABI_H
 
-// Encoded as 8-bit major + 8-bit minor: 0x0007 == v0.7.
-#define COMPARTMENT_ABI_VERSION 0x0007
+// Encoded as 8-bit major + 8-bit minor: 0x0008 == v0.8.
+#define COMPARTMENT_ABI_VERSION 0x0008
 
 // Recursive subtree enforcement walks ancestor dentries up to this many
 // levels. The default is intentionally conservative for verifier/load-time
@@ -216,6 +341,30 @@ struct inode_key {
 #define ACTION_DENY_PRCTL_SET_MM      11
 #define ACTION_DENY_PTRACE_ACCESS     12
 #define ACTION_DENY_PTRACE_TRACEME    13
+// v0.8: mount-shadowing deny. Emitted by comp_sb_mount / comp_move_mount
+// when a mount would be attached on a sealed inode (dev/ino = that inode)
+// or inside a sealed subtree (dev/ino = the covering sealed directory).
+// Uniform-deny seals emit this code; actor-bound seals emit
+// ACTION_DENY_ACTOR_MISMATCH on a non-actor caller as everywhere else.
+#define ACTION_DENY_MOUNT             14
+// v0.8: umount/detach deny. Emitted by comp_sb_umount when a filesystem
+// that hosts sealed inodes would be detached, and by comp_move_mount when
+// such a filesystem's own mount would be moved away from under its path.
+// dev = the superblock's s_dev; ino = 0 (the whole filesystem is the
+// subject, not one inode). Distinct from ACTION_DENY_MOUNT=14: 14 means
+// "something was about to be attached ON a seal", 15 means "the ground
+// under the seals was about to be pulled away".
+#define ACTION_DENY_UMOUNT            15
+
+// v0.8 self-protection. 16 is object-scoped (a BPF map), 17 is inode-scoped
+// (a bpffs pin). Both are emitted only when --self-protect is in force.
+//
+// 16 carries dev=0, ino=<bpf map id>: an audit consumer must not try to
+// resolve it as a filesystem inode. This is the one action whose (dev, ino)
+// pair is not a filesystem object, which is why it gets its own code rather
+// than reusing ACTION_DENY_ACTOR_MISMATCH.
+#define ACTION_DENY_BPF_SELF          16
+#define ACTION_DENY_PIN_TAMPER        17
 
 // Per-constant value-drift asserts. The struct-size assert on
 // audit_event catches layout drift but not value drift on SEAL_*/ACTION_*;
@@ -239,6 +388,10 @@ _Static_assert(ACTION_DENY_CHMOD_PARENT_DIR  == 10, "ACTION_DENY_CHMOD_PARENT_DI
 _Static_assert(ACTION_DENY_PRCTL_SET_MM   == 11, "ACTION_DENY_PRCTL_SET_MM value drift (v0.7)");
 _Static_assert(ACTION_DENY_PTRACE_ACCESS  == 12, "ACTION_DENY_PTRACE_ACCESS value drift (v0.7)");
 _Static_assert(ACTION_DENY_PTRACE_TRACEME == 13, "ACTION_DENY_PTRACE_TRACEME value drift (v0.7)");
+_Static_assert(ACTION_DENY_MOUNT          == 14, "ACTION_DENY_MOUNT value drift (v0.8)");
+_Static_assert(ACTION_DENY_UMOUNT         == 15, "ACTION_DENY_UMOUNT value drift (v0.8)");
+_Static_assert(ACTION_DENY_BPF_SELF      == 16, "ACTION_DENY_BPF_SELF value drift (v0.8)");
+_Static_assert(ACTION_DENY_PIN_TAMPER    == 17, "ACTION_DENY_PIN_TAMPER value drift (v0.8)");
 
 // ABI v0.3 layout (gcc-verified sizeof on LP64, natural alignment):
 //   off  0: __u32 version       — MUST be at offset 0; per the
@@ -350,9 +503,10 @@ _Static_assert(COMPARTMENT_MAX_ACTORS_PER_SEAL == 4,
 //                     (the launcher binary's file_id), value=struct
 //                     launcher_actor. Populated by the loader from
 //                     `actor-strict NAME = TARGET launcher=PATH`
-//                     directives. On `bprm_check_security`, a hit means
-//                     "exec of a sealed launcher" and the kernel sets a
-//                     marker on the new task.
+//                     directives. On `bprm_committed_creds` (v0.8; was
+//                     `bprm_check_security` through v0.7), a hit means
+//                     "exec of a sealed launcher COMMITTED" and the kernel
+//                     sets a marker on the new task.
 //
 // actor_marker      : BPF_MAP_TYPE_TASK_STORAGE, value=struct
 //                     actor_marker. Per-task; set on launcher exec,
@@ -396,5 +550,29 @@ struct policy_state {
 };
 _Static_assert(sizeof(struct policy_state) == 8,
 	"policy_state layout must be stable across BPF and userspace (v0.4)");
+
+
+// ---------------- ABI v0.8: self-protection types ----------------
+
+// Written once by the loader into self_protect_cfg[0] before attach, and
+// completed (pin_dev) before the late freeze. The BPF side reads it on every
+// gated hook, so it is one ARRAY[1] lookup, not a per-field map.
+//
+// enabled == 0 means every self-protection gate is a no-op: the programs are still
+// loaded and attached (so the link/pin/coverage accounting does not change
+// shape between the two modes) but they return 0 immediately. That keeps the
+// opt-in switch in one place instead of scattering autoload decisions.
+struct self_protect_cfg {
+	__u64 pin_dev;      /* s_dev of the bpffs holding PIN_ROOT, 0 if unknown */
+	__u32 enabled;      /* 1 = --self-protect in force                       */
+	__u32 _pad;
+};
+_Static_assert(sizeof(struct self_protect_cfg) == 16,
+	"self_protect_cfg size must match across BPF producer and userspace consumer (ABI v0.8)");
+
+// Maximum binaries allowed to maintain a pinned policy: the pinning loader
+// plus up to 7 pre-authorised successors (`--authorize-loader`). Small on
+// purpose — every extra entry is another inode that can remove enforcement.
+#define COMPARTMENT_MAX_LOADER_IDS 8
 
 #endif /* COMPARTMENT_ABI_H */

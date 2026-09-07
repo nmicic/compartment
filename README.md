@@ -6,18 +6,36 @@
 Kernel-enforced sandboxing for untrusted processes. Two zero-dependency
 core tools, one shared profile format, plus an optional BPF-LSM module.
 
-> **v1.3.0 note:** `compartment-user` and `compartment-root` are
-> unchanged and remain the zero-dependency core. `compartment-bpf`
-> is a new optional advanced module for kernel-level inode sealing,
-> with its own kernel and toolchain requirements.
+> **v1.4.0 note:** `compartment-root` now starts and runs correctly
+> under real root, and is tested there by root-only suites
+> (`sudo make test-root`); several of its container fixes are security
+> fixes, so read the upgrade notes before deploying it. Profile trust
+> changed: a profile is only honoured if its *source* is trusted, the
+> parser is transactional (a file that fails to parse changes nothing),
+> the security switches are one-way — a profile may tighten policy but
+> never loosen it — and `$HOME` is no longer searched unless
+> `--user-profiles` is given. Landlock policy gained per-file rules and
+> TCP port rules (`net-bind`, `net-connect`, `net-default`) on kernels
+> with Landlock ABI v4 or newer. `make install` no longer deploys the
+> example profiles; `make install-profiles` does. The optional
+> `compartment-bpf` module moves to **v0.8.0**, port ABI **0x0008**,
+> which adds mount, ACL and ioctl coverage — and reclassifies timestamp
+> writes as `no-chmod`-class, so on a directly `no-chmod`-sealed file a
+> non-actor is now denied `touch`, `utimensat(2)` and the
+> timestamp-restoring tail of `cp -p`, `rsync -a`, `tar -x`, `install -p`
+> and `unzip`. See `compartment-bpf/CHANGELOG.md` before upgrading a host
+> that has `no-chmod` seals in the field.
 
 > **Note:** This is an open-source Linux isolation toolkit, not a
 > formally validated security product. The code has been through
-> multiple review rounds and 51 automated tests, but it has not
-> undergone professional penetration testing or formal verification.
-> The automated tests do not yet cover all bypass vectors (e.g.,
-> direct network egress in sandbox mode, compartment-root under
-> root). Use it as a defense-in-depth layer, not as your sole
+> multiple review rounds and an automated test suite (run
+> `make test-integration` and `sudo make test-root` for the current
+> counts), but it has not undergone professional penetration testing
+> or formal verification. The automated tests do not yet cover all
+> bypass vectors (e.g. direct network egress in sandbox mode).
+> compartment-root is covered by root-only suites — see
+> [tests/scripts/root.d/](tests/scripts/root.d/). Use it as a
+> defense-in-depth layer, not as your sole
 > security boundary. See [DESIGN.md](DESIGN.md) for documented
 > limits and the full security review log.
 
@@ -27,7 +45,7 @@ core tools, one shared profile format, plus an optional BPF-LSM module.
 |------|---------|-------|------|
 | **compartment-user** | Landlock + seccomp + env sanitize + audit | no | none |
 | **compartment-root** | Full namespace container + seccomp + audit | yes | none |
-| **sandbox.sh** | Network namespace + proxy bridge | no | unshare, socat, newuidmap |
+| **sandbox.sh** | Network namespace + proxy bridge | no | unshare, ip; socat only with an upstream proxy; slirp4netns + nsenter only for the SOFT fallback |
 | **compartment-bpf** | Optional BPF LSM inode sealing (kernel-side deny, even root) | yes (CAP_BPF + CAP_SYS_ADMIN) | clang ≥ 12, libbpf, bpftool, libsodium, BTF, kernel ≥ 6.6 with `lsm=...,bpf` |
 
 `compartment-user` / `compartment-root` use Landlock + seccomp
@@ -49,10 +67,19 @@ make
 
 ```bash
 make                    # builds the zero-dependency core tools
-make test               # run core tests (Landlock + seccomp + env + inheritance)
-make test-integration   # run all tests (includes Claude CLI smoke test)
+make test               # the rootless suites, quick mode (run_all.sh --quick)
+make test-integration   # every unprivileged suite (sandbox.sh, external CLI)
+sudo make test-root     # the root-only suites
 make hardened           # build with randomized shell stash path
+make show-hardening     # print the hardening flags this toolchain accepted
+make check              # shellcheck + file-mode checks (same gates as CI)
 ```
+
+Hardening flags (`-fPIE -pie`, full RELRO, `-z noexecstack`,
+`-fstack-clash-protection`, `-fcf-protection`, `_FORTIFY_SOURCE=3`) are
+stated by the Makefile rather than inherited from the distribution's gcc
+specs, and each one a toolchain might not have is chosen by a compile-and-
+link probe, so an older or non-x86 target drops it instead of failing.
 
 Optional BPF module:
 
@@ -168,28 +195,79 @@ This pattern applies to any network client:
 
 **compartment-user** applies kernel-enforced restrictions before exec:
 
-1. `PR_SET_NO_NEW_PRIVS` — prevent privilege escalation
-2. **Landlock** — filesystem path restrictions (read-only system paths, writable workdir)
-3. **seccomp BPF** — block dangerous syscalls (ptrace, mount, kexec, bpf, io_uring, ...)
-4. **Environment sanitize** — strip LD_PRELOAD, LD_LIBRARY_PATH, etc.
-5. **Audit logging** — file-per-day log with PPID chain
+Kernel-enforced, inherited across `fork`/`exec`, and impossible for the
+sandboxed process or its descendants to remove:
 
-All restrictions are inherited by child processes and cannot be removed.
+1. `PR_SET_NO_NEW_PRIVS` — prevent privilege escalation
+2. **Landlock** — filesystem path restrictions (read-only system paths,
+   writable workdir) and, from ABI v4 (Linux 6.7), TCP port restrictions.
+   A rule may name a directory *or a single file*: `rw /dev/null` and
+   `exec /usr/bin/psql` are per-file grants, and a policy that grants
+   execute on individual files and on no directory is a binary allow-list
+3. **seccomp BPF** — block dangerous syscalls (ptrace, mount, kexec, bpf, io_uring, ...)
+
+Applied once, immediately before `exec`, and *not* kernel restrictions:
+
+4. **Environment sanitize** — strip `LD_*`, cloud credentials, SSH agent
+   socket, etc. from the environment handed to the command. A sandboxed
+   process can re-export any of them for its own children and the loader
+   will honour it; use `compartment-bpf` for durable environment policy.
+5. **Working directory** and **file-descriptor cleanup** — one-time actions.
+6. **Audit logging** — a record, not a restriction: file-per-day log with
+   PPID chain.
+
+Run-time order: audit log → preflight → no_new_privs → environment →
+Landlock → seccomp → `chdir` → hardening → `exec`.
+
+Two properties of Landlock decide how a policy has to be written:
+
+* **It is additive.** The rights of every rule matching an ancestor of the
+  path being opened are unioned, so a narrower rule never takes anything
+  away from a wider one. `rw /work` plus `ro /work/secrets` leaves the
+  secrets writable. Both tools refuse that policy rather than pretend.
+* **A rule for a path that does not exist grants nothing.** That is now a
+  fatal error; append `?` to the path (`ro /lib32?`) for the entries that
+  are genuinely conditional. `--verbose` reports how many rules were
+  *installed*, not how many were asked for.
 
 **compartment-root** creates a fully isolated container:
 
-1. `clone()` with new UTS, mount, PID, IPC, net, user namespaces
-2. **pivot_root** — old root fully unmounted (stronger than chroot)
-3. Minimal `/dev`, masked `/proc`, isolated hostname
-4. **Capability drop** — raw prctl + capset, no libcap. `cap-allow` preserves
+1. `clone()` with new UTS, mount, PID, IPC, net, user, cgroup namespaces
+2. **pivot_root** — the new root is bind-mounted `nosuid,nodev` onto itself
+   first, so a setuid binary inside it cannot elevate (stronger than chroot).
+   `rootdir-flags` adds `noexec` and `ro` on top; `mount-ro`, `mount-noexec`,
+   `mount-nosuid` and `mount-nodev` do the same for one path at a time.
+   The rootdir itself must be root-owned (or owned by the mapped host uid of
+   the container's root under a shifted `uid-map`) and not group- or
+   world-writable
+3. Fresh `/proc`, read-only `/sys`, a `/dev` tmpfs with `null`, `zero`,
+   `full`, `random`, `urandom` and `tty` bind-mounted from the old root, a
+   private `devpts` on `/dev/pts` with `/dev/ptmx` bound to it, a tmpfs
+   `/dev/shm`, 15 masked `/proc` paths, isolated hostname — all of it
+   applied *before* the old root is detached, which is what the kernel's
+   `mount_too_revealing()` check requires
+4. **Landlock**, opt-in with `landlock on` — the same ruleset builder
+   compartment-user uses, applied after the mounts and before the privilege
+   drop, so `exec /usr/bin/psql` is a per-binary allow-list entry inside the
+   container
+5. **Capability drop** — raw prctl + capset, no libcap. `cap-allow` preserves
    named capabilities for the service user via `PR_SET_KEEPCAPS` + `capset()`
-5. **seccomp BPF** — raw BPF, no libseccomp
-6. **Environment sanitize** + **audit logging** (same as compartment-user)
+6. **seccomp BPF** — raw BPF, no libseccomp; a 43-syscall deny-list is
+   installed by default, and `seccomp-default` chooses what a denied call
+   does (`errno`, `kill` or `log`)
+7. **Environment sanitize** + **audit logging** (same as compartment-user),
+   FD cleanup, `PR_SET_NO_NEW_PRIVS` (which no profile can turn off), and a
+   minimal PID 1 reaper that forwards signals and reaps orphans — itself
+   under the same filter whenever the policy permits the syscalls it needs
 
 **sandbox.sh** wraps the command in a network-isolated user+mount namespace:
 
-1. `unshare --user --mount --net` — HARD mode: loopback-only (no external interfaces);
-   SOFT fallback: slirp4netns with `--disable-host-loopback`
+1. `unshare --user --mount --net --map-root-user --fork` — HARD mode:
+   loopback-only, no external interfaces, no routes. Needs an unprivileged
+   user namespace with a uid map, which some distributions block; run
+   `./sandbox.sh --verify` to see whether this host allows it.
+   SOFT fallback: slirp4netns with `--disable-host-loopback`, which also
+   needs `nsenter`
 2. Unix socket proxy bridge — API traffic routed through corporate proxy
 3. Bind-mount shell replacement — every `/bin/bash` subprocess gets sandboxed
    (requires mount namespace, which sandbox.sh creates)
@@ -201,38 +279,131 @@ but do not yet include direct-bypass resistance tests.)
 
 ## Profile Files
 
-Both tools share the same `.conf` format:
+Both tools read the same `.conf` syntax. The filesystem, network, syscall
+and environment directives are honoured by both; the namespace and mount
+directives are compartment-root only and are parsed and silently ignored by
+compartment-user, so keep the two kinds in separate files.
+
+| Directive | Tools | Meaning |
+|---|---|---|
+| `ro PATH` | both | Read + execute on PATH and everything beneath it |
+| `rw PATH` | both | Read + write, **no execute** (W^X) |
+| `rwx PATH` | both | Read + write + execute |
+| `exec PATH` | both | Read + execute. On a *file* this is a per-binary grant — see below |
+| `PATH?` | both | A trailing `?` makes the rule optional: skipped when the path is absent instead of fatal |
+| `workdir PATH` | compartment-user | Working directory, added as `rwx` (not the W^X `rw`) |
+| `net-bind PORT` | both | Allow `bind(2)` on this TCP port (repeatable) |
+| `net-connect PORT` | both | Allow `connect(2)` to this TCP port (repeatable) |
+| `net-default deny\|ignore` | both | `deny` handles TCP bind and connect and refuses every port not listed. Default `ignore`: the network is not restricted |
+| `block NAME` | both | Deny-list one syscall |
+| `allow NAME` | both | Switch to allow-list mode and permit one syscall |
+| `seccomp-mode allow` | both | Switch to allow-list mode explicitly. Accepts `allow`/`allowlist` and `deny`/`denylist`; any other value is a fatal parse error |
+| `seccomp-default errno\|kill\|log` | both | What a denied syscall does. Default `errno` (EPERM) |
+| `env-deny NAME` / `env-allow NAME` | both | Environment policy; a trailing `*` is a prefix match |
+| `env-mode allow` | both | Switch the environment policy to allow-list mode. Accepts `allow`/`allowlist` and `deny`/`denylist`; any other value is a fatal parse error |
+| `landlock`/`seccomp`/`no-new-privs`/`env-sanitize` `on` | both | One-way switches: a profile may turn a mechanism on, never off. Landlock defaults to **on** for compartment-user and **off** for compartment-root |
+| `audit on` / `audit-log DIR` | both | Audit trail |
+| `inherit NAME` | both | Load another profile first, then apply these rules on top |
+| `rootdir DIR` | compartment-root | The container root. Must be root-owned and not group- or world-writable |
+| `rootdir-flags LIST` | compartment-root | Extra mount flags for the rootdir bind: `ro`, `noexec` (`nosuid` and `nodev` are always applied) |
+| `mount-ro PATH` | compartment-root | Bind PATH onto itself inside the new root and remount it read-only |
+| `mount-noexec` / `mount-nosuid` / `mount-nodev PATH` | compartment-root | The same, for the other three flags (repeatable) |
+| `uid` / `gid` / `username` | compartment-root | The service user to drop to |
+| `uid-map` / `gid-map` | compartment-root | `<container-start> <host-start> <count>`; default is the identity map |
+| `netns NAME` | compartment-root | Join `/var/run/netns/NAME` instead of creating a new network namespace |
+| `cgroup PATH` / `cap-allow CAP` / `loopback on` / `mount-mask PATH` | compartment-root | Cgroup, capability, loopback and masking policy |
+
+**`exec` on a file is a binary allow-list.** A Landlock rule may name a
+regular file, and a rule on a file carries only the file-level rights. So
 
 ```conf
-# Filesystem (compartment-user: Landlock)
-ro /usr
-rw $HOME
+landlock on
+exec /usr/bin/exampled
+exec /usr/bin/psql
+ro   /usr/lib
+```
 
-# Filesystem (compartment-root: namespaces)
-rootdir /srv/containers/default
-uid 1000
-gid 1000
-username svc
-loopback on
+means "these two binaries may be executed and nothing else", because no
+directory in the policy carries execute. Two things to know before relying
+on it: the dynamic loader has to be listed as well (`execve(2)` opens the
+ELF interpreter with `FMODE_EXEC`, so Landlock checks execute on it), while
+shared libraries do *not* (`ld.so` opens them read-only, and Landlock has no
+mmap hook — `ro`/`rw` on the library directory is enough); and the rule keys
+on the file, so a busybox-style multi-call binary cannot be split into
+applets. `ro` grants execute too, which is why no directory holding binaries
+may appear as `ro` in an allow-list policy.
+
+**Landlock network rules are TCP-only and allow-list-only.** `net-bind` and
+`net-connect` map onto `LANDLOCK_RULE_NET_PORT`, which covers `bind(2)` and
+`connect(2)` on TCP and nothing else: no UDP, no unix sockets, no netlink,
+no raw sockets, no `listen`/`accept` granularity, and no per-address rules —
+a rule for port 443 allows connecting to port 443 on any address, v4 and v6
+alike. There is no way to express "everything except port N"; that needs a
+BPF LSM and is left to a sibling tool. Below Landlock ABI v4 (Linux 6.7)
+both tools warn loudly that the port policy is not active.
+
+```conf
+# compartment-user: filesystem (Landlock)
+ro /usr
+rwx $HOME
 
 # Syscalls
 block ptrace
 block mount
 # Or allow-list mode:
+# seccomp-mode allow
 # allow read
 # allow write
 
-# Environment
-env-deny LD_PRELOAD
+# Environment ('*' at the end is a prefix match)
+env-deny LD_*
+# Or allow-list mode:
+# env-mode allow
+# env-allow PATH
 
-# Features
+# Features — a profile may only turn these on; use --no-landlock,
+# --no-seccomp or --no-env-sanitize on the command line to disable them
+landlock on
 seccomp on
 no-new-privs on
 env-sanitize on
 audit on
 ```
 
-Search order: `--profile /path/file.conf` → `~/.config/compartment/<name>.conf` → `/etc/compartment/<name>.conf` → built-in.
+```conf
+# compartment-root: namespace container
+rootdir /srv/containers/default
+uid 1000
+gid 1000
+username svc
+loopback on
+cap-allow net_bind_service
+mount-mask /proc/keys
+
+# Landlock inside the container (opt-in), mount hardening, TCP ports
+landlock on
+exec /usr/bin/myapp
+ro   /usr/lib
+rw   /srv/data
+rootdir-flags ro
+mount-noexec /tmp
+net-connect 5432
+net-default deny
+```
+
+`examples/restricted-root.conf` is a worked example of that shape, with a
+comment block on what it does and does not guarantee.
+
+Print the effective policy at any time with
+`compartment-user --dump-profile <name>`.
+
+Search order: `--profile /path/file.conf` → `/etc/compartment/<name>.conf` →
+`~/.config/compartment/<name>.conf` (compartment-user with `--user-profiles`
+only) → built-in. compartment-root searches `/etc/compartment/` only.
+
+Every profile file must be a regular file owned by root or by you (root only
+for compartment-root), in a directory with the same ownership, and neither
+may be group- or world-writable.
 
 See [HOWTO.md](HOWTO.md) for full format reference.
 
@@ -249,6 +420,14 @@ matches what you're protecting against.
 | `socat-proxy.conf` | Used internally by `paranoid-ssh.sh` | socat having access to your SSH keys |
 | `container.conf` | Full namespace isolation via compartment-root | Process escaping its root directory |
 | `dev.conf` | Development and debugging | Nothing — this is intentionally relaxed |
+| `restricted-root.conf` | A service container with an `exec` binary allow-list and one outbound TCP port | Anything but the named binaries running inside the container; egress to any other port |
+| `curl-wget.conf` | Running `curl`, `wget` or `aria2c` | An HTTP client reading or writing outside its download directory |
+| `dns-client.conf` | Running `dig`, `host`, `nslookup`, `drill`, `kdig` | A resolver tool touching anything but its own configuration |
+| `net-trace.conf` | Running `ping`, `traceroute`, `mtr`, `nmap`, `arping` | A raw-socket diagnostic tool with filesystem access it does not need |
+| `tcpdump.conf` | Running `tcpdump`, `tshark`, `dumpcap` | A capture tool reading the filesystem or writing outside its capture directory |
+| `net-admin-ro.conf` | Read-only network administration: `ip`, `ss`, `nft list`, `iptables -L` | A query command mutating network state or the filesystem |
+| `tcp-udp-relay.conf` | Running `socat`, `nc`, `ncat` as a relay | A relay tool reaching your files |
+| `dhclient.conf` | Running the ISC DHCP client (root) | A DHCP client writing outside `/var/lib/dhcp` |
 
 **Which one should I use?**
 
@@ -376,6 +555,34 @@ modules, cannot mount filesystems, and writes only to allowed paths.
 - **Recovery**: always keep at least one admin account with a real
   shell. If compartment-user has a bug, you need a way back in.
 
+### Limited root
+
+The same machinery, pointed at a **uid-0** account: `radmin` logs in over
+sshd, gets the wrapper as its login shell, and can inspect the system, read
+logs and manage the paths a profile names — but cannot load a module, kexec,
+write the raw disk, reach kernel memory, use `ptrace`/`perf`/`bpf`, leave its
+namespace, edit anything in the authentication or login path, or ask systemd,
+D-Bus or snapd to do any of it on its behalf.
+
+Two directives make that possible on top of Landlock and seccomp:
+
+| Directive | What it adds |
+|-----------|--------------|
+| `cap-drop CAP` | drops `CAP` from the bounding set, which for a root exec *is* the effective set the session inherits; one-way |
+| `mask PATH` | covers `PATH` in a private mount namespace — the only way to take away `connect(2)` to a privileged unix socket, which is not a Landlock access right |
+
+Ship `examples/limited-root.conf` and
+`compartment-bpf/profiles/limited-root-authpath.conf` together: the first
+binds the session, the second binds the inodes, and they answer different
+adversaries. Full walk-through, the sshd settings it needs and the recovery
+plan: [HOWTO.md](HOWTO.md), "Limited root over SSH". **Section 8 there is the
+complete list of what this does not protect against** — read it before
+deploying, along with the self-protection section of
+[compartment-bpf/LIMITATIONS.md](compartment-bpf/LIMITATIONS.md), which covers
+the kernel-side half of the pair. `tests/scripts/root.d/limited-root.sh`
+exercises the deployment end to end through a real sshd login, with an
+unconfined uid-0 login as the positive control.
+
 ## Requirements
 
 - Linux >= 5.13 (Landlock) — compartment-user
@@ -391,16 +598,30 @@ compartment-user.c     — Landlock + seccomp + audit (zero deps, rootless)
 compartment-root.c     — Full namespace container (zero deps, requires root)
 sandbox.sh             — Network namespace + proxy bridge
 Makefile               — Build targets
+README.md              — This file
 HOWTO.md               — Detailed setup guide
 DESIGN.md              — Architecture, security review, lineage from shell-guard
 SECURITY.md            — Vulnerability reporting policy
+LICENSE                — Apache-2.0
+.gitignore             — Build products and operational artifacts, never committed
+compartment-bpf/       — Optional BPF-LSM inode-sealing module, its own build,
+                         profiles, tests and documentation (see its README.md,
+                         HOWTO.md, LIMITATIONS.md and CHANGELOG.md)
 examples/
-  ai-agent.conf        — Profile for Claude/Codex/Gemini
+  ai-agent.conf        — Profile for AI coding assistants
   strict.conf          — Locked-down profile (inherits ai-agent)
-  container.conf       — Full namespace isolation profile
+  container.conf       — Full namespace isolation profile (compartment-root)
+  restricted-root.conf — Container with an exec allow-list and one TCP port
   dev.conf             — Relaxed profile for development
   ssh.conf             — Read-only SSH client (no filesystem writes)
   socat-proxy.conf     — Network-only socat bridge (no user file access)
+  curl-wget.conf       — HTTP(S) clients: curl, wget, aria2c
+  dns-client.conf      — DNS clients: dig, host, nslookup, drill, kdig
+  net-trace.conf       — Raw-socket diagnostics: ping, traceroute, mtr, nmap
+  tcpdump.conf         — Packet capture: tcpdump, tshark, dumpcap
+  net-admin-ro.conf    — Read-only network admin: ip, ss, nft list, iptables -L
+  tcp-udp-relay.conf   — Relay tools: socat, nc, ncat
+  dhclient.conf        — ISC DHCP client (root)
   paranoid-ssh.sh      — Privilege-separated SSH (SSH+socat split)
 tools/
   syscall.py           — Profile generator: trace any program, emit .conf
@@ -410,9 +631,18 @@ man/
   compartment-root.8   — Man page (section 8: system administration)
 tests/
   probes/deny_probe.c  — Sandbox validation probe (machine-parseable output)
-  profiles/            — Test-specific .conf profiles
-  scripts/run_all.sh   — Top-level test runner (52 tests across 4 suites)
+  profiles/            — Test-specific .conf profile templates
+  scripts/run_all.sh   — Rootless test runner (make test-integration)
+  scripts/run_root_tests.sh — Root-only test runner (sudo make test-root)
+  scripts/rootless.d/  — Discovered unprivileged suites (drop a script in)
+  scripts/root.d/      — Discovered root-only suites
   README.md            — Test documentation
+scripts/
+  timestamp.sh         — SHA256 + OpenTimestamps proof-of-existence
+extra/
+  squid-proxy/, tinyproxy/ — Optional egress-proxy helpers
+.github/workflows/
+  ci.yml               — Build, rootless + root suites, sanitizers, lint
 archive/
   shell-guard/         — Archived shell-replacement tool (~2003, self-contained)
 ```
@@ -437,7 +667,8 @@ archive/
 
 - **Firejail** (~100K lines) — closest comparison; mature profile ecosystem
   for desktop apps, but large attack surface with CVE history.
-  compartment-user is 100x smaller and auditable in one sitting.
+  compartment-user is well over an order of magnitude smaller and
+  auditable in one sitting.
 - **bwrap** (~3K lines) — mount/PID/network namespaces. Architecturally
   different (namespaces vs Landlock). Use bwrap when you need full mount
   isolation or kernel < 5.13; use compartment-user when you need profiles,
@@ -449,7 +680,8 @@ archive/
   user-deployable with no system configuration changes.
 
 No existing tool combines: zero deps, profile files with inheritance,
-shell-replacement mode, and PPID chain audit logging in ~1600 lines.
+shell-replacement mode, and PPID chain audit logging in under 4000 lines
+of C, header included.
 
 ## Related
 
@@ -464,7 +696,7 @@ This project was developed with AI assistance:
   testing, debugging, and implementation across all C source, shell scripts,
   profiles, and test infrastructure
 - **ChatGPT** (OpenAI), **Gemini** (Google), **Codex** (OpenAI) — independent
-  code review rounds that identified 18 security bugs, all fixed before release
+  code review rounds; DESIGN.md records all 61 findings and their fixes
 - **Human** — architecture, design decisions, review coordination, and final
   approval
 

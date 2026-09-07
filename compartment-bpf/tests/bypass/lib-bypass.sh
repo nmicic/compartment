@@ -13,7 +13,46 @@
 # Caller must have set REPO before sourcing.
 : "${REPO:=/root/compartment-bpf}"
 SEALPROBE="$REPO/tests/sealprobe"
-DAEMON="$REPO/compartment-bpf"
+BYPASS_REAL_DAEMON="$REPO/compartment-bpf"
+
+# ── Probe-integrity guard ───────────────────────────────────────────
+#
+# A witness that prints PASS without running anything satisfies the
+# runner's one-label-per-script invariant while asserting nothing: put
+# `bypass_pass "..."` straight after bypass_check_env in any witness here
+# and the whole suite still reports "44 PASS / 0 FAIL / 0 SKIP", rc=0.
+# Nothing in the corpus could tell the difference.
+#
+# $DAEMON is therefore a per-witness wrapper that records every
+# invocation and exec's the real loader, and bypass_pass refuses when the
+# count is zero. It is a wrapper rather than a counter the witnesses call
+# because all 39 invoke "$DAEMON" directly — foreground, backgrounded,
+# --dry-run, --pin — and none of them needs to change. exec() keeps
+# argv[0] and the pid, so $DAEMON_PID, pkill and the audit output are
+# unaffected.
+#
+# A witness that genuinely has nothing to run must call bypass_skip with
+# a reason; one that exercises the kernel without the loader (none today)
+# can declare it with bypass_evidence.
+BYPASS_WRAPDIR=$(mktemp -d /tmp/bypass-wrap.XXXXXX)
+BYPASS_RUNS="$BYPASS_WRAPDIR/daemon-runs"
+: > "$BYPASS_RUNS"
+DAEMON="$BYPASS_WRAPDIR/compartment-bpf"
+{
+	printf '#!/bin/sh\n'
+	printf 'echo run >> %s\n' "$BYPASS_RUNS"
+	printf 'exec %s "$@"\n' "$BYPASS_REAL_DAEMON"
+} > "$DAEMON"
+chmod 755 "$DAEMON"
+
+# Declare evidence that is not a loader invocation.
+bypass_evidence() {
+	echo "evidence: $*" >> "$BYPASS_RUNS"
+}
+
+bypass_evidence_count() {
+	wc -l < "$BYPASS_RUNS" 2>/dev/null | tr -d ' \t' || echo 0
+}
 
 bypass_die() {
 	echo "FAIL ${BYPASS_NAME:-?}: $*" >&2
@@ -24,6 +63,11 @@ bypass_skip() {
 	exit 77
 }
 bypass_pass() {
+	if [ "$(bypass_evidence_count)" -lt 1 ]; then
+		echo "FAIL ${BYPASS_NAME:-?}: witness reported PASS without running a probe" \
+		     "(the loader was never invoked) — claimed: $*" >&2
+		exit 1
+	fi
 	echo "PASS ${BYPASS_NAME:-?}: $*"
 	exit 0
 }
@@ -37,7 +81,7 @@ bypass_check_env() {
 	grep -qw bpf /sys/kernel/security/lsm 2>/dev/null \
 		|| bypass_skip "bpf not in active LSM"
 	[ -x "$SEALPROBE" ] || bypass_skip "sealprobe not built"
-	[ -x "$DAEMON" ]   || bypass_skip "daemon not built"
+	[ -x "$BYPASS_REAL_DAEMON" ] || bypass_skip "daemon not built"
 }
 
 # bypass_setup <flags> [extra-seal-line ...]
@@ -71,5 +115,7 @@ bypass_teardown() {
 		wait "$DAEMON_PID" 2>/dev/null || true
 	fi
 	[ -n "${TMP:-}" ] && rm -rf "$TMP"
+	[ -n "${BYPASS_WRAPDIR:-}" ] && rm -rf "$BYPASS_WRAPDIR"
+	return 0
 }
 trap bypass_teardown EXIT INT TERM

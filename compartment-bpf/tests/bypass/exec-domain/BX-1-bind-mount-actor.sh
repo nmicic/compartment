@@ -25,8 +25,16 @@ ed_setup_actor_seal myactor "$ACTOR" "no-write"
 # ino) is unaffected (it captured the original inode). Any exec via the
 # ACTOR path now runs DECOY's bytes; the running process's mm->exe_file
 # is the DECOY inode.
-mount --bind "$DECOY" "$ACTOR" 2>/dev/null \
-	|| bypass_skip "bind-mount of regular file failed (need privileged mount)"
+if ! mount --bind "$DECOY" "$ACTOR" 2>/dev/null; then
+	# v0.8: comp_sb_mount denies a mount ON a sealed inode, and the actor
+	# binary is sealed `full` by ed_setup_actor_seal. The decoy can no
+	# longer be staged at all — the bypass is refused one layer earlier
+	# than the actor check this witness was written for.
+	if ed_mount_denied_by_compartment; then
+		bypass_pass "bind-mount-over-actor refused at the mount itself (DENY_MOUNT audited); the decoy cannot be staged, so the actor-inode check is never even reached"
+	fi
+	bypass_skip "bind-mount of regular file failed (need privileged mount)"
+fi
 
 # Ensure we umount on every exit path — runs before lib-bypass.sh's
 # teardown so $DAEMON gets killed cleanly with no live bind-mount.

@@ -27,6 +27,19 @@ and unknown flags are fatal at load time. `oracle.conf` is the
 minimal worked example; the per-daemon profiles under `profiles/`
 are richer examples.
 
+`no-chmod` covers every inode-metadata write path the kernel exposes:
+`chmod`/`chown` (`inode_setattr`), xattrs, POSIX ACLs
+(`inode_set_acl` / `inode_remove_acl` — a separate hook since Linux 6.2,
+covered from v0.8), inode-flag ioctls such as `chattr +i/+a`
+(`file_ioctl`, v0.8) and explicit timestamp changes (`touch -d`,
+`utimensat`; v0.8). Truncation remains write-class (`no-write`). Any
+seal flag also refuses new mounts on or under the sealed path
+(`sb_mount` / `move_mount`, v0.8) so the path cannot be shadowed, and
+refuses to let the filesystem hosting the sealed path be detached or moved
+away from under it (`sb_umount`, v0.8). Note the operational consequence:
+while a policy is loaded, `umount` of a filesystem holding sealed paths is
+denied — run `compartment-bpf --unpin` first.
+
 The loader resolves paths once at load time via
 `open(O_PATH | O_NOFOLLOW)` + `fstat`, then keys the seal by
 `(dev, ino)`. A symlink at the leaf is refused with a clear message;
@@ -112,10 +125,13 @@ forgeable.
 
 ### 2.3 Hook-side semantics (ED-4 / ED-6)
 
-At each of the 21 LSM hooks `compartment.bpf.c` attaches (the 16
-file/inode/path hooks of v0.3 plus `task_alloc`, `task_prctl`,
-`ptrace_access_check`, `ptrace_traceme`, and the sleepable
-`bprm_check_security` added by v0.4 strict-launch),
+At each of the 28 LSM hooks `compartment.bpf.c` attaches (the 16
+file/inode/path hooks of v0.3; the five v0.4 strict-launch hooks
+`bprm_committed_creds`, `task_alloc`, `task_prctl`,
+`ptrace_access_check`, `ptrace_traceme`; and the seven v0.8
+metadata/mount hooks `inode_set_acl`, `inode_remove_acl`,
+`file_ioctl`, `file_ioctl_compat`, `sb_mount`, `sb_umount`,
+`move_mount`),
 after the
 existing seal+flag check passes the kernel runs an actor match
 against `current->mm->exe_file`'s `(dev, ino)`. On mismatch the
@@ -158,7 +174,7 @@ seal /var/lib/aide/aide.db no-write actor=aide strict-launch
 - the launcher path and the target path are both sealed `full` in
   the same profile;
 - env policy is the wrapper's responsibility, not the loader's
-  see §4.1 below). The 16
+  see §4.1 below). The 68
   dangerous dynamic-loader/interpreter env names are rejected by the
   wrapper at build time via the shared
   `tools/compartment-dangerous-env.h` table.
@@ -173,8 +189,10 @@ The `strict-launch` flag on a seal turns on the in-kernel marker
 check. A protected file operation on such a seal requires:
 
 1. existing actor= inode check (v0.3 binding) — and
-2. a valid task-storage marker (`bprm_check_security` sets one when
-   the task exec'd the sealed launcher), and
+2. a valid task-storage marker (`bprm_committed_creds` sets one once an
+   exec of the sealed launcher has *committed*; v0.8 moved this off
+   `bprm_check_security`, which runs before the point of no return and
+   left a marker behind when the exec failed afterwards), and
 3. the marker's target inode equals the current task's exe inode, and
 4. the marker's actor_slot matches the seal's strict_actor_slot, and
 5. the marker's policy_generation equals the loaded generation.
@@ -386,14 +404,25 @@ on x86_64) + `sodium_mlock` on every passphrase buffer + dual-
 channel audit (stderr + syslog `LOG_AUTHPRIV`) on
 `DENY_UNPIN_AUTH_FAIL` + an ABI-versioned action code
 (`ACTION_DENY_UNPIN_AUTH_FAIL = 7`, stable since ABI v0.3 and
-unchanged through the current v0.5 ABI). That is a
+unchanged through the current v0.8 ABI). That is a
 credential-gate-grade build, not the "speed bump" wording the
 v0 brief originally used. The honest threat-model framing:
 
 * **Against an attacker with CAP_BPF / CAP_SYS_ADMIN on the box,**
   this gate is bypassable — they own the sentinel file, the bpffs
-  pin tree, and can `bpftool prog detach`. The recovery path in
-  §3.4 documents this directly.
+  pin tree, and can `unlink()` the link pins (note `bpf(BPF_LINK_DETACH)`
+  does not work on an LSM link — it returns `-EOPNOTSUPP`; the pin tree is
+  the surface). The recovery path in
+  §3.4 documents this directly. They can also rewrite the policy maps
+  without touching the pin tree at all: `freeze_seal_maps()` calls
+  `bpf_map_freeze()` after load, but freeze gates only the **syscall**
+  path. Measured on 6.8.0-139 and 7.0.0-31, a `CAP_BPF` caller that
+  obtains any fd to a frozen compartment map — `BPF_F_RDONLY` is enough
+  — can splice it into a BPF program of its own and write it from
+  program context, so wiping `sealed_inodes` removes policy with no
+  unlink, no umount and no audit event. Do not read the freeze as map
+  integrity; it is not, and the `CAP_BPF + direct map mutation` row in
+  `LIMITATIONS.md` carries the measurement.
 * **Against a non-CAP_BPF-restricted root attacker** (an
   unconfined process running as uid 0 but without CAP_BPF /
   CAP_SYS_ADMIN — e.g. a setuid binary, a confined container
@@ -516,6 +545,232 @@ continue to work without the passphrase opt-in.
 
 ---
 
+### 3.6 Self-protection (`--self-protect`) and the upgrade ceremony
+
+`--self-protect` is opt-in, off by default, and only meaningful with `--pin`.
+It answers a different question from the unpin passphrase. The passphrase asks
+*"does the operator running `--unpin` know the secret?"*. `--self-protect` asks
+*"is this even the loader?"* — and it is enforced in the kernel, so it also
+covers the paths that never call `--unpin` at all: `rm` of a pin, `umount` of
+the bpffs, and `bpf(BPF_MAP_GET_FD_BY_ID)` on the seal maps.
+
+```sh
+export COMPARTMENT_BPF_PASSPHRASE='<high-entropy-string>'
+sudo -E /usr/sbin/compartment-bpf --pin --self-protect profiles/aide.conf
+```
+
+What it refuses, for every task whose `mm->exe_file` is not an authorised
+loader image — measured identically on 6.8.0-139 and 7.0.0-31:
+
+* any fd to a compartment BPF map — read-only included, because a read-only fd
+  is enough to write the map from a BPF program (`bpf_map_freeze()` gates only
+  the syscall path);
+* `unlink`, `rename` and `rmdir` of the pin objects, the two pin directories,
+  `/sys/fs/bpf/compartment` and the bpffs mount root;
+* mounting a second bpffs over any of those (`move_mount(2)` included).
+
+And one thing it refuses to **everyone**, the loader included:
+
+* `umount` (and `umount -l`) of the bpffs holding the pins. There is no
+  loader exemption here on purpose — the loader has no reason to detach that
+  filesystem, and it is the same rule v0.8 already applies to a filesystem
+  holding sealed paths: you `--unpin` first, then unmount. The audit line is
+  `DENY_UMOUNT`, not `DENY_PIN_TAMPER`.
+
+Two prerequisites, both enforced at pin time with a clear refusal:
+
+1. The kernel must have `bpf_lsm_bpf_map` (it does on 6.8 and 7.0). Without it
+   the loader refuses to start rather than claim protection it does not have.
+2. The loader binary must be root-owned and **not** group- or world-writable.
+   A group-writable maintenance binary means the maintenance right belongs to
+   that group, not to root. Install it `root:root 0755`; a binary sitting in a
+   build tree usually is not.
+
+Without the flag, nothing changes: the `comp_bpf_map` program is not even
+loaded, the pin set is the same 28 links v0.8 pinned, and both new counters
+stay 0.
+
+That default is a real exposure and not a neutral one, which is the reason
+this flag exists. **With the flag off, `bpf_map_freeze()` is not map
+integrity.** Freezing gates the *syscall* path only, so a `CAP_BPF` holder
+that obtains any fd to a frozen compartment map — `BPF_F_RDONLY` is enough —
+splices it into a BPF program of its own with `bpf_map__reuse_fd()` and
+writes it from *program* context: measured on both kernels, the syscall write
+stays `EPERM`, the program write returns 0 and the value reads back. Wiping
+the seal entries that way removes policy with no unlink, no umount and no
+audit event at all. So on a default build the load-bearing control is not the
+freeze — it is keeping `CAP_BPF` off every workload and every root login.
+`tests/bypass/26-frozen-map-honesty.sh` re-measures the gap on every run.
+
+#### The errno an operator sees
+
+All five lines below are the verbatim text measured on 6.8.0-139 and
+7.0.0-31 with bpftool 7.4 and 7.7.
+
+| operation, refused | errno | what it looks like |
+|---|---|---|
+| any `bpf()` that would hand out a map fd (`BPF_MAP_GET_FD_BY_ID`, `BPF_OBJ_GET` on a pin) | `EPERM` | `Error: can't get map by id (N): Operation not permitted` |
+| `rm` / `mv` / `rmdir` on a pin object or pin directory | `EACCES` | `rm: cannot remove '/sys/fs/bpf/compartment/links/comp_file_open': Permission denied` |
+| `umount` / over-mount of the bpffs holding the pins | `EACCES` | `umount: /sys/fs/bpf: block devices are not permitted on filesystem.` — util-linux's rendering of `EACCES` from `umount2(2)`, which is unhelpful but is not ours to change; the audit stream carries `DENY_UMOUNT` |
+| `--unpin` from an unauthorised image | `EACCES` on the first pin | `unlinkat /sys/fs/bpf/compartment/links/comp_bpf_map: Permission denied`, then the paragraph below |
+| `--stats` from an unauthorised image | `EPERM` | `open pinned /sys/fs/bpf/compartment/maps/deny_total: Operation not permitted`, then one paragraph naming the remedy — printed once, not once per counter, and never as "no pinned counters found" |
+
+`EPERM` on the `bpf()` side is that syscall's own dialect: `bpf(2)` reports
+every "you do not have the right to this object" as `EPERM`, including
+`BPF_MAP_GET_FD_BY_ID` without `CAP_BPF`, so tools have an `EPERM` path and no
+`EACCES` path. `EACCES` on the path side is what every other compartment deny
+returns and what `rm`, `mv` and `umount` print. `ENOENT` was measured as an
+alternative — it makes `bpftool map show` skip our maps and exit 0 — and
+rejected: it disguises a security decision as a missing object, and it makes an
+unauthorised `--stats` print "no pinned counters found", which an operator
+cannot tell from "no policy is pinned".
+
+#### Identity, and why a rebuild matters
+
+The maintenance right is the `(dev, ino)` of an executable image — the same
+identity the `actor=` allowlist uses, for the same reason: `--pin`, `--unpin`
+and `--stats` are three different processes running the same binary.
+
+The set is fixed when the policy is pinned and frozen. The loader deliberately
+cannot extend it afterwards: if it could, anything that can make the loader run
+one more time could widen it.
+
+**A rebuild or a package upgrade replaces the binary and therefore its inode.
+The new binary is a different image and cannot unpin the old policy.** This is
+the whole cost of the feature. There are two supported ceremonies:
+
+```sh
+# (a) the normal one — unpin before you replace the binary
+sudo -E /usr/sbin/compartment-bpf --unpin
+sudo apt install ./compartment-bpf_amd64.deb           # or: make && make install
+sudo -E /usr/sbin/compartment-bpf --pin --self-protect profiles/aide.conf
+
+# (b) pre-authorise the successor, if you need zero policy gap
+sudo -E /usr/sbin/compartment-bpf --pin --self-protect \
+        --authorize-loader /usr/sbin/compartment-bpf.next profiles/aide.conf
+# ...later, the successor can take the old policy down:
+sudo -E /usr/sbin/compartment-bpf.next --unpin
+```
+
+`--authorize-loader` resolves the path to `(dev, ino)` at pin time. Replacing
+the file afterwards does **not** carry the authorisation over — that is the
+point. At most 8 images in total, including the pinning one.
+
+**The rule, in one line: unpin before upgrading the loader, or authorize the
+new binary at pin time; a stranded tree costs a reboot.**
+
+#### If you strand yourself
+
+Running `--unpin` from an unauthorised image fails loudly and tells you so:
+
+```
+unlinkat /sys/fs/bpf/compartment/links/comp_bpf_map: Permission denied
+unpin: the running policy was pinned with --self-protect and this
+       executable is not in its authorised loader set, so the kernel
+       refused to remove the pin (ACTION_DENY_PIN_TAMPER in the audit
+       stream). Run --unpin from the binary image that pinned it, or
+       from one authorised with --authorize-loader at pin time. If that
+       image no longer exists (rebuild, package upgrade), the pin tree
+       can only be cleared by rebooting: bpffs is not persistent.
+```
+
+The escape hatch is a reboot, and the worst case is bounded by it: bpffs is
+memory-backed, so the pin tree and every attached program are gone after a
+restart. That is the same reboot an unconfined root can perform anyway, which
+is why stranding is no worse than the residual risk the threat model already
+accepts — but it *is* a reboot, so treat `--self-protect` on a host you cannot
+restart as a decision, not a default.
+
+**On a build host, do not `--pin --self-protect` and then rebuild.** `make`
+relinks `compartment-bpf` into a fresh inode on every invocation (`vmlinux.h`
+depends on the `.PHONY` `check-env` target), so `sudo make check` after a
+self-protected `--pin` leaves a tree that only a reboot can clear.
+
+#### What it costs
+
+`bpftool map show` — the host-wide listing, not just ours — aborts at the first
+compartment map (`Error: can't get map by id (N): Operation not permitted`,
+exit 255) instead of skipping it, so maps *after* ours in id order are not
+listed either. This affects the whole host while a self-protected policy is
+live, and it is the single most visible cost of the feature.
+
+Unaffected: `bpftool prog show`, `bpftool link show`, `bpftool cgroup tree`,
+`bpftool map show id <N>` for a specific non-compartment id, and creating,
+writing, dumping, pinning and unlinking unrelated maps and pins. Use
+`compartment-bpf --stats` — run from an authorised loader image, which is the
+same executable — for this tool's own counters.
+
+Read-only map access is **not** carved out for `--stats` or `bpftool map dump`.
+It was considered and rejected on measurement: a read-only fd is a complete
+attack, because a map spliced into a BPF program with `bpf_map__reuse_fd()` is
+writable from program context regardless of `bpf_map_freeze()`. A read-only
+carve-out would have left every seal map mutable and the gate decorative.
+
+Runtime: the gate sits on `bpf_map_new_fd()`, so it costs something on every
+map fd the kernel hands out, to anything on the box. Measured with
+`make bench-bpf-syscall` (median of seven 200 000-call runs of
+`BPF_MAP_GET_FD_BY_ID` + `close`, the thinnest syscall that reaches the hook):
+
+| kernel | no policy | `--pin` | `--pin --self-protect` |
+|---|---|---|---|
+| 6.8.0-139 | 1450–1452 ns | −0.3 % to +0.4 % | **+9 % to +17 %** (+128 to +252 ns) |
+| 7.0.0-31 | 1148–1153 ns | +0.1 % to +0.5 % | **+11 % to +13 %** (+121 to +144 ns) |
+
+Without the flag the cost is nil, because `comp_bpf_map` is not even loaded —
+every run lands within the noise of the no-policy baseline. With it, budget of
+order 100–250 ns per map-fd creation; the range is the guest, not the hook (7.0
+reproduced to within 23 ns across three runs, 6.8 spread across three). The
+percentage is the less stable half of the pair, because it moves with whatever
+else the guest is doing to the baseline: the release-candidate run measured
++127.7 ns on 6.8 against a 1449.6 ns baseline and called it +8.8 %, and
++143.5 ns on 7.0 against 1148.7 ns and called it +12.5 %. Read the nanoseconds. If you
+have a latency budget on `bpf(2)`, measure it on your own hardware. Nothing on
+the file or inode data plane changes either way: the pin-tamper branch costs
+one array lookup and one integer compare on any filesystem that is not the
+bpffs holding the pins.
+
+#### What it does not close
+
+Six residuals, in the order an operator meets them. `LIMITATIONS.md`'s
+self-protection section carries the full table, including two adjacent
+upstream gaps (`mount --move` of the pin bpffs, and the unpin sentinel not
+being a bpffs object).
+
+1. **A reboot with `lsm=` changed, or `kexec`.** bpffs is not persistent and
+   the BPF LSM is only in the chain because the kernel command line put it
+   there. Root can come back with no compartment at all, and nothing enforced
+   from inside a running kernel survives that. Secure Boot plus a signed,
+   locked bootloader is the answer and it is outside this tool; compartment's
+   contribution is that the change is not silent.
+2. **A map fd stolen from a *running* loader.** `pidfd_getfd(2)` and
+   `SCM_RIGHTS` clone an existing fd without calling `bpf_map_new_fd()`, so
+   `comp_bpf_map` never sees them. Both need `PTRACE_MODE_ATTACH` on the
+   loader, and in daemonless `--pin` mode there is no loader process to
+   attach to. `lsm/file_receive` would close the `SCM_RIGHTS` half.
+3. **A stranded pin tree** after an unauthorised loader change. Bounded by a
+   reboot, and avoided by one of the two ceremonies above: `--unpin` before
+   replacing the binary, or `--authorize-loader` at pin time.
+4. **`bpftool map show` aborts host-wide** at the first compartment map while
+   the flag is on. Accepted cost; the upstream fix worth proposing is one
+   line in bpftool — `continue` on `EPERM`/`EACCES` in its map-listing loop.
+5. **Mount-namespace reachability.** An operator can be in a namespace that
+   cannot see the pin tree while enforcement is live. `--unpin` warns instead
+   of reporting success, but cannot fix it; recovery is `nsenter` into the
+   namespace holding the bpffs, or a reboot.
+6. **`CAP_BPF` itself.** This flag raises the cost of using the capability
+   against this tool; it does not take the capability off the box.
+
+That last one is the limited-root profile's job, and the two controls
+compose: `--self-protect` puts the maps and the pin tree behind the loader's
+binary identity for every caller, while a limited-root deployment takes
+`CAP_BPF` away from a confined uid-0 session and makes it the only route to
+the seals. **Neither replaces the other.** The complete list of what the
+session-side control does not protect against is the top-level `HOWTO.md`,
+"Limited root over SSH", section 8; `LIMITATIONS.md` has the measurement
+behind the read-only decision and the full residual table for this side.
+
+---
+
 ## 4. Counters and audit (operator surface)
 
 `compartment-bpf --stats` prints the v0.3 baseline counters and (since
@@ -533,13 +788,28 @@ ABI v0.4) the strict-launch-marker counters:
 |--------------------------------------|-----------------------------------------------------------------------------------------------|
 | `strict_launch_missing_total`        | file-op denies emitted by `strict_launch_check_or_deny` (any failure mode)                    |
 | `strict_launch_allowed_total`        | file-op operations passed by `strict_launch_check_or_deny` (positive observability)           |
-| `marker_set_total`                   | tasks marker'd by `bprm_check_security` on sealed-launcher exec                              |
+| `marker_set_total`                   | tasks marker'd by `bprm_committed_creds` on a committed sealed-launcher exec                 |
+| `marker_set_fail_total`              | committed sealed-launcher execs whose task-storage marker could not be allocated (fail-closed; expect 0) |
 | `marker_clear_foreign_exec_total`    | tasks whose marker was cleared on a foreign exec (chain break — visibility signal)            |
 | `marker_copy_fork_total`             | child tasks that inherited a parent marker via `task_alloc` (G6 Outcome B)                    |
 | `marker_stale_generation_total`      | denies whose root cause was generation mismatch (always 0 in v0.4 fresh-load-only; see §3a)  |
 | `prctl_set_mm_exe_file_denied_total` | `PR_SET_MM` denies emitted by `task_prctl` while strict mode is loaded (gates ALL `PR_SET_MM` sub-ops — see note below)               |
 | `ptrace_access_denied_total`         | denies emitted by `ptrace_access_check` (strace, process_vm_writev, pidfd_getfd, /proc/mem)   |
 | `ptrace_traceme_denied_total`        | denies emitted by `ptrace_traceme` (a marked actor calling PTRACE_TRACEME)                    |
+
+### Self-protection counters (`--self-protect` only)
+
+| counter                     | meaning                                                                                          |
+|-----------------------------|--------------------------------------------------------------------------------------------------|
+| `bpf_self_denied_total`     | map-fd requests refused by `comp_bpf_map` for a task that is not an authorised loader image (read-only requests included) |
+| `pin_tamper_denied_total`   | unlink / rename / rmdir / mount attempts on this policy's own bpffs pins, refused for a non-loader |
+
+Both stay 0 unless the policy was pinned with `--self-protect` (without the
+flag `comp_bpf_map` is not loaded at all). `bpf_self_denied_total` picking up a
+small non-zero value is normal on a box where something enumerates BPF map ids
+— `bpftool map show` does. A **sustained** non-zero `pin_tamper_denied_total`
+is the one to alert on: it means something is actively trying to take
+enforcement off.
 
 `audit_drop_total > 0` means the ringbuf consumer fell behind and
 events were dropped — investigate before trusting the audit log
@@ -574,7 +844,7 @@ in profiles. Env policy is the wrapper's responsibility:
    one or more times to add specific variable names to the wrapper's
    allowlist; only those names survive the clearenv-then-allowlist
    filter at runtime.
-3. The 16 dangerous dynamic-loader / interpreter names
+3. The 68 dangerous dynamic-loader / interpreter names
    (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, GLIBC_TUNABLES, GCONV_PATH,
    LOCPATH, NLSPATH, BASH_ENV, ENV, PYTHONPATH, PYTHONSTARTUP,
    PERL5LIB, PERL5OPT, RUBYLIB, RUBYOPT, NODE_OPTIONS) are
@@ -616,16 +886,18 @@ sudo ./compartment-bpf observe --actor aide=/usr/sbin/aide \
 ```
 
 - `--actor NAME=PATH` registers an actor by inode. Repeatable for multi-binary
-  actors. At least one actor (or `--pid`) is required.
-- `--pid PID` seeds from an already-running process instead of spawning one.
+  actors. At least one actor is required.
+- `--pid PID` is **reserved and not implemented** — passing it exits with
+  status 2. Seed from a spawned command instead.
 - `-- COMMAND [ARGS...]` spawns the command and stops observation when it exits
   (or after `--duration` seconds, whichever comes first).
 - `--duration N` sets a hard timeout in seconds; omit to run until SIGINT.
 - `--format profile|compact|jsonl|audit` selects the output format
   (default: `profile`).
 - `--verbose` adds parent chain, dev/ino, and cgroup to each record.
-- `--include-stat` records stat/metadata activity. Off by default because it
-  can saturate maps on busy hosts.
+- `--include-stat` is **reserved and not implemented** — passing it exits
+  with status 2. It is intended to record stat/metadata activity, which is
+  off by default because it can saturate maps on busy hosts.
 - `--no-resolve-paths` emits raw dev/ino only; skips path resolution.
 - `--no-dir-dest` forces per-file fallback rules (testing/compat path).
 - `-o PATH` writes output to PATH (`-` for explicit stdout; default: stdout).
@@ -739,13 +1011,28 @@ without enumerating every file, while keeping the model fail-closed.
 
 ### 7.1 What a dir-destination seal does
 
-`deny_file_write()` (LSM `file_open` / `file_truncate`) and
-`deny_file_chmod()` (`path_chmod`) call both `deny_inode_action()`
-(for the file's own inode seal — the v0.3 behavior) AND
-`deny_file_parent_dir_action()` (for the parent inode's
-`ACTION_DENY_WRITE_PARENT_DIR=9` / `ACTION_DENY_CHMOD_PARENT_DIR=10`).
-A non-actor write or chmod against any immediate child of a
-DD-sealed dir is denied even if the child has no per-file seal.
+Every hook that can mutate a file calls **both** `deny_inode_action()`
+(the file's own inode seal — the v0.3 behaviour) and one of
+`deny_file_parent_dir_action()` / `deny_dentry_parent_dir_action()` (the
+covering directory's seal, emitting `ACTION_DENY_WRITE_PARENT_DIR=9` or
+`ACTION_DENY_CHMOD_PARENT_DIR=10`). A non-actor write or metadata change
+against a child of a DD-sealed dir is denied even if the child has no
+per-file seal.
+
+The write-class hooks are `file_open`, `file_permission` and
+`file_truncate`. The chmod-class hooks — what `no-chmod` actually covers —
+are:
+
+| hook | denies |
+|------|--------|
+| `inode_setattr` | `chmod`, `chown`, and (v0.8) explicit timestamp writes: `ATTR_ATIME\|ATTR_MTIME` without `ATTR_SIZE`, i.e. `touch` / `touch -d` / `touch -a` / `utimensat(2)`. `ATTR_SIZE` is excluded so truncation stays write-class. |
+| `inode_setxattr` / `inode_removexattr` | extended-attribute writes |
+| `inode_set_acl` / `inode_remove_acl` (v0.8) | POSIX ACL writes (`setfacl -m/-x/-b`). Since Linux 6.2 these are routed by `vfs_set_acl()` / `vfs_remove_acl()` and never reach the xattr hooks. |
+| `file_ioctl` + `file_ioctl_compat` (v0.8) | `FS_IOC_SETFLAGS` / `FS_IOC32_SETFLAGS` / `FS_IOC_FSSETXATTR` / `FS_IOC_SETVERSION` — `chattr +i/+a`, project ids. Both the native and the 32-bit compat ioctl entry points are separate LSM hooks in the kernel, so both are attached. |
+
+(There is no `path_chmod` program and no `deny_file_chmod()` helper; earlier
+revisions of this section named symbols that do not exist in
+`compartment.bpf.c`.)
 
 ### 7.2 Syntax
 
@@ -812,7 +1099,8 @@ at load time.
 
 ### 7.4 Version requirement
 
-The runtime kernel module must be at ABI v0.5 or higher.
+The runtime kernel module must be at ABI v0.5 or higher. The current ABI
+is v0.8 (`0x0008`).
 
 `compartment-bpf observe` calls `detect_runtime_abi()`, which since
 v0.6 reads the exact runtime ABI from `PIN_ROOT/maps/abi_version_map`
@@ -822,8 +1110,8 @@ returned value is in the supported range (`0x0004` ≤ abi ≤ the
 compile-time `COMPARTMENT_ABI_VERSION`), it is used verbatim.
 
 `seal_value` is **96 bytes** in v0.5 and remains 96 bytes through
-v0.7 (ABI v0.6 and v0.7 introduce new behaviour and new audit
-actions without changing the on-wire struct layout; the ABI header's
+v0.8 (ABI v0.6, v0.7 and v0.8 introduce new behaviour, new audit
+actions and new hooks without changing the on-wire struct layout; the ABI header's
 `_Static_assert(sizeof(struct seal_value) == 96, ...)` is the
 authoritative size). The earlier
 `seal_value` size probe (96-byte v0.4/v0.5 vs newer) is no longer
@@ -882,7 +1170,7 @@ attach→pin→exit sequence.
 ### 9.2 Running
 
 ```bash
-# Quick smoke (64 cycles, ~5 min):
+# Quick smoke (64 cycles, ~1-2 min):
 make check-stability-quick
 
 # Full run (1024 cycles, ~45-60 min):
@@ -899,6 +1187,36 @@ All stability tests require root (for `--pin`/`--unpin`, dmesg access,
 and bpffs cleanup). The harness `stab_skip`s with rc=77 on hosts
 without root or BPF LSM, matching the project SKIP convention.
 
+Two things the harness now does for you, because getting them wrong
+produced a run that looked healthy and tested nothing:
+
+* **It drives `--pin` the way the loader actually behaves.** `--pin`
+  does not daemonise, fork or detach, and there is no
+  `--daemonize`/`--background` flag: it attaches, writes the pins under
+  `PIN_ROOT`, prints `[run] compartment-bpf live. ^C to exit.` and then
+  blocks in the ringbuf poll loop. The pins outlive the process — that
+  is the point — so each cycle starts it, waits for the pins to appear
+  on bpffs, then signals and reaps it. The old harness waited for
+  `--pin` to *exit* and declared a hang at cycle 0 of 64 on a perfectly
+  healthy box.
+* **It renders the profile against a real binary.**
+  `tests/stability/baseline-profile{,-b}.conf` are templates:
+  `@STAB_ACTOR@` / `@STAB_ACTOR_B@` are substituted with a purpose-built
+  regular-file ELF (`tests/lib-realbin.sh`). They used to name
+  `/usr/bin/true` and `/usr/bin/false`, which are symlinks on any distro
+  shipping uutils coreutils (Ubuntu 26.04); the loader refuses a symlink
+  leaf, so every seal failed to resolve and all 64 cycles pinned nothing
+  while the run still reported the churn as healthy. T-STAB-8 now fails
+  the run unless every cycle observed a live pin.
+
+Loop B runs `tests/mesh/run-mesh.sh` concurrently, and its ME-10 phase
+pins a daemon to read counter deltas back through `--stats`. `PIN_ROOT`
+is one global namespace and `--unpin` sweeps all of it, so both sides
+take the advisory mutex in `tests/lib-pinlock.sh` around their pinned
+window. Without it, the churn deleted the maps ME-10 was measuring and
+the run failed with `deny_total-delta(exp=1,got=0)` rows that had
+nothing to do with enforcement.
+
 ### 9.3 Acceptance criteria
 
 | ID | Check | Gate |
@@ -909,7 +1227,8 @@ without root or BPF LSM, matching the project SKIP convention.
 | T-STAB-4 | Mesh trials ≥ 99% pass-rate during churn | FAIL |
 | T-STAB-5 | All 10 corner-case witnesses pass or documented-skip | FAIL on any FAIL |
 | T-STAB-6 | No stuck-state (D-state survivor, mesh outer timeout) | FAIL |
-| T-STAB-7 | BPF prog/map counts return to baseline (±4) | FAIL |
+| T-STAB-7 | BPF prog/map counts return to baseline (±4) — the harness prints this assertion under the `T-STAB-4` label, alongside the mesh aggregate | FAIL |
+| T-STAB-8 | Every churn cycle observed a live pin under `PIN_ROOT/links` | FAIL |
 
 ### 9.4 Failure handling
 

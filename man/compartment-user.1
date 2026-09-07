@@ -1,6 +1,6 @@
 .\" Copyright (c) 2026 Nenad Mićić <nenad@micic.be>
 .\" SPDX-License-Identifier: Apache-2.0
-.TH COMPARTMENT-USER 1 "June 2026" "compartment 1.3.3" "User Commands"
+.TH COMPARTMENT-USER 1 "September 2026" "compartment 1.4.0" "User Commands"
 .SH NAME
 compartment-user \- userspace process isolation with Landlock, seccomp, and environment sanitization
 .SH SYNOPSIS
@@ -11,24 +11,52 @@ compartment-user \- userspace process isolation with Landlock, seccomp, and envi
 applies kernel-enforced restrictions to a process before executing it.
 No root required. Zero dependencies.
 .PP
-Restrictions are applied in order and are all inherited by child processes:
-.IP 1. 4
+Three of the mechanisms are enforced by the kernel. Once set they are
+inherited across
+.BR fork (2)
+and
+.BR execve (2)
+and cannot be removed by the sandboxed process or any of its descendants:
+.IP \(bu 4
 .B PR_SET_NO_NEW_PRIVS
 \- prevents privilege escalation via setuid binaries.
-.IP 2.
+.IP \(bu
 .B Landlock
 \- filesystem path restrictions (read-only system paths, writable working directory).
-.IP 3.
+.IP \(bu
 .B seccomp BPF
 \- blocks dangerous syscalls (ptrace, mount, bpf, io_uring, etc.).
-.IP 4.
-.B Environment sanitization
-\- strips LD_PRELOAD, cloud credentials, SSH agent socket, etc.
-.IP 5.
-.B Audit logging
-\- file-per-day log with PPID chain and user identity.
 .PP
-All restrictions are irreversible \(em a sandboxed process cannot remove them.
+The rest is applied once, immediately before
+.BR execve (2),
+and is
+.B not
+a kernel restriction:
+.IP \(bu 4
+.B Environment sanitization
+\- strips LD_PRELOAD, cloud credentials, SSH agent socket, etc. from the
+environment handed to the command.
+A sandboxed process may re-export any of these variables for its own
+children, and the loader will honour them; nothing in the kernel prevents
+that.
+Durable environment policy needs
+.BR compartment-bpf .
+.IP \(bu
+.B Working directory
+and
+.B file-descriptor cleanup
+\- both are one-time actions, not ongoing restrictions.
+.IP \(bu
+.B Audit logging
+\- a record, not a restriction. File-per-day log with PPID chain and
+user identity.
+.PP
+The actual order at run time is: audit log opened, preflight check,
+.BR PR_SET_NO_NEW_PRIVS ,
+environment sanitization, Landlock, seccomp,
+.BR chdir (2),
+hardening,
+.BR execve (2).
 .SH OPTIONS
 .SS Profiles
 .TP
@@ -39,36 +67,353 @@ Built-in profiles:
 .BR strict ", "
 .BR none .
 File search order:
-.IR ~/.config/compartment/NAME.conf ,
-.IR /etc/compartment/NAME.conf .
+.IR /etc/compartment/NAME.conf ,
+then
+.I ~/.config/compartment/NAME.conf
+but only with
+.BR \-\-user\-profiles .
 An explicit file path (containing \fB/\fR) loads directly.
+Every profile file must be a regular file owned by root or by the real uid of
+the caller, must not be group- or world-writable, and its containing directory
+must satisfy the same conditions.
+A profile that exists but does not parse is fatal; the built-in is used only
+when no file was found.
+.TP
+.B \-\-user\-profiles
+Also search
+.I ~/.config/compartment/NAME.conf
+for profiles.
+Off by default: the sandboxed process usually has write access to
+.IR $HOME ,
+so a profile found there could switch its own sandbox off.
+Never honoured in shell-replacement mode.
 .SS "Filesystem (Landlock)"
+.PP
+The built-in profiles add
+.I $HOME
+as a read-write-execute Landlock root.
+.I $HOME
+must therefore be an absolute path, must not be
+.IR / ,
+and must name an existing directory owned by the real uid of the caller;
+compartment-user refuses to start otherwise.
+The same applies to
+.I $HOME
+expanded inside a profile value.
+.PP
+A rule may name a directory or a single file.
+A rule that names a file carries only the file-level rights
+(execute, read, write, truncate, device ioctl); the directory-only rights
+are dropped, which is what makes
+.B \-\-rw
+.I /dev/null
+and
+.B \-\-exec
+.I /usr/bin/psql
+meaningful.
+.PP
+A rule for a path that does not exist is a
+.B fatal error:
+it would grant nothing, and a policy that believes otherwise is worse than
+one that refuses to start.
+Append
+.B ?
+to the path to make the rule optional
+.RI ( "\-\-ro /lib32?" ):
+it is then skipped, with a note under
+.BR \-\-verbose ,
+when the path is absent.
+.PP
+Landlock is
+.B additive:
+the rights of every rule matching an ancestor of the path being opened are
+unioned, so a narrower rule never restricts a wider one.
+A
+.B ro
+rule whose path lies inside a
+.B rw
+or
+.B rwx
+rule cannot take anything away and is refused; split the writable rules
+instead.
+An
+.B exec
+rule inside a
+.B rw
+rule is allowed, because it genuinely adds a right.
 .TP
 .BI \-\-ro " PATH"
-Grant read-only + execute access to \fIPATH\fR.
+Grant read-only + execute access to \fIPATH\fR and everything beneath it.
 .TP
 .BI \-\-rw " PATH"
-Grant read-write + execute access to \fIPATH\fR.
+Grant read-write access to \fIPATH\fR.
+Execute is deliberately
+.B not
+granted: compartment-user enforces W^X, so a directory that a program can
+write to is never a directory it can execute from.
+Use
+.B \-\-exec
+(or
+.BR \-\-ro )
+for execute access, and note that a path listed both \fB\-\-rw\fR and
+\fB\-\-exec\fR ends up read-write-execute, because Landlock rules are
+additive.
 .TP
 .BI \-\-exec " PATH"
-Grant read + execute access (alias for \fB\-\-ro\fR).
+Grant read + execute access to \fIPATH\fR.
+On a directory this is the same set of rights as
+.BR \-\-ro .
+On a
+.I file
+it is a per-binary execute grant: a policy that names individual files with
+.B \-\-exec
+and grants execute on no directory is an allow-list of binaries.
+Two caveats decide whether that works.
+The dynamic loader must be listed as well, because
+.BR execve (2)
+opens the ELF interpreter with
+.B FMODE_EXEC
+and Landlock checks the execute right on it.
+Shared libraries must
+.I not
+be: the loader opens them read-only and Landlock has no mmap hook, so read
+access to the library directory is enough \(em and
+.B \-\-rw
+is the more precise choice there, since
+.B \-\-ro
+grants execute on everything beneath it.
+The grant keys on the file, so a busybox-style multi-call binary cannot be
+split into applets, and a shell builtin is not an
+.BR execve (2)
+at all.
 .TP
 .BI \-\-workdir " PATH"
-Set working directory (added as \fB\-\-rw\fR).
+Set working directory. It is added as a path rule in its own right \(em
+read, write and execute, the same rights the built-in profile gives
+.IR $HOME ,
+not the W^X rights of
+.BR \-\-rw .
 .TP
 .B \-\-no\-landlock
 Disable Landlock filesystem restrictions.
+.SS "Network (Landlock, ABI v4 / Linux 6.7+)"
+.PP
+TCP only.
+These rules cover
+.BR bind (2)
+and
+.BR connect (2)
+on TCP and nothing else: no UDP, no unix sockets, no netlink, no raw
+sockets, no
+.BR listen / accept
+granularity, and no per-address rules \(em a rule for port 443 allows port
+443 on every address, IPv4 and IPv6 alike.
+They are an allow-list; there is no way to express \(lqeverything except
+port N\(rq.
+Below Landlock ABI v4 compartment-user prints a warning and the port policy
+is
+.B not
+active, while the filesystem rules still are.
+.TP
+.BI \-\-net\-bind " PORT"
+Allow
+.BR bind (2)
+on TCP \fIPORT\fR. Repeatable.
+.TP
+.BI \-\-net\-connect " PORT"
+Allow
+.BR connect (2)
+to TCP \fIPORT\fR. Repeatable.
+.TP
+.B \-\-net\-deny
+Handle TCP bind and connect and refuse every port not named above.
+Without this flag and without any
+.B \-\-net\-*
+rule the network is not restricted at all, which is the default.
+Note that naming only connect rules still leaves
+.BR bind (2)
+unrestricted, while
+.B \-\-net\-deny
+refuses both \(em including the explicit
+.BR bind (2)
+on port 0 that some clients make before connecting.
+.SS "Capabilities and namespace (root callers)"
+.PP
+Both of these need privilege the caller already has; neither grants any.
+They exist for the case where the confined subject is
+.B root
+\(em a uid-0 login shell, a privileged service \(em because Landlock and
+seccomp alone leave such a subject every capability it started with.
+.TP
+.BI \-\-cap\-drop " CAP"
+Drop \fICAP\fR from the capability bounding set with
+.BR prctl (2)
+.BR PR_CAPBSET_DROP ,
+then clear the ambient and inheritable sets and lock the securebits.
+Repeatable.
+Accepts
+.BR CAP_SYS_MODULE ,
+.BR cap_sys_module ,
+.B sys_module
+or a decimal number.
+.IP
+For a uid-0 process exec'ing a file that carries no file capabilities the
+kernel recomputes the permitted set as (full set AND bounding set), so what
+survives the exec is exactly the bounding set: dropping a capability here
+removes it from everything the session runs afterwards.
+.BR PR_CAPBSET_DROP
+is one-way, and
+.BR capset (2)
+cannot raise a capability that has left the bounding set.
+Verify with
+.RS
+.IP
+.nf
+grep CapBnd /proc/self/status
+.fi
+.RE
+.IP
+.B SECBIT_NOROOT
+is deliberately
+.B not
+set.
+With it the same exec computes permitted = 0 and the process holds no
+capabilities at all \(em correct for an unprivileged sandbox, useless for
+an administrative account, which still needs
+.BR CAP_DAC_OVERRIDE ,
+.BR CAP_KILL ,
+.B CAP_NET_ADMIN
+and
+.B CAP_SYSLOG
+to read a log or run
+.BR ip (8).
+Only the locking securebits are set, so the ambient set cannot be re-raised
+and the securebits cannot be relaxed later in the session.
+.IP
+Needs
+.BR CAP_SETPCAP .
+A caller that is not root and holds no capabilities gets a warning and the
+run continues, because there is nothing to drop.
+.TP
+.BI \-\-mask " PATH"
+Cover \fIPATH\fR inside a private mount namespace: an empty read-only
+.B tmpfs
+over a directory, a bind of
+.I /dev/null
+over anything else. Repeatable.
+A trailing
+.B ?
+makes the mask optional.
+.IP
+This exists for the surface Landlock cannot express.
+.BR connect (2)
+to a unix socket named by a path is not a filesystem access right, so a
+domain that denies
+.BR open (2)
+on
+.I /run/systemd/private
+still lets the process talk to systemd through it. The only way to take
+that away without a BPF socket hook is to make the path not be there.
+.IP
+The namespace is made
+.B MS_PRIVATE|MS_REC
+first, and that is not optional: on a systemd distribution
+.I /
+is
+.BR shared ,
+and a cover mount made in a fresh namespace without it propagates back to
+the host and hides the path from every process on the machine.
+.IP
+A mask fails closed \(em anything but \(lqthe path is not there\(rq
+aborts the run. The one exception is
+.BI mask " PATH" ?
+, which degrades to a warning when the caller has no
+.B CAP_SYS_ADMIN
+and therefore cannot create a mount namespace at all.
+.IP
+A non-directory mask
+.B neutralises
+a write rather than refusing one: the open succeeds, because Landlock keys
+its rules on inodes and a usable profile grants
+.BR "rw /dev/null" ,
+and the bytes go nowhere. A read-only remount does not change this \(em the
+kernel's read-only-filesystem check covers regular files, directories and
+symlinks, never device nodes. Use
+.B \-\-mask
+for a read or connect surface and a path rule for a write surface, where
+Landlock refuses the open outright.
 .SS "Syscalls (seccomp BPF)"
 .TP
 .BI \-\-block " SYSCALL"
 Block a syscall by name or number. Repeatable.
+Up to 256 entries; the built-in
+.B ai-agent
+profile already uses 43 of them, and overflowing the limit is a fatal
+error rather than a silent truncation.
+.TP
+.BI \-\-allow " SYSCALL"
+Switch seccomp to allow-list mode and permit
+.IR SYSCALL .
+Everything not named by an
+.B \-\-allow
+flag or an
+.B allow
+profile directive returns
+.BR EPERM .
+Repeatable.
 .TP
 .B \-\-no\-seccomp
 Disable seccomp filtering.
+.PP
+What a denied syscall does is chosen by the
+.B seccomp\-default
+profile directive:
+.B errno
+(the default,
+.BR EPERM ),
+.B kill
+.RB ( SECCOMP_RET_KILL_PROCESS ,
+a
+.B SIGSYS
+the process cannot mishandle) or
+.B log
+(permit and record, for working out what a policy needs).
+.B errno
+remains the default for compatibility; it is the weakest of the three,
+because a program that does not check return values corrupts its own logic
+instead of dying, and every denial returns cleanly enough for an attacker to
+probe the filter one call at a time.
 .SS Environment
+.TP
+.BI \-\-env\-allow " VAR"
+Switch environment handling to allow-list mode and keep
+.IR VAR .
+Everything not named by an
+.B \-\-env\-allow
+flag or an
+.B env-allow
+profile directive is removed. Repeatable.
 .TP
 .BI \-\-env\-deny " VAR"
 Strip an environment variable. Repeatable.
+A trailing \fB*\fR makes the entry a prefix match, so
+.B \-\-env\-deny
+.I LD_*
+strips the whole loader family.
+The same applies to
+.BR \-\-env\-allow .
+.PP
+The built-in profile strips the loader, shell-startup, interpreter and
+git-helper families along with cloud, VCS and database credentials.
+It deliberately does
+.B not
+strip the
+.I *_API_KEY
+variables an agent authenticates its model provider with: removing the
+credential the sandboxed agent needs in order to start would defeat the
+tool's main purpose.
+Environment sanitization removes what the sandboxed process should not
+have; it cannot protect a secret deliberately handed to it.
 .TP
 .B \-\-no\-env\-sanitize
 Do not strip dangerous environment variables.
@@ -76,18 +421,99 @@ Do not strip dangerous environment variables.
 .TP
 .B \-\-dry\-run
 Show what restrictions would be applied without executing the command.
+Implies
+.BR \-\-verbose .
+.TP
+.BI \-\-dump\-profile " NAME"
+Resolve
+.I NAME
+the way a real run would and print the effective policy as
+.B .conf
+syntax on standard output, then exit.
+No command is needed.
+Use it to generate a profile file that is guaranteed to match what the
+binary enforces:
+.RS
+.nf
+
+compartment-user \-\-dump\-profile ai\-agent | sudo tee /etc/compartment/my\-agent.conf
+
+.fi
+.RE
 .TP
 .B \-\-verbose
-Print actions to stderr.
+Print actions to stderr, including the resolved profile and its source.
 .TP
 .B \-\-audit
 Log events to stderr and to a file.
 .TP
 .BI \-\-audit\-log " DIR"
 Set audit log directory (implies \fB\-\-audit\fR).
-Default: \fI/var/tmp/compartment-audit-$UID/\fR.
+The directory must be owned by the effective uid and must not be group- or
+world-writable; it is opened with
+.B O_DIRECTORY
+and
+.B O_NOFOLLOW
+and the daily file is created relative to that descriptor, so neither the
+directory nor the file may be a symlink.
+If auditing was requested and cannot be set up safely,
+.B compartment-user
+refuses to run.
+.PP
+An operator-chosen directory that lies inside a granted
+.B rw
+or
+.B rwx
+path is reachable by the sandboxed process, which can then read and
+rewrite the trail. Choose one that no path rule covers.
+.PP
+Without
+.BR \-\-audit\-log ,
+the default is chosen in this order:
+.RS
+.IP 1. 4
+.IR /var/lib/compartment/audit/ UID ,
+if an administrator provisioned it. It is used only when the parent
+.I /var/lib/compartment/audit
+is owned by root and is not group- or world-writable, and the per-uid
+directory is a real directory owned by the caller's real uid with mode
+0700. Provision it with:
+.RS
+.nf
+
+install \-d \-m 0755 \-o root \-g root /var/lib/compartment/audit
+install \-d \-m 0700 \-o USER /var/lib/compartment/audit/UID
+
+.fi
+.RE
+.IP 2.
+.IR /var/tmp/compartment\-audit\- UID ,
+created mode 0700. Because
+.I /var/tmp
+is sticky and world-writable, another user can create that name first:
+if the directory is found with a different owner or a mode other than
+0700,
+.B compartment-user
+refuses to run rather than appending to it.
+.RE
+.PP
+Running as root short-circuits both of those: the default is
+.IR /var/log/compartment ,
+created mode 0700, and neither step above is consulted.
+.PP
+Neither default is inside a path the built-in profiles grant for writing,
+so the sandboxed process cannot rewrite its own audit trail. Note that
+.I /var/lib
+is granted
+.B ro
+by the built-in
+.B ai-agent
+profile, so a log kept there is readable — though not writable or
+removable — from inside the sandbox;
+.I /var/tmp
+is covered by no rule at all and is therefore neither.
 .TP
-.B \-\-unsecure
+.B \-\-insecure
 Allow execution when enforcement is degraded.
 .B compartment-user
 runs a pre-flight check before executing the command. If any check fails
@@ -97,11 +523,16 @@ protection, printing warnings to stderr.
 When \fB\-\-audit\fR is also set, a
 .B COMPARTMENT_DEGRADED
 event is logged.
+.B \-\-unsecure
+is accepted as an alias.
 .TP
 .B \-\-verify
 Check kernel support (Landlock, seccomp, filesystem type) and exit.
 Reports the Landlock ABI version, detects unsupported filesystems
 (9p, NFS, CIFS), and verifies seccomp BPF availability.
+.TP
+.B \-\-version
+Print the version and exit.
 .TP
 .B \-\-help
 Print usage summary.
@@ -139,18 +570,67 @@ compartment-user: REFUSING to execute \(em 1 preflight check failed.
 .fi
 .RE
 .PP
-Use \fB\-\-unsecure\fR to proceed with degraded protection, or
+Use \fB\-\-insecure\fR to proceed with degraded protection, or
 \fB\-\-no-landlock\fR to skip filesystem restrictions entirely.
 .SH SHELL REPLACEMENT MODE
 When invoked via a symlink whose name is not
 .IR compartment-user
 (e.g., as \fI/bin/bash\fR, \fI/bin/zsh\fR, \fI/bin/tcsh\fR, or any other
 shell), the program enters shell-replacement mode:
-it applies the
+it applies a profile and execs the real shell from the stash directory
+(compile-time \fBREAL_SHELL_DIR\fR, or the \fBCOMPARTMENT_SHELL_DIR\fR
+environment variable when that names a directory worth trusting).
+.PP
+One leading
+.B \-
+is stripped from
+.I argv[0]
+when choosing the stash entry.
+.BR login (1)
+and
+.BR sshd (8)
+give a
+.I login
+shell an
+.I argv[0]
+of \fB\-bash\fR, and that dash is a convention for the shell, not part of
+its name.
+.I argv
+itself is passed to the real shell unchanged, so it still knows it is a
+login shell and still reads the login startup files.
+.PP
+The profile is resolved in this order, with the same trust checks as
+.BR \-\-profile
+and with
+.I $HOME
+never searched:
+.RS
+.IP 1. 3
+.IR /etc/compartment/shell\-replacement.conf .
+.IP 2. 3
+.IR /etc/compartment/ai\-agent.conf ,
+then the compiled-in
 .B ai-agent
-profile and execs the real shell from the stash directory
-(compile-time \fBREAL_SHELL_DIR\fR or the \fBCOMPARTMENT_SHELL_DIR\fR
-environment variable).
+policy.
+.RE
+.PP
+.B COMPARTMENT_SHELL_DIR
+is caller-supplied, so it is honoured only when it is an absolute path
+with no \fB..\fR component and both the directory and the shell binary
+inside it are owned by root or by the real uid of the caller and are
+neither group- nor world-writable.
+Otherwise it is ignored with a warning on standard error and the
+compile-time
+.B REAL_SHELL_DIR
+is used instead.
+Either way the sandbox is applied before the exec: an accepted
+.B COMPARTMENT_SHELL_DIR
+changes which binary runs, never whether it is confined.
+.PP
+Shell-replacement mode performs the same preflight check, ambient
+capability clearing,
+.BR PR_SET_DUMPABLE (2)
+reset and file-descriptor cleanup as the normal path.
 .PP
 .B "IMPORTANT:"
 Shell-replacement mode
@@ -163,13 +643,34 @@ warning at
 level, including uid, pid, and ppid for audit trail:
 .RS
 .nf
-compartment-user[bash]: INSECURE shell session (1 mechanisms failed) uid=1000 pid=12345 ppid=12340
+compartment-user[bash]: INSECURE shell session (1 mechanism failed) uid=1000 pid=12345 ppid=12340
 .fi
 .RE
 .PP
 This ensures that replacing \fI/bin/bash\fR (or any shell) with a symlink
 to compartment-user can never lock out users, while still providing
 audit visibility when enforcement is degraded.
+.PP
+.B "That trade-off inverts when"
+.IR /etc/compartment/shell\-replacement.conf
+.BR "is present."
+An operator who writes that file is confining an account rather than
+sandboxing an agent, and for such an account an unconfined uid-0 login
+.I is
+the failure. So with that file in force a rejected profile, a failed mask,
+a failed capability policy or any failed enforcement mechanism refuses the
+session with exit status 126 and a
+.B LOG_ERR
+syslog record. Keep a second administrative account whose login shell is
+the stashed binary, and console access, before deploying it.
+.PP
+.B \-\-mask
+and
+.B \-\-cap\-drop
+failures are fatal in
+.I both
+modes: nothing depends on them degrading, and a mask that did not go on is
+a hole the profile says is shut.
 .PP
 Build with a randomized stash path:
 .RS
@@ -179,20 +680,29 @@ make hardened
 .RE
 .SH PROFILE FORMAT
 Profiles use a simple line-oriented format shared with
-.BR compartment-root (1):
+.BR compartment-root (8):
 .PP
 .nf
 .RS
-# Filesystem
+# Filesystem.  A rule may name a directory or a file; a
+# trailing '?' makes the rule optional instead of fatal.
 ro /usr
+ro /lib32?
+rw /dev/null
+exec /usr/bin/psql
 rw $HOME
+
+# Network (TCP only, Landlock ABI v4 / Linux 6.7+)
+net-connect 5432
+net-default deny
 
 # Syscalls
 block ptrace
 block mount
+seccomp-default errno
 
 # Environment
-env-deny LD_PRELOAD
+env-deny LD_*
 
 # Features
 landlock on
@@ -212,23 +722,37 @@ Boolean values accept:
 .BR 1 / 0
 (case-insensitive). Unrecognized values are rejected.
 .PP
-Unknown directives produce a warning to help catch typos.
+An unknown directive is a fatal parse error: a profile is policy, and a
+line that cannot be read means the policy is not known. A directive that
+belongs to
+.BR compartment\-root (8)
+is recognised, ignored, and reported with a warning that names the tool.
+An invalid value for a directive that takes one
+.RB ( seccomp\-mode ,
+.BR env\-mode ,
+.BR net\-default ,
+.BR seccomp\-default ,
+.BR audit )
+is also a fatal parse error, naming the accepted values.
 .SH DEFAULT DENY LIST (ai-agent profile)
 The built-in
 .B ai-agent
 profile blocks these syscall families:
 .PP
 .nf
-ptrace, mount, umount2, reboot, kexec_load,
+ptrace, process_vm_readv, process_vm_writev,
+mount, umount2, pivot_root, chroot, unshare, setns,
+mount_setattr, open_tree, move_mount,
+fsopen, fsmount, fsconfig, fspick,
+open_by_handle_at, name_to_handle_at,
+reboot, kexec_load, kexec_file_load,
 init_module, finit_module, delete_module,
-pivot_root, chroot, unshare, setns,
 keyctl, add_key, request_key,
 bpf, userfaultfd, perf_event_open,
-process_vm_readv, process_vm_writev,
 io_uring_setup, io_uring_enter, io_uring_register,
-open_by_handle_at, name_to_handle_at,
-open_tree, move_mount, fsopen, fsmount,
-fsconfig, fspick, mount_setattr, pidfd_getfd
+acct, swapon, swapoff,
+settimeofday, clock_settime, clock_adjtime, adjtimex,
+pidfd_getfd, and on x86-64 ioperm and iopl
 .fi
 .PP
 Environment variables stripped include LD_PRELOAD, cloud credentials
@@ -250,7 +774,7 @@ Preview the policy:
 .B compartment-user \-\-dry\-run \-\- claude
 .TP
 Read-only SSH client:
-.B compartment-user \-\-profile ssh.conf \-\- ssh user@host
+.B compartment-user \-\-profile ./examples/ssh.conf \-\- ssh user@host
 .TP
 Check kernel support:
 .B compartment-user \-\-verify
@@ -263,20 +787,72 @@ Command executed successfully under sandbox.
 Configuration error, missing command, or profile load failure.
 .TP
 .B 126
-Shell-replacement mode failed (enforcement error or path traversal rejected).
+Reserved. Shell-replacement mode no longer refuses to run: a rejected
+.B COMPARTMENT_SHELL_DIR
+is a warning and a fall back to the compile-time stash directory, and an
+enforcement failure is logged to syslog.
 .TP
 .B 127
 Command not found or not executable under Landlock restrictions.
+.SH LIMITATIONS
+.PP
+.B \-\-cap\-drop
+and
+.B \-\-mask
+exist for the case where the confined subject is uid 0, and that case has
+limits worth reading in full before deploying one. The confinement is
+per-task kernel state on a session: it says nothing about a root process
+that was never in the session, and it creates no uid boundary \(em the
+account still is uid 0, so a
+.B ro
+rule on
+.I /etc
+grants it
+.IR /etc/shadow ,
+and read policy is as load-bearing as write policy.
+A
+.B \-\-mask
+list is an enumeration of the privileged sockets Landlock cannot govern, not
+a boundary; a mask over a non-directory neutralises a write rather than
+refusing one; sshd forwarding and
+.B internal-sftp
+route around a login-shell confinement and are closed by
+.BR sshd_config (5)
+rather than by enforcement; and anything holding
+.B CAP_BPF
+outside the session owns the
+.B compartment-bpf
+seals unless the policy was pinned with
+.BR \-\-self\-protect .
+.PP
+The complete list, with the closure for each, is
+.B HOWTO.md
+\(lqLimited root over SSH\(rq, section 8. What the companion kernel-side
+control does and does not close is
+.B compartment-bpf/LIMITATIONS.md
+under \(lqSelf-protection\(rq.
 .SH FILES
 .TP
 .I ~/.config/compartment/*.conf
 Per-user profile files.
+Searched only when
+.B \-\-user\-profiles
+is given, and never in shell-replacement mode.
 .TP
 .I /etc/compartment/*.conf
 System-wide profile files.
 .TP
-.I /var/tmp/compartment-audit-$UID/
-Default audit log directory (one file per day).
+.I /etc/compartment/shell-replacement.conf
+Policy for shell-replacement mode, when present.
+Also selects the fail-closed semantics described under
+.BR "SHELL REPLACEMENT MODE" .
+.TP
+.IR /var/lib/compartment/audit/ UID /
+Preferred audit log directory when an administrator has provisioned it
+(one file per day).
+.TP
+.IR /var/tmp/compartment\-audit\- UID /
+Fallback audit log directory.
 .SH REQUIREMENTS
 Linux >= 5.13 (Landlock). seccomp BPF requires >= 3.17.
 No external libraries.
