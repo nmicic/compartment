@@ -11,6 +11,8 @@
 #   C  --verbose reports rules INSTALLED, not rules asked for
 #   D  M9: a `ro` rule nested in a `rw`/`rwx` rule is refused
 #   E  `exec` semantics, and the difference from `ro`
+#   E2 the listed loader starts a compatible loadable ELF (HOWTO fact 5)
+#   E3 `ro` on a directory grants execute beneath it (HOWTO fact 3)
 #   F  Landlock TCP port rules against a real loopback listener
 #   G  seccomp-default parsing
 #   H  make install-profiles is not part of make install
@@ -90,7 +92,7 @@ want_rc_nonzero() {
 }
 
 # Declared assertion count for the whole suite (see harness_expect_total).
-LANDLOCK_RULES_TOTAL=92
+LANDLOCK_RULES_TOTAL=105
 
 if [ "${ABI}" -lt 1 ]; then
     skip_to_total "${LANDLOCK_RULES_TOTAL}" \
@@ -333,6 +335,140 @@ fi
 
 echo ""
 
+# ── E2. The listed loader is the way out of the allow-list ─────────
+#
+# Facts 1 and 2 of HOWTO.md's allow-list section, taken together: the
+# loader must carry EXECUTE, and the loader needs only READ on the file it
+# starts.  So a listed loader will start a compatible loadable ELF the
+# sandbox can read, with no execve() of that file and therefore no execute
+# check on it.  One payload is what these assertions measure; the claim
+# they support is about a file the loader accepts, not about every byte
+# sequence on disk.
+#
+# These assertions record TODAY'S behaviour in both directions.  If a
+# kernel or a policy change ever closes the gap, the "runs" assertion
+# fails and someone has to come back here and to HOWTO.md fact 5; if the
+# static-only case ever stops holding, that fails instead.  Neither
+# direction can change quietly.
+
+echo "--- Test group: the listed loader bypasses the allow-list (fact 5) ---"
+
+STATIC_PROBE="${REPO_DIR}/tests/probes/fd_reader-static"
+
+if [ -n "${LOADER}" ] && [ -e "${LOADER}" ] && [ -n "${LIBC}" ]; then
+    LIBDIR="$(dirname "${LIBC}")"
+    LOADERDIR="$(dirname "${LOADER}")"
+    mkdir -p "${WORK}/data"
+    # A copy of /bin/sh is a dynamically linked ELF that no exec rule
+    # names: the rule keys on the inode (fact 4), so the copy is not the
+    # /bin/sh that is listed.  Using the shell as the payload means the
+    # witness needs no compiler.
+    cp /bin/sh "${WORK}/data/shcopy"
+
+    # The documented allow-list shape: the shell, the loader, read on the
+    # library directory, and rw on a data directory.  `rw` is read+write
+    # and no execute, which is exactly the W^X guarantee under test.
+    GAP=(--profile none --no-seccomp --ro /etc --ro /proc --rw /dev/null
+         --exec /bin/sh --exec "${LOADER}"
+         --rw "${LIBDIR}" --rw "${LOADERDIR}" --rw "${WORK}/data")
+
+    run "${CU}" "${GAP[@]}" -- /bin/sh -c \
+        "echo x > '${WORK}/data/w' && echo WROTE_DATA; \
+         '${WORK}/data/shcopy' -c 'echo GAP_DIRECT_RAN' 2>&1"
+    want_out "loader gap: the data directory is readable and writable" \
+             "WROTE_DATA"
+    want_out "loader gap: direct execve of the unlisted payload is denied" \
+             "Permission denied"
+    want_no_out "loader gap: the direct execve really did not run it" \
+                "GAP_DIRECT_RAN"
+
+    # The gap itself: the same inode, started by the listed loader, runs.
+    run "${CU}" "${GAP[@]}" -- /bin/sh -c \
+        "'${LOADER}' '${WORK}/data/shcopy' -c 'echo GAP_VIA_LOADER_RAN' 2>&1"
+    want_out "loader gap: the SAME file RUNS when the listed loader starts it" \
+             "GAP_VIA_LOADER_RAN"
+
+    # The other half: a static allowed binary and no loader in the policy.
+    # The library directory is still readable, so the loader is refused for
+    # want of EXECUTE and not for want of READ.
+    if [ -x "${STATIC_PROBE}" ]; then
+        STATIC_POLICY=(--profile none --no-seccomp --ro /etc --ro /proc
+                       --rw /dev/null --exec "${STATIC_PROBE}"
+                       --rw "${LIBDIR}" --rw "${LOADERDIR}"
+                       --rw "${WORK}/data")
+
+        run "${CU}" "${STATIC_POLICY[@]}" -- "${STATIC_PROBE}" 0
+        want_out "static-only policy: the static allowed binary runs" \
+                 "FD_READER_START"
+
+        run "${CU}" "${STATIC_POLICY[@]}" -- \
+            "${WORK}/data/shcopy" -c 'echo STATIC_DIRECT_RAN'
+        want_rc_nonzero "static-only policy: the dynamic payload cannot start"
+        want_no_out "static-only policy: the payload really did not run" \
+                    "STATIC_DIRECT_RAN"
+
+        run "${CU}" "${STATIC_POLICY[@]}" -- \
+            "${LOADER}" "${WORK}/data/shcopy" -c 'echo STATIC_LOADER_RAN'
+        want_rc_nonzero "static-only policy: an unlisted loader cannot be executed"
+        want_no_out "static-only policy: the loader route really did not run it" \
+                    "STATIC_LOADER_RAN"
+    else
+        skip_group 5 "fd_reader-static not built: static-only allow-list witnesses"
+    fi
+else
+    skip_group 9 "no dynamic loader found: loader-bypass witnesses"
+fi
+
+echo ""
+
+# ── E3. A recursive `ro` directory is an exec grant ────────────────
+#
+# HOWTO.md fact 3, measured.  `ro` on a directory carries EXECUTE on every
+# file beneath it, so an executable that no `exec` rule names runs anyway
+# when it happens to sit under one.  That is how a library rule undoes an
+# allow-list: /usr/lib is not only libraries, and on Debian and Ubuntu it
+# carries /usr/lib/klibc/bin/ — ordinary executables under the directory a
+# policy grants so that libc can be read.
+#
+# The corrected shape is `rw` on the library directory: read for the
+# loader's mmap, and no execute.  The second half of this group measures
+# that the same file is then refused, so neither direction can change
+# without a failure here.
+
+echo "--- Test group: ro on a directory grants execute (fact 3) ---"
+
+if [ -n "${LOADER}" ] && [ -e "${LOADER}" ] && [ -n "${LIBC}" ]; then
+    LIBDIR="$(dirname "${LIBC}")"
+    LOADERDIR="$(dirname "${LOADER}")"
+    mkdir -p "${WORK}/libdir"
+    # The stand-in for /usr/lib/klibc/bin/true: an ordinary executable that
+    # lives under the directory a policy grants for libraries, and that no
+    # `exec` rule names.
+    cp /bin/sh "${WORK}/libdir/stray"
+
+    RODIR=(--profile none --no-seccomp --ro /etc --ro /proc --rw /dev/null
+           --exec /bin/sh --exec "${LOADER}"
+           --rw "${LIBDIR}" --rw "${LOADERDIR}")
+
+    # The wrong shape: `ro` on the directory holding the stray executable.
+    run "${CU}" "${RODIR[@]}" --ro "${WORK}/libdir" -- /bin/sh -c \
+        "'${WORK}/libdir/stray' -c 'echo RO_DIR_STRAY_RAN' 2>&1; echo PROBE_DONE"
+    want_out "ro DIR: an unlisted executable beneath it RUNS" \
+             "RO_DIR_STRAY_RAN"
+
+    # The corrected shape: `rw` is read + write and carries no execute.
+    run "${CU}" "${RODIR[@]}" --rw "${WORK}/libdir" -- /bin/sh -c \
+        "'${WORK}/libdir/stray' -c 'echo RW_DIR_STRAY_RAN' 2>&1; echo PROBE_DONE"
+    want_out "rw DIR: the same file is refused with EACCES" "Permission denied"
+    want_no_out "rw DIR: the unlisted executable really did not run" \
+                "RW_DIR_STRAY_RAN"
+    want_out "rw DIR: the probe itself still ran" "PROBE_DONE"
+else
+    skip_group 4 "no dynamic loader found: ro-directory exec-grant witnesses"
+fi
+
+echo ""
+
 # ── F. Landlock TCP port rules ─────────────────────────────────────
 
 echo "--- Test group: Landlock TCP port rules (P1-a) ---"
@@ -345,6 +481,8 @@ if [ "${ABI}" -lt 4 ]; then
                  "bind to any other port gets EACCES" \
                  "no net-* directive leaves the network untouched" \
                  "--dry-run reports the port rules" \
+                 "--dry-run lists net-connect" \
+                 "--dry-run lists net-default deny" \
                  "below ABI 4 the tool warns that the policy is inactive"; do
         skip "${label} (Landlock ABI v${ABI} < 4: no network support before Linux 6.7)"
     done

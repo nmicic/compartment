@@ -8,8 +8,11 @@
 # Covers, root only:
 #   A  `landlock on` and the per-binary exec allow-list
 #   B  shared libraries need READ_FILE, the ELF interpreter needs EXECUTE
+#   B2 the listed loader starts a compatible loadable ELF (HOWTO fact 5)
+#   B3 `ro` on a directory grants execute beneath it (HOWTO fact 3)
 #   C  mount-ro / mount-noexec / mount-nosuid
 #   D  rootdir-flags
+#   D2 `rootdir-flags ro` is not recursive and `mount-ro` is
 #   E  rootdir ownership refusals
 #   F  --netns joins an existing namespace
 #   G  devpts, /dev/ptmx and /dev/shm
@@ -212,7 +215,7 @@ mkprofile() {
 echo "--- Test group: Landlock exec allow-list (P1-b/d) ---"
 
 if [ "${ABI}" -lt 1 ]; then
-    skip "Landlock not available on this kernel"
+    skip_group 11 "Landlock not available on this kernel: the exec allow-list group"
 else
     # Rules but no `landlock on`: the tool must say the rules are inert
     # rather than pretend they are policy.
@@ -348,6 +351,145 @@ fi
 
 echo ""
 
+# ── B2. The listed loader is the way out of the allow-list ─────────
+#
+# The container half of HOWTO.md fact 5.  Group B establishes the two
+# facts this rests on: the interpreter needs EXECUTE, and a shared library
+# needs only READ.  Together they mean a listed loader will start a
+# compatible loadable ELF the container can read, with no execve() of that
+# file and so no execute check on it — including for uid 0 inside the
+# container.  One payload is what these assertions measure; the claim they
+# support is about a file the loader accepts, not about every byte sequence
+# in the rootdir.
+#
+# These assertions record TODAY'S behaviour in both directions, so that a
+# change either way is visible here and in HOWTO.md fact 5 rather than
+# silently drifting away from the shipped docs.
+
+echo "--- Test group: the listed loader bypasses the allow-list (fact 5) ---"
+
+if [ -z "${DYNBIN}" ] || [ -z "${LOADER_IN:-}" ] || [ "${ABI}" -lt 1 ]; then
+    skip_group 11 "no C compiler, no interpreter or no Landlock: loader-bypass witnesses"
+else
+    # A dynamically linked payload that no `exec` rule names, in a service
+    # data directory the container owns and may write.
+    cat > "${WORK}/payload.c" <<'PEOF'
+#include <stdio.h>
+int main(void){ printf("%s\n", MARKER); return 0; }
+PEOF
+    mkdir -p "${JAIL}/srv/data"
+    cc -O2 -DMARKER='"PAYLOAD_RAN"' -o "${JAIL}/srv/data/payload" \
+       "${WORK}/payload.c" 2>/dev/null
+    chown -R 60000:60000 "${JAIL}/srv/data"
+
+    GAPFLAGS=(--landlock --exec /bin/busybox --exec "${DYNBIN}"
+              --exec "${LOADER_IN}" --rw /lib --rw /lib64 --ro /etc --ro /proc
+              --rw /dev/null --rw /srv/data -c "${JAIL}" "${CRUSER[@]}")
+
+    # `rw` is read + write and no execute, so the direct execve is refused.
+    run_cr "${GAPFLAGS[@]}" -- /bin/sh -c \
+        '/bin/dyntest; /srv/data/payload 2>&1; echo PROBE_DONE'
+    want_out "loader gap: the listed binary still runs"            "DYN_RAN"
+    want_out "loader gap: direct execve of the unlisted payload is denied" \
+             "Permission denied"
+    want_no_out "loader gap: the direct execve really did not run it" \
+                "PAYLOAD_RAN"
+
+    # The gap: the same inode, started by the listed loader, runs.
+    run_cr "${GAPFLAGS[@]}" -- /bin/sh -c \
+        "${LOADER_IN} /srv/data/payload 2>&1; echo PROBE_DONE"
+    want_out "loader gap: the SAME file RUNS when the listed loader starts it" \
+             "PAYLOAD_RAN"
+
+    # And the container can author the ELF itself: a location that is both
+    # readable and writable is all the route needs.
+    run_cr "${GAPFLAGS[@]}" -- /bin/sh -c \
+        "cp /bin/dyntest /srv/data/fresh && echo COPIED; \
+         /srv/data/fresh 2>&1; ${LOADER_IN} /srv/data/fresh 2>&1; echo PROBE_DONE"
+    want_out "loader gap: the container writes a new ELF into its rw directory" \
+             "COPIED"
+    want_out "loader gap: and starts that new ELF through the loader" "DYN_RAN"
+
+    # The other half: a static allowed binary and no loader in the policy.
+    # /lib and /lib64 stay readable, so the loader is refused for want of
+    # EXECUTE rather than for want of READ.
+    run_cr --landlock --exec /bin/busybox --rw /lib --rw /lib64 --ro /etc \
+        --ro /proc --rw /dev/null --rw /srv/data -c "${JAIL}" "${CRUSER[@]}" -- \
+        /bin/sh -c \
+        "echo STATIC_ALLOWED_RAN; /srv/data/payload 2>&1; \
+         ${LOADER_IN} /srv/data/payload 2>&1; echo PROBE_DONE"
+    want_out "static-only policy: the static allowed binary runs" \
+             "STATIC_ALLOWED_RAN"
+    want_no_out "static-only policy: the dynamic payload cannot start at all" \
+                "PAYLOAD_RAN"
+
+    # mount-noexec closes the writable-payload half of the bypass and only
+    # that half: the loader maps its target PROT_EXEC and the kernel refuses
+    # that mapping on a MNT_NOEXEC mount.  It does nothing about a readable
+    # unlisted ELF on an exec-capable mount, which is what the assertions
+    # above measure.
+    P="$(mkprofile noexecgap "rootdir ${JAIL}" "username ctsvc" "uid 60000" \
+         "gid 60000" "mount-noexec /tmp" "mount-nosuid /tmp" "landlock on" \
+         "exec /bin/busybox" "exec ${DYNBIN}" "exec ${LOADER_IN}" \
+         "rw /lib" "rw /lib64" "ro /etc" "ro /proc" "rw /dev/null" "rw /tmp")"
+    run_cr --profile "${P}" -- /bin/sh -c \
+        "cp /bin/dyntest /tmp/fresh && echo COPIED; \
+         ${LOADER_IN} /tmp/fresh 2>&1; echo PROBE_DONE"
+    want_out "mount-noexec: the loader cannot map an ELF from a noexec mount" \
+             "failed to map segment"
+    # An error string on its own proves nothing about whether the payload
+    # ran: /bin/dyntest prints DYN_RAN on entry to main(), so its absence
+    # is the assertion that the mapping really did not happen.
+    want_no_out "mount-noexec: the payload really did not run" "DYN_RAN"
+    want_out "mount-noexec: the probe itself still ran" "PROBE_DONE"
+fi
+
+echo ""
+
+# ── B3. A recursive `ro` directory is an exec grant ────────────────
+#
+# HOWTO.md fact 3, inside a container.  `ro` on a directory carries EXECUTE
+# on every file beneath it, so an executable that no `exec` rule names runs
+# anyway when it sits under one.  That is how a library rule undoes an
+# allow-list: a distribution leaves ordinary executables under /usr/lib
+# (/usr/lib/klibc/bin/ on Debian and Ubuntu), and `ro` on the library
+# directory hands every one of them to the container.
+#
+# The corrected shape — the one examples/restricted-root.conf now uses — is
+# `rw` on the library directory: read for the loader's mmap, no execute, and
+# the write right inert under a read-only rootdir mount.  Both directions
+# are measured, so neither can change quietly.
+
+echo "--- Test group: ro on a directory grants execute (fact 3) ---"
+
+if [ -z "${DYNBIN}" ] || [ -z "${LOADER_IN:-}" ] || [ "${ABI}" -lt 1 ]; then
+    skip_group 4 "no C compiler, no interpreter or no Landlock: ro-directory exec-grant witnesses"
+else
+    # The stand-in for /usr/lib/klibc/bin/true: an ordinary executable in
+    # the container's library directory that no `exec` rule names.
+    cc -O2 -DMARKER='"STRAY_RAN"' -o "${JAIL}/lib/stray" \
+       "${WORK}/payload.c" 2>/dev/null
+
+    # The wrong shape: `ro` on the library directory.
+    run_cr --landlock --exec /bin/busybox --exec "${DYNBIN}" \
+        --exec "${LOADER_IN}" --ro /lib --rw /lib64 --ro /etc --ro /proc \
+        --rw /dev/null -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+        '/lib/stray 2>&1; echo PROBE_DONE'
+    want_out "ro DIR: an unlisted executable beneath it RUNS" "STRAY_RAN"
+
+    # The corrected shape: `rw` is read + write and carries no execute.
+    run_cr --landlock --exec /bin/busybox --exec "${DYNBIN}" \
+        --exec "${LOADER_IN}" --rw /lib --rw /lib64 --ro /etc --ro /proc \
+        --rw /dev/null -c "${JAIL}" "${CRUSER[@]}" -- /bin/sh -c \
+        "/lib/stray 2>&1; ${DYNBIN}; echo PROBE_DONE"
+    want_out "rw DIR: the same file is refused with EACCES" "Permission denied"
+    want_no_out "rw DIR: the unlisted executable really did not run" "STRAY_RAN"
+    want_out "rw DIR: the listed dynamic binary still loads its libraries" \
+             "DYN_RAN"
+fi
+
+echo ""
+
 # ── C. mount-ro / mount-noexec / mount-nosuid ──────────────────────
 
 echo "--- Test group: mount-* flags (P1-c) ---"
@@ -423,6 +565,70 @@ want_out "the refusal lists the valid flags" "ro, nosuid, nodev, noexec"
 
 run_cr -c "${JAIL}" "${CRUSER[@]}" --dry-run -- /bin/sh
 want_out "nosuid,nodev are reported as unconditional" "rootdir-flags: nosuid,nodev"
+
+echo ""
+
+# ── D2. `rootdir-flags ro` is not recursive; `mount-ro` is ─────────
+#
+# `rootdir-flags ro` is applied to the rootdir mount and to nothing stacked
+# on top of it, on purpose: /proc, /dev and /sys are separate mounts and
+# have to stay usable.  The consequence is the one
+# examples/restricted-root.conf depends on.  That profile grants its
+# library and read-only-data directories `rw` — read plus write, no execute
+# — and calls the write right inert; it is inert only because a `mount-ro`
+# directive names each of those directories.  Under `rootdir-flags ro`
+# alone a submount anywhere beneath them stays writable, and the `rw` rule
+# is then a real write grant.
+#
+# Both directions are measured against a real tmpfs submount inside the
+# jail's library directory, so neither the kernel behaviour nor the advice
+# in the profile can change quietly.
+
+echo "--- Test group: rootdir-flags ro is not recursive, mount-ro is ---"
+
+SUBMNT="${JAIL}/lib/sub"
+SUBMOUNTED=0
+if [ -n "${DYNBIN}" ] && [ -n "${LOADER_IN:-}" ] && [ "${ABI}" -ge 1 ]; then
+    mkdir -p "${SUBMNT}"
+    mount -t tmpfs -o size=1m,mode=1777 tmpfs "${SUBMNT}" 2>/dev/null && \
+        SUBMOUNTED=1
+fi
+
+if [ "${SUBMOUNTED}" -eq 0 ]; then
+    skip_group 5 "no C compiler, no interpreter, no Landlock or no tmpfs: rootdir-flags/mount-ro recursion witnesses"
+else
+    # The library-rule shape restricted-root.conf ships: `rw` on the
+    # directory the loader reads from, and a read-only container root.
+    LIBRW=("rootdir ${JAIL}" "username ctsvc" "uid 60000" "gid 60000"
+           "rootdir-flags nosuid,nodev,ro" "landlock on" "exec /bin/busybox"
+           "exec ${DYNBIN}" "exec ${LOADER_IN}" "rw /lib" "rw /lib64"
+           "ro /etc" "ro /proc" "rw /dev/null")
+    # The listed dynamic binary runs last in both probes, so the
+    # container's exit status is its own and want_no_out can trust it.
+    WITH_ROOT="echo x > /lib/probe; echo x > /lib/sub/w && echo WROTE_SUBMOUNT; ${DYNBIN}"
+    SUB_ONLY="echo x > /lib/sub/w && echo WROTE_SUBMOUNT; ${DYNBIN}"
+
+    # `rootdir-flags ro` on its own.  The library directory belongs to the
+    # rootdir mount and is read-only; the tmpfs on top of it is not.
+    P="$(mkprofile librw "${LIBRW[@]}")"
+    run_cr --profile "${P}" -- /bin/sh -c "${WITH_ROOT}"
+    want_out "rootdir-flags ro: the library directory itself is read-only" \
+             "Read-only file system"
+    want_out "rootdir-flags ro is NOT recursive: a submount under the rw rule stays writable" \
+             "WROTE_SUBMOUNT"
+
+    # The same policy with `mount-ro` naming the library directory.  Only
+    # the submount is written here, so the EROFS can come from nowhere else.
+    P="$(mkprofile libmro "${LIBRW[@]}" "mount-ro /lib")"
+    run_cr --profile "${P}" -- /bin/sh -c "${SUB_ONLY}"
+    want_out "mount-ro: the same submount write fails EROFS" \
+             "Read-only file system"
+    want_no_out "mount-ro: the write really did not happen" "WROTE_SUBMOUNT"
+    want_out "mount-ro: the listed binary still runs and loads its libraries" \
+             "DYN_RAN"
+
+    umount -l "${SUBMNT}" 2>/dev/null || true
+fi
 
 echo ""
 
@@ -639,7 +845,7 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 58
+harness_expect_total 78
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"
