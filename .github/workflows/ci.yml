@@ -219,7 +219,7 @@ jobs:
           # installs tools for a generic kernel. Bypass Ubuntu's uname-based
           # wrapper with the packaged binary for these BTF/static gates.
           if ! bpftool version; then
-            installed_bpftool="$(find /usr/lib/linux-tools -type f -name bpftool -executable | sort -V | tail -1)"
+            installed_bpftool="$(find -L /usr/lib/linux-tools -type f -name bpftool -executable | sort -V | tail -1)"
             test -n "$installed_bpftool"
             sudo ln -s "$installed_bpftool" /usr/local/sbin/bpftool
           fi
