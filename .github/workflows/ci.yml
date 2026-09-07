@@ -215,7 +215,15 @@ jobs:
                                   linux-tools-generic libelf-dev zlib1g-dev \
                                   libsodium-dev
           clang --version | head -1
-          bpftool version || true
+          # The runner may use an Azure kernel while linux-tools-generic
+          # installs tools for a generic kernel. Bypass Ubuntu's uname-based
+          # wrapper with the packaged binary for these BTF/static gates.
+          if ! bpftool version; then
+            installed_bpftool="$(find /usr/lib/linux-tools -type f -name bpftool -executable | sort -V | tail -1)"
+            test -n "$installed_bpftool"
+            sudo ln -s "$installed_bpftool" /usr/local/sbin/bpftool
+          fi
+          bpftool version
 
       - name: Kernel BTF is readable
         run: test -r /sys/kernel/btf/vmlinux

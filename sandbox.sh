@@ -240,7 +240,7 @@ run_verify() {
 
     echo ""
     echo "=== Result: isolation=${ISOLATION:-NONE} ==="
-    if [ "${ISOLATION:-NONE}" = "NONE" ]; then
+    if [ "${ISOLATION:-NONE}" != "HARD" ]; then
         echo ""
         hard_mode_help
     fi
