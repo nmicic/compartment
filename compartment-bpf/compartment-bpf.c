@@ -3038,6 +3038,15 @@ static int resolve_binary_key(const char *path, struct inode_key *out,
 		close(pfd);
 		return -1;
 	}
+	if (st.st_uid != 0) {
+		fprintf(stderr,
+			"%s %s: not root-owned (uid %u); refusing — install "
+			"the maintenance binary as root:root mode 0755 before "
+			"pinning with --self-protect.\n",
+			ctx, path, (unsigned)st.st_uid);
+		close(pfd);
+		return -1;
+	}
 	if (st.st_mode & (S_IWOTH | S_IWGRP)) {
 		// A group/world-writable maintenance binary would let a non-root
 		// user become the loader by overwriting it in place. Same gate

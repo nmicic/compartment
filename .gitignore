@@ -2,6 +2,7 @@
 compartment-user
 compartment-root
 tests/probes/deny_probe
+tests/probes/fd_reader-static
 
 # Build artifacts
 *.o

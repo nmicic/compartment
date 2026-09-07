@@ -91,6 +91,10 @@ for src in "${REPO_DIR}"/tests/profiles/*.conf; do
         printf '%s\n' "${line//@FIXTURES@/${FIXTURES}}"
     done < "${src}" > "${dst}"
 done
+# Profiles are security policy, not ordinary collaborative build output.
+# The developer may use umask 002, but every rendered fixture must satisfy
+# the same trust rule the installed product enforces.
+chmod go-w "${FIXTURES}/profiles" "${FIXTURES}/profiles"/*.conf
 
 echo "=== Fixture tree created ==="
 find "${FIXTURES}" -type f | sort

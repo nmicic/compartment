@@ -267,6 +267,23 @@ else
         /bin/sh -c 'cp /bin/busybox /tmp/bb && /tmp/bb true 2>&1 | head -1'
     want_out "W^X: a binary copied into a rw path cannot be executed" \
              "Permission denied"
+
+    # The host-side preflight cannot resolve container-only symlinks.  The
+    # final check, after pivot_root, must see that this `ro` alias lives under
+    # the writable subtree and refuse before the target can change it.
+    mkdir -p "${JAIL}/srv/writable"
+    printf 'original\n' > "${JAIL}/srv/writable/secret"
+    ln -s writable/secret "${JAIL}/srv/readonly-link"
+    run_cr --landlock --exec /bin/busybox --ro /etc --ro /proc \
+        --rw /dev/null --rw /srv/writable --ro /srv/readonly-link \
+        -c "${JAIL}" "${CRUSER[@]}" -- \
+        /bin/sh -c 'echo overwritten > /srv/readonly-link'
+    want_rc_nonzero "container-only symlink: nested ro alias is refused after pivot_root"
+    if [ "$(cat "${JAIL}/srv/writable/secret")" = original ]; then
+        pass "container-only symlink: writable parent cannot override ro"
+    else
+        fail "container-only symlink: target was overwritten"
+    fi
 fi
 
 echo ""
@@ -622,7 +639,7 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 56
+harness_expect_total 58
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

@@ -151,6 +151,10 @@ echo "Building deny_probe..."
 cc -Wall -Wextra -Wpedantic -std=c11 -O2 \
     -o tests/probes/deny_probe tests/probes/deny_probe.c 2>&1
 
+echo "Building fd_reader-static..."
+cc -Wall -Wextra -Wpedantic -std=c11 -O2 -static \
+    -o tests/probes/fd_reader-static tests/probes/fd_reader.c 2>&1
+
 echo "Creating fixtures..."
 # One fixture root for the whole run; exported so every suite reuses it and
 # removed by the harness EXIT trap.

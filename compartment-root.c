@@ -1190,6 +1190,11 @@ static int child_func(void *arg)
      * opens them read-only and Landlock has no mmap hook — so the library
      * directories need READ_FILE and nothing more. */
     if (config->use_landlock) {
+        /* The parent-side check resolves paths in the host filesystem.
+         * Repeat it after pivot_root, once container-only symlinks and
+         * mounts resolve exactly as they will for the target. */
+        if (config_check_additive(config, TOOL) != 0)
+            exit(EXIT_FAILURE);
         if (apply_landlock(config, TOOL) != 0) {
             fprintf(stderr, "compartment-root: Landlock failed — aborting\n");
             exit(EXIT_FAILURE);

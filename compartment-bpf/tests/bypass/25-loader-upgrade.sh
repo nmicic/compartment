@@ -25,7 +25,8 @@
 #       "no pinned counters found" — that would read as "no policy pinned"
 #   W4  the pinning image CAN --unpin (flow a)
 #   W5  a successor pre-authorised with --authorize-loader CAN --unpin (flow b)
-#   W6  --authorize-loader refuses a group/world-writable successor
+#   W6a --authorize-loader refuses a group/world-writable successor
+#   W6b --authorize-loader refuses a non-root-owned successor even at 0755
 #   W7  --self-protect is rejected on --unpin/--stats (the authorised set is
 #       fixed at pin time and must not look changeable afterwards)
 set -u
@@ -60,7 +61,7 @@ case "$w7" in
 	*) bypass_fail "W7: --unpin --self-protect was not rejected ($w7)" ;;
 esac
 
-# W6: a group-writable successor must be refused at pin time.
+# W6a: a group-writable successor must be refused at pin time.
 #
 # Run under `timeout`, and never through `| head`. This invocation is expected
 # to fail before it attaches; if the refusal ever regresses, the loader goes
@@ -81,6 +82,23 @@ case "$w6" in
 esac
 sp_drain || bypass_fail "W6: the refused --pin left programs loaded"
 [ "$(sp_npins)" -eq 0 ] || bypass_fail "W6: the refused --pin left $(sp_npins) pins behind"
+
+# W6b: mode 0755 is insufficient when an unprivileged owner can replace the
+# image in place without changing the authorised inode.
+sp_install "$TMP/loader-user-owned"
+chown 65534:65534 "$TMP/loader-user-owned" \
+	|| bypass_die "cannot chown the non-root-owned loader fixture"
+w6b=$(COMPARTMENT_BPF_PASSPHRASE="$SP_PASS" timeout 30 "$SP_OWNER" --pin --self-protect \
+      --authorize-loader "$TMP/loader-user-owned" "$TMP/policy.conf" 2>&1)
+w6brc=$?
+[ "$w6brc" -ne 124 ] \
+	|| bypass_fail "W6b BYPASS: --pin accepted a non-root-owned maintenance image and went live; a self-protected policy may be pinned — check $SP_PIN"
+case "$w6b" in
+	*"not root-owned"*) : ;;
+	*) bypass_fail "W6b: a non-root-owned 0755 --authorize-loader target was accepted (rc=$w6brc): $(printf '%s' "$w6b" | tail -2 | tr '\n' ' ')" ;;
+esac
+sp_drain || bypass_fail "W6b: the refused --pin left programs loaded"
+[ "$(sp_npins)" -eq 0 ] || bypass_fail "W6b: the refused --pin left $(sp_npins) pins behind"
 
 # --- flow (a): pin with A, try to unpin with B, then unpin with A. ---
 sp_pin "$SP_OWNER" "$TMP/policy.conf" "$TMP/daemon.err"
@@ -145,4 +163,4 @@ sp_drain || bypass_fail "W5: programs did not drain after the successor unpinned
 [ "$(sp_npins)" -eq 0 ] || bypass_fail "W5: $(sp_npins) pins survived the successor's --unpin"
 SP_OWNER=""   # nothing left to tear down
 
-bypass_pass "an unauthorised image cannot unpin and says why (W1), the policy survives the attempt (W2) and gives it no telemetry side door (W3); the pinning image can unpin (W4); a successor pre-authorised with --authorize-loader can unpin (W5); a group-writable successor is refused (W6); --self-protect is rejected outside --pin (W7)"
+bypass_pass "an unauthorised image cannot unpin and says why (W1), the policy survives the attempt (W2) and gives it no telemetry side door (W3); the pinning image can unpin (W4); a successor pre-authorised with --authorize-loader can unpin (W5); group-writable and non-root-owned successors are refused (W6a/W6b); --self-protect is rejected outside --pin (W7)"

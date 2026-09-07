@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 REPO_DIR="$(harness_repo_dir)"
 PROBE="${REPO_DIR}/tests/probes/deny_probe"
+FD_READER="${REPO_DIR}/tests/probes/fd_reader-static"
 CU="${REPO_DIR}/compartment-user"
 VERBOSE="${1:-}"
 
@@ -491,12 +492,16 @@ expect_blocked "strict: ptrace blocked (inherited)"
 # probe cannot run at all.  --exec grants execute on the fixture root only;
 # the seccomp policy under test is untouched, and PROBE_START now proves the
 # probe really executed instead of the assertion passing on empty output.
+TRUSTED_EXAMPLES="${FIXTURES}/examples"
+mkdir -p "${TRUSTED_EXAMPLES}"
+cp "${REPO_DIR}"/examples/*.conf "${TRUSTED_EXAMPLES}/"
+chmod go-w "${TRUSTED_EXAMPLES}" "${TRUSTED_EXAMPLES}"/*.conf
 RUN_PROBE_EXTRA=(--exec "${FIXTURES}")
-run_probe "${REPO_DIR}/examples/strict.conf" sc_ptrace_traceme
+run_probe "${TRUSTED_EXAMPLES}/strict.conf" sc_ptrace_traceme
 expect_blocked "strict file: ptrace blocked (file inherit)"
 
 # Verify strict.conf file actually loads ai-agent rules (dry-run check)
-DRY_OUT=$("${CU}" --profile "${REPO_DIR}/examples/strict.conf" --dry-run -- /bin/true 2>&1) || true
+DRY_OUT=$("${CU}" --profile "${TRUSTED_EXAMPLES}/strict.conf" --dry-run -- /bin/true 2>&1) || true
 if echo "${DRY_OUT}" | grep -q "21 path rules" && echo "${DRY_OUT}" | grep -q "49 blocked"; then
     pass "strict.conf file: inherits full ai-agent policy (21 paths, 49 blocks)"
 else
@@ -520,6 +525,8 @@ else
     # assertion can tell "sandbox applied and shell exec'd" from "exited 0
     # without ever reaching the shell".
     cp "${PROBE}" "${SHELL_TEST_DIR}/shells/fake-bash"
+    chmod go-w "${SHELL_TEST_DIR}" "${SHELL_TEST_DIR}/shells" \
+        "${SHELL_TEST_DIR}/shells/fake-bash"
 
     SHELL_RC=0
     SHELL_OUT=$(COMPARTMENT_SHELL_DIR="${SHELL_TEST_DIR}/shells" \
@@ -567,6 +574,55 @@ else
         fail "FD inheritance: expected exactly 3 FDs (0,1,2), got ${FD_COUNT}"
     else
         pass "FD inheritance: exactly 3 FDs (0,1,2), caller fd 9 closed"
+    fi
+fi
+
+# A profile can block both cleanup syscalls.  Cleanup must therefore happen
+# before that profile's filter is installed, and it must cover descriptors
+# above the old fixed fallback ceiling.
+FD_SECRET="${FIXTURES}/fd-secret"
+printf 'PRIVATE_FD_FIXTURE\n' > "${FD_SECRET}"
+if [ ! -x "${FD_READER}" ]; then
+    skip "FD inheritance: blocked close syscalls (static reader not built)"
+    skip "FD inheritance: blocked close syscalls keep the secret closed"
+    skip "FD inheritance: high descriptor fallback (static reader not built)"
+    skip "FD inheritance: high descriptor fallback keeps the secret closed"
+else
+    FD_RC=0
+    FD_OUT=$("${CU}" --profile none --exec "${FD_READER}" \
+        --block close_range --block close -- \
+        "${FD_READER}" 99 99<"${FD_SECRET}" 2>&1) || FD_RC=$?
+    if printf '%s\n' "${FD_OUT}" | grep -q 'FD_READER_START fd=99'; then
+        pass "FD inheritance: static reader ran with close syscalls blocked"
+    else
+        fail "FD inheritance: static reader did not run (rc=${FD_RC}: ${FD_OUT})"
+    fi
+    if [ "${FD_RC}" -ne 0 ] &&
+       ! printf '%s\n' "${FD_OUT}" | grep -q 'PRIVATE_FD_FIXTURE'; then
+        pass "FD inheritance: blocked close syscalls cannot preserve fd 99"
+    else
+        fail "FD inheritance: fd 99 survived blocked cleanup (rc=${FD_RC}: ${FD_OUT})"
+    fi
+
+    if [ "$(ulimit -Hn)" -le 5000 ]; then
+        skip "FD inheritance: high descriptor fallback (hard limit <= 5000)"
+        skip "FD inheritance: high descriptor fallback keeps the secret closed"
+    else
+        FD_RC=0
+        FD_OUT=$("${CU}" --profile none --no-landlock --block close_range -- \
+            /bin/bash -c 'ulimit -n 6001 && exec 5000<"$1" && exec "$2" --profile none --no-landlock --no-seccomp -- "$3" 5000' \
+            _ "${FD_SECRET}" "${CU}" "${FD_READER}" 2>&1) || FD_RC=$?
+        if printf '%s\n' "${FD_OUT}" | grep -q 'FD_READER_START fd=5000'; then
+            pass "FD inheritance: /proc fallback reaches fd 5000"
+        else
+            fail "FD inheritance: high-fd static reader did not run (rc=${FD_RC}: ${FD_OUT})"
+        fi
+        if [ "${FD_RC}" -ne 0 ] &&
+           ! printf '%s\n' "${FD_OUT}" | grep -q 'PRIVATE_FD_FIXTURE'; then
+            pass "FD inheritance: outer close_range denial cannot preserve fd 5000"
+        else
+            fail "FD inheritance: fd 5000 survived the complete fallback (rc=${FD_RC}: ${FD_OUT})"
+        fi
     fi
 fi
 
@@ -687,6 +743,6 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 60
+harness_expect_total 64
 harness_summary "compartment-user-matrix" || exit 1
 exit 0

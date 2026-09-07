@@ -286,12 +286,10 @@ echo ""
 
 echo "--- Test group: profile file trust, group-writable (C1) ---"
 
-# rootless.d/profile-trust.sh can only reach the world-writable half:
-# the caller belongs to exactly one group, its own, and the private-group
-# exemption covers that. Dropping S_IWGRP from the trust mask therefore
-# left all 420 rootless assertions green while a 0664 profile in a shared
-# group became trusted. Root can hand a user-owned file to a group the
-# user is not in, which is the shape the exemption must not cover.
+# The rootless suite covers group-write through the caller's own primary
+# group.  Root can additionally hand a user-owned file or directory to a
+# foreign group and verify that ownership of the object does not make the
+# broader write permission trustworthy.
 if [ -z "${SUDO_USER:-}" ] || ! command -v runuser >/dev/null 2>&1; then
     skip "trust: 0664 in a foreign group refused (needs SUDO_USER + runuser)"
     skip "trust: the refusal names the mode (needs SUDO_USER + runuser)"
@@ -326,9 +324,8 @@ else
     want_rc_nonzero "trust: 0775 directory in a foreign group refused"
     want_out "trust: the directory refusal names the directory" "profile directory"
 
-    # HOWTO: "a root-owned file never qualifies" for the exemption — and
-    # for compartment-user a root-owned profile is not owned by the caller
-    # at all, so it is refused on ownership.
+    # For compartment-user a root-owned profile is not owned by the caller,
+    # so it is refused on ownership independently of its mode.
     install -o root -g root -m 0664 \
         "${REPO_DIR}/tests/profiles/test-fs-rw.conf" "${TDIR}/root-owned.conf"
     run runuser -u "${TU}" -- "${CU}" --dry-run \
@@ -343,6 +340,37 @@ else
     run runuser -u "${TU}" -- "${CU}" --dry-run \
         --profile "${TDIR}/ok.conf" -- /bin/true
     want_rc "trust: control — 0644 owned by the caller is accepted" 0
+fi
+
+# NSS group entries list supplementary members only.  Two passwd entries can
+# share a primary GID while the group's explicit member list is empty.  Pair
+# the trust decision with a real write by that second uid so this cannot pass
+# on an inaccurate group-membership assumption.
+GROUPROOT="${WORK}/primary-group-root"
+mkdir -p "${GROUPROOT}/etc"
+chmod 0755 "${GROUPROOT}" "${GROUPROOT}/etc"
+printf 'passwd: files\ngroup: files\n' > "${GROUPROOT}/etc/nsswitch.conf"
+printf 'owner:x:12345:12345::/:/bin/sh\npeer:x:12346:12345::/:/bin/sh\n' \
+    > "${GROUPROOT}/etc/passwd"
+printf 'shared:x:12345:\n' > "${GROUPROOT}/etc/group"
+chmod 0644 "${GROUPROOT}/etc/nsswitch.conf" "${GROUPROOT}/etc/passwd" \
+    "${GROUPROOT}/etc/group"
+printf 'block ptrace\n' > "${GROUPROOT}/policy.conf"
+chown 12345:12345 "${GROUPROOT}/policy.conf"
+chmod 0660 "${GROUPROOT}/policy.conf"
+if cc -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE -O2 \
+      -I"${REPO_DIR}" -o "${WORK}/profile-group-probe" \
+      "${REPO_DIR}/tests/probes/profile_group_probe.c" 2>"${WORK}/group-build.log"; then
+    run "${WORK}/profile-group-probe" "${GROUPROOT}"
+    want_rc "trust: shared primary group writer does not make a profile trusted" 0
+    if [ "$(cat "${GROUPROOT}/policy.conf")" = "block getpid" ]; then
+        pass "trust: the peer uid really modified the group-writable profile"
+    else
+        fail "trust: the peer uid did not modify the profile"
+    fi
+else
+    skip "trust: shared primary group trust probe (could not compile)"
+    skip "trust: shared primary group paired DAC write (could not compile)"
 fi
 
 echo ""
@@ -446,7 +474,7 @@ echo ""
 # guarded by a tool that is not installed — changes the total, and a
 # changed total is a failure rather than a smaller number nobody
 # compares against anything.
-harness_expect_total 46
+harness_expect_total 48
 
 echo "=== Results ==="
 echo "  PASS: ${PASS}"

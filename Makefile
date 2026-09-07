@@ -128,10 +128,14 @@ tests/probes/deny_probe: tests/probes/deny_probe.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 	@echo "Built: deny_probe (sandbox validation probe)"
 
-test-integration: all tests/probes/deny_probe
+tests/probes/fd_reader-static: tests/probes/fd_reader.c
+	$(CC) $(BASE_CFLAGS) -static -o $@ $<
+	@echo "Built: fd_reader-static (inherited descriptor probe)"
+
+test-integration: all tests/probes/deny_probe tests/probes/fd_reader-static
 	./tests/scripts/run_all.sh
 
-test test-quick: all tests/probes/deny_probe
+test test-quick: all tests/probes/deny_probe tests/probes/fd_reader-static
 	./tests/scripts/run_all.sh --quick
 
 # Kernel matrix across virtme-ng guests (v5.4 .. v6.12). Not part of
@@ -139,14 +143,14 @@ test test-quick: all tests/probes/deny_probe
 # kernels, so it is a deliberate, named invocation. It was reachable from
 # nothing at all before this target existed — 70 assertions that never
 # ran. Exits 77 (and says so) when virtme-ng is absent.
-test-kernels: all tests/probes/deny_probe
+test-kernels: all tests/probes/deny_probe tests/probes/fd_reader-static
 	@rc=0; ./tests/scripts/run_kernel_matrix.sh || rc=$$?; \
 	if [ "$$rc" = "77" ]; then echo "test-kernels: SKIP (virtme-ng not installed)"; exit 0; fi; \
 	exit $$rc
 
 # Root-only suites (tests/scripts/root.d/). Must be run as root:
 #   sudo make test-root
-test-root: all tests/probes/deny_probe
+test-root: all tests/probes/deny_probe tests/probes/fd_reader-static
 	./tests/scripts/run_root_tests.sh
 
 # Own the installed files as root when we are root; stay silent about
@@ -226,4 +230,5 @@ check-modes:
 	@rc=0; 	for f in $$(git ls-files $(SHELL_DIRS) sandbox.sh 2>/dev/null | grep '\.sh$$'); do 		mode=$$(git ls-files -s "$$f" | awk '{print $$1}'); 		if head -c2 "$$f" | grep -q '^#!'; then 			if [ "$$mode" != "100755" ]; then 				echo "check-modes: $$f has a shebang but is mode $$mode (want 100755)"; rc=1; 			fi; 		else 			if [ "$$mode" = "100755" ]; then 				echo "check-modes: $$f has no shebang but is executable (want 100644)"; rc=1; 			fi; 		fi; 	done; 	if [ $$rc -eq 0 ]; then echo "check-modes: all shell scripts have the right mode"; fi; 	exit $$rc
 
 clean:
-	rm -f compartment-user compartment-root tests/probes/deny_probe
+	rm -f compartment-user compartment-root tests/probes/deny_probe \
+		tests/probes/fd_reader-static

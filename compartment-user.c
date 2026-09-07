@@ -30,6 +30,7 @@
 #endif
 #include <getopt.h>
 #include <libgen.h>
+#include <dirent.h>
 #include <syslog.h>
 #include <sys/utsname.h>
 
@@ -882,6 +883,66 @@ static int apply_cap_drops(Config *cfg)
     return 0;
 }
 
+/* Remove every descriptor inherited from the caller before installing
+ * Landlock or the profile's seccomp filter.  A filter is allowed to block
+ * close_range(2) and close(2), so doing this afterwards lets the policy
+ * disable its own cleanup. */
+static int close_inherited_fds(void)
+{
+    if (close_range(3, ~0U, 0) == 0)
+        return 0;
+
+    int close_range_errno = errno;
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) {
+        fprintf(stderr, TOOL ": cannot close inherited file descriptors: "
+                "close_range: %s; /proc/self/fd: %s\n",
+                strerror(close_range_errno), strerror(errno));
+        return -1;
+    }
+
+    int scan_fd = dirfd(dir);
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(dir);
+        if (!de) {
+            if (errno != 0) {
+                fprintf(stderr, TOOL ": readdir /proc/self/fd: %s\n",
+                        strerror(errno));
+                failed = 1;
+            }
+            break;
+        }
+
+        char *end = NULL;
+        errno = 0;
+        long fd = strtol(de->d_name, &end, 10);
+        if (errno != 0 || end == de->d_name || *end != '\0' ||
+            fd < 3 || fd > INT_MAX || fd == scan_fd)
+            continue;
+
+        if (close((int)fd) == 0 || errno == EBADF)
+            continue;
+
+        /* An outer sandbox may block close(2) too.  FD_CLOEXEC still
+         * establishes the required boundary: no caller descriptor reaches
+         * the target image. */
+        int flags = fcntl((int)fd, F_GETFD);
+        if (flags >= 0 && fcntl((int)fd, F_SETFD, flags | FD_CLOEXEC) == 0)
+            continue;
+
+        fprintf(stderr, TOOL ": cannot close or mark inherited fd %ld: %s\n",
+                fd, strerror(errno));
+        failed = 1;
+    }
+
+    /* opendir() marks its own descriptor close-on-exec.  Even an outer
+     * filter that rejects this close cannot leak the scan descriptor. */
+    (void)closedir(dir);
+    return failed ? -1 : 0;
+}
+
 /* ── Hardening applied on every path, just before exec ───────────── */
 
 static void apply_hardening(void)
@@ -893,17 +954,6 @@ static void apply_hardening(void)
      * also restricts /proc/self access from other same-UID processes */
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
-    /* Close inherited file descriptors — Landlock only restricts new
-     * open() calls, not already-open fds leaked from the parent.
-     * close_range() available since Linux 5.9, glibc 2.34. */
-    if (close_range(3, ~0U, 0) != 0) {
-        /* Fallback for older kernels — use rlimit to find upper bound */
-        struct rlimit rl;
-        int max_fd = 4096;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < (rlim_t)max_fd)
-            max_fd = (int)rl.rlim_cur;
-        for (int cfd = 3; cfd < max_fd; cfd++) close(cfd);
-    }
 }
 
 /* ── COMPARTMENT_SHELL_DIR validation ────────────────────────────── */
@@ -1003,12 +1053,12 @@ int main(int argc, char *argv[])
             return 126;
         }
 
-        /* Apply ai-agent profile sandbox, then exec real shell.
-         *
-         * IMPORTANT: Shell-replacement mode must NEVER block login.
-         * If enforcement fails, log to syslog and continue unsecured.
-         * Blocking /bin/bash would lock out the user — worse than
-         * running unsandboxed. */
+        /* Apply the ai-agent profile sandbox, then exec the real shell.
+         * Runtime mechanism failures may degrade to a syslog warning for
+         * the built-in agent-interception profile.  An explicit operator
+         * policy, and invariants whose failure would directly preserve a
+         * bypass (capability drops, masks and inherited descriptors), fail
+         * closed. */
         Config shell_cfg = {
             .use_landlock     = 1,
             .use_seccomp      = 1,
@@ -1109,6 +1159,17 @@ int main(int argc, char *argv[])
         }
         if (shell_cfg.use_env_sanitize)
             sanitize_env(&shell_cfg);
+
+        /* Landlock does not revoke access through an already-open fd, and
+         * the profile may block the close syscalls.  Fail closed if the
+         * caller's descriptor table cannot be cleaned first. */
+        if (close_inherited_fds() != 0) {
+            syslog(LOG_ERR, "compartment-user[%s]: inherited file descriptor "
+                   "cleanup failed — refusing to run", invoked_name);
+            fprintf(stderr, TOOL ": refusing to run — inherited file "
+                    "descriptors could not be closed safely\n");
+            return 126;
+        }
         if (shell_cfg.use_landlock) {
             if (apply_landlock(&shell_cfg, TOOL) != 0) {
                 syslog(LOG_WARNING, "compartment-user[%s]: "
@@ -1140,8 +1201,8 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* Same ambient-cap clear, PR_SET_DUMPABLE(0) and fd cleanup the
-         * normal path performs — these were omissions, not choices. */
+        /* Same ambient-cap clear and PR_SET_DUMPABLE(0) the normal path
+         * performs. Descriptor cleanup happened before the filters. */
         apply_hardening();
 
         execv(real_shell, argv);
@@ -1536,6 +1597,13 @@ int main(int argc, char *argv[])
     if (apply_cap_drops(&cfg) != 0) {
         fprintf(stderr, TOOL ": refusing to run — the capability policy "
                 "could not be applied\n");
+        return 1;
+    }
+
+    /* ── 2d. Inherited descriptors (before Landlock/seccomp) ───── */
+    if (close_inherited_fds() != 0) {
+        fprintf(stderr, TOOL ": refusing to run — inherited file "
+                "descriptors could not be closed safely\n");
         return 1;
     }
 

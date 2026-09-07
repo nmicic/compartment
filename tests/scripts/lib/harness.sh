@@ -25,6 +25,10 @@ if [ -n "${HARNESS_SH_LOADED:-}" ]; then
 fi
 HARNESS_SH_LOADED=1
 
+# Generated profiles must be acceptable to the product even when the
+# developer's interactive shell uses the common collaborative umask 002.
+umask 022
+
 HARNESS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS_SCRIPT_DIR="$(cd "${HARNESS_LIB_DIR}/.." && pwd)"
 HARNESS_REPO_DIR="$(cd "${HARNESS_SCRIPT_DIR}/../.." && pwd)"

@@ -22,6 +22,7 @@
 # Usage: ./tests/scripts/rootless.d/sandbox.sh [--verbose]
 
 set -euo pipefail
+umask 022
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"

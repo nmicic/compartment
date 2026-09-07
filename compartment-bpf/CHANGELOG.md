@@ -57,6 +57,9 @@ is not the loader cannot remove, detach, forge or shadow the enforcement.
 
 * `--self-protect` (with `--pin`) and `--authorize-loader PATH` (repeatable,
   implies `--self-protect`, at most 8 images including the pinning one).
+* The running loader and every `--authorize-loader` successor must be a
+  root-owned regular file with no group/world write bits. Both ownership and
+  mode are checked before their inode identities enter the maintenance set.
 * `SEC("lsm/bpf_map")` → `comp_bpf_map`: denies `bpf_map_new_fd()` — the single
   chokepoint for `BPF_MAP_GET_FD_BY_ID`, `BPF_OBJ_GET` on a pin and
   `BPF_MAP_CREATE` — for any task whose `mm->exe_file` inode is not an

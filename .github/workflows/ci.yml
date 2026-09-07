@@ -212,7 +212,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libbpf-dev linux-tools-common \
-                                  linux-tools-generic libelf-dev zlib1g-dev
+                                  linux-tools-generic libelf-dev zlib1g-dev \
+                                  libsodium-dev
           clang --version | head -1
           bpftool version || true
 

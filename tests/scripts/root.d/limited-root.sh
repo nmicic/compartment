@@ -83,7 +83,7 @@ summary_and_exit() {
 echo "=== Limited root over SSH: root-only test suite ==="
 echo ""
 
-TOTAL_ASSERTIONS=67
+TOTAL_ASSERTIONS=70
 
 if [ "$(id -u)" -ne 0 ]; then
     skip_group $((TOTAL_ASSERTIONS - 1)) "not running as root — these checks need uid 0"
@@ -121,6 +121,7 @@ HOMES=/var/tmp/compartment-limited-root-test
 CONFDIR=/etc/compartment
 CONF="${CONFDIR}/shell-replacement.conf"
 SEALPROBE=/etc/compartment-lr-seal-probe
+FDSECRET="/root/.compartment-lr-fd-$$"
 AUDITDIR=/var/log/compartment
 PINNED=0
 PIN_PID=""
@@ -176,6 +177,7 @@ cleanup() {
     [ "${MADE_CONFDIR}" -eq 1 ]  && rmdir "${CONFDIR}" 2>/dev/null
     [ "${MADE_AUDITDIR}" -eq 1 ] && rm -rf "${AUDITDIR}"
     rm -f "${SEALPROBE}"
+    rm -f "${FDSECRET}"
     rm -rf "${LRDIR}" "${HOMES}" "${T}"
     exit "${rc}"
 }
@@ -206,6 +208,15 @@ if ! cc -Wall -std=c11 -D_GNU_SOURCE -O1 \
     summary_and_exit
 fi
 ln -sf "${LRDIR}/bin/compartment-user" "${LRDIR}/bin/bash"
+
+HAVE_FD_READER=0
+if cc -static -O2 -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE \
+      -o "${LRDIR}/shells/fd-reader" \
+      "${REPO_DIR}/tests/probes/fd_reader.c" 2>"${T}/fd-reader-build.log"; then
+    chmod 0755 "${LRDIR}/shells/fd-reader"
+    ln -sf "${LRDIR}/bin/compartment-user" "${LRDIR}/bin/fd-reader"
+    HAVE_FD_READER=1
+fi
 
 # Policy.  The shipped example verbatim: the point of the suite is that
 # what ships is what works.
@@ -284,6 +295,30 @@ want_not_out "L4: the interactive login does not look for a dash-prefixed stash 
 # in place, so /proc/$$/exe would name readlink rather than the shell.
 run_lr 'readlink -f "/proc/$$/exe"; true'
 want_out "L5: the session really is running the stashed bash" "${LRDIR}/shells/bash"
+
+# Shell-replacement mode used to close descriptors only after installing
+# this profile's filter.  When the policy denied both cleanup syscalls, an
+# fd for a path outside every Landlock grant reached the replacement shell.
+if [ "${HAVE_FD_READER}" -eq 0 ]; then
+    skip_group 3 "L6: inherited descriptor witness could not be built statically"
+else
+    printf 'LIMITED_ROOT_PRIVATE_FD\n' > "${FDSECRET}"
+    printf '\nblock close_range\nblock close\n' >> "${CONF}"
+    OUT="$("${LRDIR}/bin/fd-reader" 99 99<"${FDSECRET}" 2>&1)"; RC=$?
+    if printf '%s\n' "${OUT}" | grep -q 'FD_READER_START fd=99'; then
+        pass "L6: shell-replacement fd witness reached the stashed static target"
+    else
+        fail "L6: shell-replacement fd witness did not run (rc=${RC}: ${OUT})"
+    fi
+    if [ "${RC}" -ne 0 ]; then
+        pass "L7: shell-replacement closes inherited fd 99 before seccomp"
+    else
+        fail "L7: inherited fd 99 remained readable in shell-replacement mode"
+    fi
+    want_not_out "L8: the replacement target cannot read the private fd" \
+                 "LIMITED_ROOT_PRIVATE_FD"
+    install -m 0644 -o root -g root "${PROFILE_SRC}" "${CONF}"
+fi
 
 echo ""
 echo "── 2. Enforcement is on, and cannot be taken off ────────────────"

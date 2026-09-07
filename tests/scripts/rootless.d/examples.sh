@@ -11,6 +11,7 @@
 # Usage: ./tests/scripts/rootless.d/examples.sh [--verbose]
 
 set -euo pipefail
+umask 022
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -49,6 +50,10 @@ harness_expect_total() {
 vsay() { [ -n "${VERBOSE}" ] && echo "    $*" || true; }
 
 WORK="$(mktemp -d -t compartment-examples-XXXXXXXX)"
+PROFILE_EXAMPLES="${WORK}/profiles"
+mkdir -p "${PROFILE_EXAMPLES}"
+cp "${EXAMPLES}"/*.conf "${PROFILE_EXAMPLES}/"
+chmod go-w "${PROFILE_EXAMPLES}" "${PROFILE_EXAMPLES}"/*.conf
 SSHD_PID=""
 # The host-key group has to write inside ${HOME}/.ssh/paranoid — that is
 # the one path ssh.conf grants, and it is the policy under test — so the
@@ -82,7 +87,7 @@ echo "--- Test group: example profiles parse ---"
 # per root-only directive, that the directive belongs to the other tool —
 # which is the point of the 1.4 change and not a defect in the example.
 # Parse each profile with the tool it is written for.
-for conf in "${EXAMPLES}"/*.conf; do
+for conf in "${PROFILE_EXAMPLES}"/*.conf; do
     name="$(basename "${conf}")"
     ERR="${WORK}/${name}.err"
     if grep -qE '^[[:space:]]*rootdir[[:space:]]' "${conf}"; then
@@ -112,17 +117,17 @@ done
 
 # container.conf is a compartment-root profile: it declares no path rules, so
 # compartment-user must refuse rather than run something unrestricted.
-if "${CU}" --profile "${EXAMPLES}/container.conf" -- /bin/true >/dev/null 2>&1; then
+if "${CU}" --profile "${PROFILE_EXAMPLES}/container.conf" -- /bin/true >/dev/null 2>&1; then
     fail "container.conf runs under compartment-user despite having no path rules"
 else
     pass "container.conf is refused by compartment-user (fail-closed)"
 fi
-if grep -qE 'NOT usable with compartment-user|NOT USABLE WITH compartment-user' "${EXAMPLES}/container.conf"; then
+if grep -qE 'NOT usable with compartment-user|NOT USABLE WITH compartment-user' "${PROFILE_EXAMPLES}/container.conf"; then
     pass "container.conf says which tool it is for"
 else
     fail "container.conf does not warn that it is compartment-root only"
 fi
-if grep -q 'covers most server workloads' "${EXAMPLES}/container.conf"; then
+if grep -q 'covers most server workloads' "${PROFILE_EXAMPLES}/container.conf"; then
     fail "container.conf still claims to cover most server workloads"
 else
     pass "container.conf no longer claims to cover server workloads"
@@ -130,7 +135,7 @@ fi
 # The network block is live now that syscall_table[] carries these names.
 for sc in socket bind listen connect epoll_ctl eventfd2 timerfd_create \
           signalfd4 openat2; do
-    if grep -qE "^allow ${sc}$" "${EXAMPLES}/container.conf"; then
+    if grep -qE "^allow ${sc}$" "${PROFILE_EXAMPLES}/container.conf"; then
         pass "container.conf allows '${sc}' (network block enabled)"
     else
         fail "container.conf does not allow '${sc}'"
@@ -140,7 +145,7 @@ done
 # Every syscall container.conf names must resolve, or the allow-list is
 # quietly one entry short of what it claims.
 CC_WARN="${WORK}/container-warn.err"
-"${CU}" --dry-run --profile "${EXAMPLES}/container.conf" -- /bin/true \
+"${CU}" --dry-run --profile "${PROFILE_EXAMPLES}/container.conf" -- /bin/true \
     >/dev/null 2>"${CC_WARN}" || true
 if grep -q 'unknown syscall' "${CC_WARN}"; then
     fail "container.conf names a syscall the table does not know: $(grep -m1 'unknown syscall' "${CC_WARN}")"
@@ -150,7 +155,7 @@ fi
 
 # restricted-root.conf is the compartment-root demonstration profile: an
 # exec allow-list, mount hardening and a TCP port policy in one file.
-RR="${EXAMPLES}/restricted-root.conf"
+RR="${PROFILE_EXAMPLES}/restricted-root.conf"
 for want in 'landlock on' 'net-default deny' 'rootdir-flags' 'mount-noexec /tmp'; do
     if grep -qE "^${want}" "${RR}"; then
         pass "restricted-root.conf sets '${want}'"
@@ -264,7 +269,7 @@ fi
 
 # The profile has to make the known_hosts location writable, or first-use
 # keys are re-accepted on every single run.
-KH_DIR_RULE=$(grep -E '^rwx? \$HOME/\.ssh/' "${EXAMPLES}/ssh.conf" || true)
+KH_DIR_RULE=$(grep -E '^rwx? \$HOME/\.ssh/' "${PROFILE_EXAMPLES}/ssh.conf" || true)
 if [ -n "${KH_DIR_RULE}" ]; then
     pass "ssh.conf grants write access for the known_hosts location (${KH_DIR_RULE})"
 else
@@ -323,7 +328,7 @@ EOF
     # happens first, which is the only part under test.
     try_ssh() {
         local alias="$1" out="$2"
-        "${CU}" --profile "${EXAMPLES}/ssh.conf" -- \
+        "${CU}" --profile "${PROFILE_EXAMPLES}/ssh.conf" -- \
             ssh -o "HostKeyAlias=${alias}" \
                 -o "UserKnownHostsFile=${KH}" \
                 -o StrictHostKeyChecking=accept-new \

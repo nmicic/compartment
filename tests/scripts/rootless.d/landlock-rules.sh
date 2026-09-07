@@ -90,7 +90,7 @@ want_rc_nonzero() {
 }
 
 # Declared assertion count for the whole suite (see harness_expect_total).
-LANDLOCK_RULES_TOTAL=90
+LANDLOCK_RULES_TOTAL=92
 
 if [ "${ABI}" -lt 1 ]; then
     skip_to_total "${LANDLOCK_RULES_TOTAL}" \
@@ -214,6 +214,28 @@ want_rc_nonzero "nested ro before the rw rule: also refused"
 run "${CU}" "${BASE[@]}" --rwx "${WORK}/proj" --ro "${WORK}/proj/secrets" -- /bin/true
 want_rc_nonzero "nested ro inside rwx: refused"
 
+# '/' is the ancestor of every other absolute path.  The component-boundary
+# check used to look for a second slash and miss this special case, allowing
+# the narrower file to be modified despite its `ro` rule.
+ROOT_TARGET="${WORK}/root-parent-target"
+printf 'original\n' > "${ROOT_TARGET}"
+run "${CU}" --profile none --no-seccomp --rw / --ro "${ROOT_TARGET}" --dry-run -- /bin/true
+want_rc_nonzero "ro under a writable filesystem root: refused"
+
+LOADER="$(ldd /bin/sh 2>/dev/null | sed -n 's#.*\(/lib[^ ]*ld-linux[^ ]*\).*#\1#p' | head -1)"
+if [ -n "${LOADER}" ] && [ -e "${LOADER}" ]; then
+    run "${CU}" --profile none --no-seccomp --rw / --ro "${ROOT_TARGET}" \
+        --exec /bin/sh --exec "${LOADER}" -- \
+        /bin/sh -c "printf 'overwritten\\n' > '${ROOT_TARGET}'"
+    if [ "${RUN_RC}" -ne 0 ] && [ "$(cat "${ROOT_TARGET}")" = original ]; then
+        pass "writable root cannot override a nested ro file"
+    else
+        fail "writable root overrode the nested ro file (rc=${RUN_RC})"
+    fi
+else
+    skip "writable root real-write witness (no dynamic loader found)"
+fi
+
 # A sibling that merely shares a prefix is not nested.
 mkdir -p "${WORK}/projX"
 run "${CU}" "${BASE[@]}" --rw "${WORK}/proj" --ro "${WORK}/projX" -- /bin/sh -c 'echo SIBLING_OK'
@@ -228,7 +250,11 @@ want_rc "exec inside rw is allowed" 0
 want_out "exec inside rw really executed" "EXEC_IN_RW_OK"
 
 # The shipped examples must all survive the check.
-for conf in "${REPO_DIR}"/examples/*.conf; do
+EXAMPLE_DIR="${WORK}/examples"
+mkdir -p "${EXAMPLE_DIR}"
+cp "${REPO_DIR}"/examples/*.conf "${EXAMPLE_DIR}/"
+chmod go-w "${EXAMPLE_DIR}" "${EXAMPLE_DIR}"/*.conf
+for conf in "${EXAMPLE_DIR}"/*.conf; do
     run "${CU}" --dry-run --profile "${conf}" -- /bin/true
     if [ "${RUN_RC}" -eq 0 ]; then
         pass "example parses under the additive check: $(basename "${conf}")"

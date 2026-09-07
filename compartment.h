@@ -1153,26 +1153,6 @@ static inline int directive_is_user_only(const char *d)
 
 /* ── Profile file trust ─────────────────────────────────────────── */
 
-/* umask 002 plus user-private groups — the default for interactive users
- * on Debian/Ubuntu and Fedora — leaves everything you create at 0664 or
- * 0775. Group-write is then no wider than owner-write, because the group
- * has exactly one member: you. Tolerate that single case and nothing
- * else. A root-owned object never qualifies, so /etc policy files and
- * every compartment-root profile keep the strict rule. */
-static inline int group_is_private(uid_t owner, gid_t gid)
-{
-    if (owner == 0 || owner != getuid() || gid != getgid())
-        return 0;
-    struct group *gr = getgrgid(gid);
-    if (!gr || !gr->gr_mem)
-        return 0;
-    struct passwd *pw = getpwuid(owner);
-    for (char **m = gr->gr_mem; *m; m++)
-        if (!pw || strcmp(*m, pw->pw_name) != 0)
-            return 0;   /* somebody else is in the group */
-    return 1;
-}
-
 /* Check the object behind an already-open fd, so the thing we validate
  * and the thing we read are the same inode. A policy source must be the
  * expected type, must be owned by root or by the real uid of the caller
@@ -1204,8 +1184,6 @@ static inline int profile_fd_trusted(int fd, unsigned flags, mode_t want_type,
      * third party could swap the policy we just validated. Regular files
      * get no such exemption. */
     mode_t bad = st.st_mode & (S_IWGRP | S_IWOTH);
-    if ((bad & S_IWGRP) && group_is_private(st.st_uid, st.st_gid))
-        bad &= (mode_t)~S_IWGRP;
     if ((want_type == S_IFDIR) && (st.st_mode & S_ISVTX))
         bad = 0;
     if (bad) {
@@ -2174,8 +2152,6 @@ static inline int audit_log_open(Config *cfg)
             return -1;
         }
         mode_t bad = st.st_mode & (S_IWGRP | S_IWOTH);
-        if ((bad & S_IWGRP) && group_is_private(st.st_uid, st.st_gid))
-            bad &= (mode_t)~S_IWGRP;
         if (st.st_uid != geteuid() || bad) {
             fprintf(stderr, "compartment: audit dir %s is not a private, "
                     "self-owned directory (uid %u, mode %04o)\n",
@@ -2500,7 +2476,10 @@ static inline int config_check_additive(const Config *cfg, const char *tool)
                 olen--;
             if (strncmp(inner, outer, olen) != 0)
                 continue;
-            if (inner[olen] != '/')     /* strict descendant only */
+            int descendant = (olen == 1 && outer[0] == '/')
+                ? inner[1] != '\0'
+                : inner[olen] == '/';
+            if (!descendant)            /* strict descendant only */
                 continue;
 
             fprintf(stderr, "%s: '%s' is inside the writable path '%s'\n",
