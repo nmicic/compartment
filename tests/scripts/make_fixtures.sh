@@ -41,9 +41,21 @@ case "${FIXTURES}" in
     *)  echo "make_fixtures.sh: fixture root must be an absolute path" >&2; exit 2 ;;
 esac
 
+mkdir -p "${FIXTURES}"
+# Resolve symlinks, dot components and trailing slashes before comparing:
+# /tmp/../ and a symlink to the caller's home are just as unsafe as /.
+FIXTURES="$(cd "${FIXTURES}" && pwd -P)"
+HOME_DIR="$(cd "${HOME}" && pwd -P)"
+TEMP_DIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+case "${FIXTURES}" in
+    /|/tmp|/private/tmp|/var/tmp|/private/var/tmp|/home|/Users|/root|"${HOME_DIR}"|"${TEMP_DIR}"|"${REPO_DIR}")
+        echo "make_fixtures.sh: refusing unsafe fixture root: ${FIXTURES}" >&2
+        exit 2
+        ;;
+esac
+
 echo "=== Creating fixture tree at ${FIXTURES} ==="
 
-mkdir -p "${FIXTURES}"
 rm -rf "${FIXTURES:?}"/{readable,writable,protected,subdir,profiles}
 mkdir -p "${FIXTURES}"/{readable,writable,protected,subdir,profiles}
 chmod 700 "${FIXTURES}"

@@ -42,7 +42,7 @@ USE_KVM=1
 VERBOSE=0
 MEMORY="2G"
 CPUS=1
-KERNELS="v5.4 v5.10 v5.15 v6.1 v6.5 v6.8"
+KERNELS="v5.4 v5.10 v5.15 v6.1 v6.5 v6.7 v6.10 v6.12"
 
 # Parse args
 while [[ $# -gt 0 ]]; do

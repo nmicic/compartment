@@ -222,6 +222,8 @@ jobs:
             installed_bpftool="$(find -L /usr/lib/linux-tools -type f -name bpftool -executable | sort -V | tail -1)"
             test -n "$installed_bpftool"
             sudo ln -s "$installed_bpftool" /usr/local/sbin/bpftool
+            export PATH="/usr/local/sbin:$PATH"
+            echo /usr/local/sbin >> "$GITHUB_PATH"
           fi
           bpftool version
 
