@@ -59,13 +59,15 @@ documented limitations, including:
   namespace, uid/gid mapping, cgroup path confinement and policy reporting
   — 101 assertions in 1.4.0, all passing on Ubuntu 24.04
   (kernel 6.8.0, gcc 13.3) and Ubuntu 26.04 (kernel 7.0.0, gcc 15.2).
-  `tests/scripts/root.d/compartment-root-landlock.sh` adds 67 more for
+  `tests/scripts/root.d/compartment-root-landlock.sh` adds 78 more for
   Landlock inside the container, the `exec` binary allow-list, the mount
-  hardening, `rootdir` ownership, the `--netns` join and devpts/`/dev/shm`;
-  `tests/scripts/root.d/limited-root.sh` adds 67 for the limited-root
+  hardening (including the recursion difference between `rootdir-flags ro`
+  and `mount-ro`), `rootdir` ownership, the `--netns` join and
+  devpts/`/dev/shm`;
+  `tests/scripts/root.d/limited-root.sh` adds 70 for the limited-root
   deployment over a real sshd login;
-  `tests/scripts/root.d/profile-trust-root.sh` adds 46 for profile trust
-  under root; `tests/scripts/root.d/sandbox-hard.sh` adds 10; 285 in total
+  `tests/scripts/root.d/profile-trust-root.sh` adds 48 for profile trust
+  under root; `tests/scripts/root.d/sandbox-hard.sh` adds 10; 312 in total
   with the discovery smoke suite. Those counts
   move as suites are added: what is covered is whatever
   `tests/scripts/root.d/` contains, and the runner prints the totals it

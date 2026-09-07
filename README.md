@@ -6,6 +6,25 @@
 Kernel-enforced sandboxing for untrusted processes. Two zero-dependency
 core tools, one shared profile format, plus an optional BPF-LSM module.
 
+> **v1.4.1 note:** documentation and test correction only. An `exec`
+> allow-list that lists the dynamic loader is a hardening layer, not an
+> exec-target boundary: `ld.so <a compatible loadable ELF>` runs that file
+> with no execute check on it. Two shapes close the direct-loader bypass —
+> static-link the allowed binaries and do not list the loader, or grant no
+> location that is both readable and writable. A `noexec` mount over the
+> writable areas closes only the writable-payload half of it and is not a
+> third complete answer. Even with the bypass closed the result is an
+> exec-target boundary and not a code-execution boundary: an allowed
+> program that is compromised can still interpret, JIT, `dlopen` or map
+> code of its own. Separately, `ro` on a directory grants execute on every
+> file beneath it, so `examples/restricted-root.conf` now grants its
+> library and read-only-data directories `rw` and pairs each one with
+> `mount-ro`: `rootdir-flags ro` is applied non-recursively — `/proc`,
+> `/dev` and `/sys` have to stay usable — so it does not on its own make
+> the write right of a `rw` rule inert. The HOWTO, SECURITY.md, the man
+> pages and the example profiles say all of this, and the Landlock suites
+> witness it on every run.
+
 > **v1.4.0 note:** `compartment-root` now starts and runs correctly
 > under real root, and is tested there by root-only suites
 > (`sudo make test-root`); several of its container fixes are security
